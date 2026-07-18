@@ -9,11 +9,20 @@ import (
 	"log"
 	"math/rand"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
 
-const DebugCM = 1
+const (
+	DebugCM = 1
+	Quantum = 1
+
+	HeartbeatTimeoutMs  = 5 * 10 * Quantum
+	ReelectionTimeoutMs = 15 * 10 * Quantum
+	SnapshotThreshold   = 1000
+	TickerTimeoutMs     = 10 * Quantum
+)
 
 // CommitEntry — это данные, которые Raft отправляет в канал фиксации.
 // Каждая запись фиксации уведомляет клиента о том, что консенсус по команде
@@ -27,6 +36,12 @@ type CommitEntry struct {
 
 	// Term — это терм Raft, в котором была зафиксирована команда клиента.
 	Term int
+
+	// Snapshot указывает, что данный CommitEntry является уведомлением
+	// о применении snapshot, а не обычной зафиксированной записи журнала.
+	// Когда Snapshot == true, Command содержит snapshot-данные ([]byte),
+	// а Index содержит lastSnapshotIndex.
+	Snapshot bool
 }
 
 type CMState int
@@ -110,6 +125,35 @@ type ConsensusModule struct {
 	// Непостоянное состояние Raft на лидерах
 	nextIndex  map[int]int
 	matchIndex map[int]int
+
+	// snapshotData — последний сохранённый snapshot в памяти.
+	snapshotData []byte
+
+	// lastSnapshotIndex — индекс последней записи, включённой в snapshot.
+	// Если snapshot не создавался, равен -1.
+	lastSnapshotIndex int
+
+	// lastSnapshotTerm — терм последней записи, включённой в snapshot.
+	// Если snapshot не создавался, равен -1.
+	lastSnapshotTerm int
+
+	// snapshotter — функция, вызываемая для получения snapshot-данных
+	// от машины состояний (KVService). Устанавливается извне через
+	// SetSnapshotter. Возвращает (data, lastIndex, lastTerm).
+	snapshotter func() ([]byte, int, int)
+
+	// takeSnapshotChan — канал, по которому CM запрашивает взятие snapshot
+	// у машины состояний. Функция, переданная в канал, будет вызвана
+	// отдельной горутиной для получения snapshot-данных.
+	takeSnapshotChan chan func() ([]byte, int, int)
+
+	// snapshotApplyWg — ожидание завершения применения snapshot на follower.
+	snapshotApplyWg sync.WaitGroup
+
+	// snapshotThreshold — минимальное количество зафиксированных записей
+	// с момента последнего snapshot, после которого лидер инициирует
+	// взятие нового snapshot.
+	snapshotThreshold int
 }
 
 // NewConsensusModule создаёт новый экземпляр CM с указанными
@@ -138,6 +182,10 @@ func NewConsensusModule(
 	cm.votedFor = -1
 	cm.commitIndex = -1
 	cm.lastApplied = -1
+	cm.lastSnapshotIndex = -1
+	cm.lastSnapshotTerm = -1
+	cm.snapshotThreshold = SnapshotThreshold
+	cm.takeSnapshotChan = make(chan func() ([]byte, int, int), 16)
 	cm.nextIndex = make(map[int]int)
 	cm.matchIndex = make(map[int]int)
 
@@ -157,7 +205,23 @@ func NewConsensusModule(
 
 	cm.newCommitReadyChanWg.Add(1)
 	go cm.commitChanSender()
+	go cm.runTakeSnapshotLoop()
 	return cm
+}
+
+// SetSnapshotter устанавливает функцию snapshotter, которая будет
+// вызываться для получения snapshot-данных от машины состояний.
+// Должна быть вызвана до начала работы CM.
+func (cm *ConsensusModule) SetSnapshotter(fn func() ([]byte, int, int)) {
+	cm.snapshotter = fn
+}
+
+// SetSnapshotThreshold устанавливает порог snapshot (количество зафиксированных
+// записей с момента последнего snapshot) для данного CM. По умолчанию
+// используется константа SnapshotThreshold. Должна быть вызвана до начала
+// работы CM.
+func (cm *ConsensusModule) SetSnapshotThreshold(n int) {
+	cm.snapshotThreshold = n
 }
 
 // Report отчет о состоянии данного CM.
@@ -202,6 +266,10 @@ func (cm *ConsensusModule) Stop() {
 	// monitors it to exit.
 	close(cm.newCommitReadyChan)
 	cm.newCommitReadyChanWg.Wait()
+
+	// Закрыть канал takeSnapshotChan, чтобы завершить горутину
+	// runTakeSnapshotLoop.
+	close(cm.takeSnapshotChan)
 }
 
 // restoreFromStorage восстанавливает постоянное состояние данного CM
@@ -232,9 +300,34 @@ func (cm *ConsensusModule) restoreFromStorage() {
 	} else {
 		log.Fatal("log not found in storage")
 	}
+
+	// Восстановление snapshot metadata (обратная совместимость:
+	// если ключей нет — lastSnapshotIndex = -1, lastSnapshotTerm = -1).
+	if snapIdxData, found := cm.storage.Get("snapshotIndex"); found {
+		d := gob.NewDecoder(bytes.NewBuffer(snapIdxData))
+		if err := d.Decode(&cm.lastSnapshotIndex); err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		cm.lastSnapshotIndex = -1
+	}
+	if snapTermData, found := cm.storage.Get("snapshotTerm"); found {
+		d := gob.NewDecoder(bytes.NewBuffer(snapTermData))
+		if err := d.Decode(&cm.lastSnapshotTerm); err != nil {
+			log.Fatal(err)
+		}
+	} else {
+		cm.lastSnapshotTerm = -1
+	}
+	if snapData, found := cm.storage.Get("snapshot"); found {
+		cm.snapshotData = snapData
+	} else {
+		cm.snapshotData = nil
+	}
 }
 
-// persistToStorage сохраняет всё постоянное состояние CM в cm.storage.
+// persistToStorage сохраняет всё постоянное состояние CM в cm.storage,
+// включая snapshot metadata и snapshot data.
 // Предполагается, что cm.mu уже заблокирован.
 func (cm *ConsensusModule) persistToStorage() {
 	var termData bytes.Buffer
@@ -254,6 +347,26 @@ func (cm *ConsensusModule) persistToStorage() {
 		log.Fatal(err)
 	}
 	cm.storage.Set("log", logData.Bytes())
+
+	// Сохранить snapshot metadata.
+	var snapIdxData bytes.Buffer
+	if err := gob.NewEncoder(&snapIdxData).Encode(cm.lastSnapshotIndex); err != nil {
+		log.Fatal(err)
+	}
+	cm.storage.Set("snapshotIndex", snapIdxData.Bytes())
+
+	var snapTermData bytes.Buffer
+	if err := gob.NewEncoder(&snapTermData).Encode(cm.lastSnapshotTerm); err != nil {
+		log.Fatal(err)
+	}
+	cm.storage.Set("snapshotTerm", snapTermData.Bytes())
+
+	// Сохранить snapshot data.
+	if cm.snapshotData != nil {
+		snapCopy := make([]byte, len(cm.snapshotData))
+		copy(snapCopy, cm.snapshotData)
+		cm.storage.Set("snapshot", snapCopy)
+	}
 }
 
 // dLogf выводит отладочное сообщение, если DebugCM > 0.
@@ -332,6 +445,22 @@ type AppendEntriesReply struct {
 	ConflictTerm  int
 }
 
+// InstallSnapshotArgs — аргументы RPC InstallSnapshot, используемые лидером
+// для передачи snapshot отстающему узлу. См. спецификацию Raft §7.
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderID          int
+	LastSnapshotIndex int
+	LastSnapshotTerm  int
+	Data              []byte
+}
+
+// InstallSnapshotReply — ответ на RPC InstallSnapshot.
+type InstallSnapshotReply struct {
+	Term    int
+	Success bool
+}
+
 func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
@@ -356,37 +485,65 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 		// у которой терм совпадает с PrevLogTerm.
 		// Обратите внимание, что в особом случае, когда PrevLogIndex == -1,
 		// условие считается истинным автоматически.
-		if args.PrevLogIndex == -1 ||
-			(args.PrevLogIndex < len(cm.log) && args.PrevLogTerm == cm.log[args.PrevLogIndex].Term) {
+		// Учитываем snapshot: если PrevLogIndex совпадает с lastSnapshotIndex,
+		// сравниваем с lastSnapshotTerm.
+		//nolint:gocritic
+		if args.PrevLogIndex == -1 {
 			reply.Success = true
+		} else if args.PrevLogIndex == cm.lastSnapshotIndex && args.PrevLogTerm == cm.lastSnapshotTerm {
+			// PrevLogIndex совпадает со snapshot.
+			reply.Success = true
+		} else if args.PrevLogIndex > cm.lastSnapshotIndex {
+			sliceIdx := args.PrevLogIndex - cm.lastSnapshotIndex - 1
+			if sliceIdx < len(cm.log) && cm.log[sliceIdx].Term == args.PrevLogTerm {
+				reply.Success = true
+			}
+		} else {
+			// PrevLogIndex < lastSnapshotIndex — отстающий узел,
+			// ему нужен InstallSnapshot.
+			reply.Success = false
+			reply.ConflictIndex = cm.lastSnapshotIndex + 1
+			reply.ConflictTerm = -1
+		}
 
+		if reply.Success {
 			// Находит точку вставки — место, где происходит несовпадение термов
-			// между существующими записями журнала, начиная с PrevLogIndex+1,t
+			// между существующими записями журнала, начиная с PrevLogIndex+1,
 			// и новыми записями, отправленными лидером через RPC.
-			logInsertIndex := args.PrevLogIndex + 1
+			var logInsertSliceIdx int
+			if args.PrevLogIndex == -1 || args.PrevLogIndex == cm.lastSnapshotIndex {
+				logInsertSliceIdx = 0
+			} else {
+				logInsertSliceIdx = args.PrevLogIndex - cm.lastSnapshotIndex
+			}
 			newEntriesIndex := 0
 
-			for logInsertIndex < len(cm.log) && newEntriesIndex < len(args.Entries) {
-				if cm.log[logInsertIndex].Term != args.Entries[newEntriesIndex].Term {
+			for logInsertSliceIdx < len(cm.log) && newEntriesIndex < len(args.Entries) {
+				if cm.log[logInsertSliceIdx].Term != args.Entries[newEntriesIndex].Term {
 					break
 				}
-				logInsertIndex++
+				logInsertSliceIdx++
 				newEntriesIndex++
 			}
-			// После завершения этого цикла:
-			// - logInsertIndex указывает на конец журнала
-			//   или на индекс, где терм записи отличается от записи лидера.
-			// - newEntriesIndex указывает на конец массива Entries
-			//   или на индекс, где терм записи отличается от соответствующей записи журнала.
+
 			if newEntriesIndex < len(args.Entries) {
-				cm.dLogf("... inserting entries %v from index %d", args.Entries[newEntriesIndex:], logInsertIndex)
-				cm.log = append(cm.log[:logInsertIndex], args.Entries[newEntriesIndex:]...)
+				cm.dLogf("... inserting entries %v from slice index %d", args.Entries[newEntriesIndex:], logInsertSliceIdx)
+				cm.log = append(cm.log[:logInsertSliceIdx], args.Entries[newEntriesIndex:]...)
 				cm.dLogf("... log is now: %v", cm.log)
 			}
 
 			// Устанавливает индекс фиксации.
+			// convert LeaderCommit from absolute to slice index
 			if args.LeaderCommit > cm.commitIndex {
-				cm.commitIndex = min(args.LeaderCommit, len(cm.log)-1)
+				newCommitIdx := args.LeaderCommit
+				// Если лидер зафиксировал индекс, который уже в snapshot
+				if newCommitIdx <= cm.lastSnapshotIndex {
+					cm.commitIndex = newCommitIdx
+				} else {
+					// newCommitIdx > lastSnapshotIndex
+					maxLogAbsIndex := cm.lastSnapshotIndex + len(cm.log)
+					cm.commitIndex = min(newCommitIdx, maxLogAbsIndex)
+				}
 				cm.dLogf("... setting commitIndex=%d", cm.commitIndex)
 				cm.newCommitReadyChan <- struct{}{}
 			}
@@ -394,22 +551,28 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 			// Не найдено совпадение для PrevLogIndex/PrevLogTerm.
 			// Заполнить ConflictIndex и ConflictTerm, чтобы помочь лидеру
 			// быстрее привести наш журнал в актуальное состояние.
-			if args.PrevLogIndex >= len(cm.log) {
-				reply.ConflictIndex = len(cm.log)
+			//nolint:gocritic
+			if args.PrevLogIndex < cm.lastSnapshotIndex {
+				// PrevLogIndex меньше snapshot — отстающий узел.
+				reply.ConflictIndex = cm.lastSnapshotIndex + 1
+				reply.ConflictTerm = -1
+			} else if args.PrevLogIndex >= cm.lastSnapshotIndex+len(cm.log) {
+				sliceLen := len(cm.log)
+				reply.ConflictIndex = cm.lastSnapshotIndex + sliceLen
 				reply.ConflictTerm = -1
 			} else {
 				// PrevLogIndex указывает на существующую запись в нашем журнале,
-				// но PrevLogTerm не совпадает с термом записи
-				// cm.log[PrevLogIndex].
-				reply.ConflictTerm = cm.log[args.PrevLogIndex].Term
+				// но PrevLogTerm не совпадает с термом записи.
+				sliceIdx := args.PrevLogIndex - cm.lastSnapshotIndex - 1
+				reply.ConflictTerm = cm.log[sliceIdx].Term
 
 				var i int
-				for i = args.PrevLogIndex - 1; i >= 0; i-- {
+				for i = sliceIdx - 1; i >= 0; i-- {
 					if cm.log[i].Term != reply.ConflictTerm {
 						break
 					}
 				}
-				reply.ConflictIndex = i + 1
+				reply.ConflictIndex = cm.lastSnapshotIndex + 1 + i
 			}
 		}
 	}
@@ -420,15 +583,149 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 	return nil
 }
 
+// InstallSnapshot — RPC-обработчик для InstallSnapshot.
+// Лидер передаёт snapshot отстающему follower, который применяет его
+// и обрезает журнал. См. спецификацию Raft §7.
+func (cm *ConsensusModule) InstallSnapshot(args InstallSnapshotArgs, reply *InstallSnapshotReply) error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	if cm.state == Dead {
+		return nil
+	}
+	if args.Term > cm.currentTerm {
+		cm.becomeFollower(args.Term)
+	}
+	reply.Term = cm.currentTerm
+	reply.Success = false
+	if args.Term == cm.currentTerm {
+		cm.dLogf("InstallSnapshot: lastIndex=%d, lastTerm=%d", args.LastSnapshotIndex, args.LastSnapshotTerm)
+		cm.lastSnapshotIndex = args.LastSnapshotIndex
+		cm.lastSnapshotTerm = args.LastSnapshotTerm
+		cm.snapshotData = args.Data
+		cm.persistToStorage()
+
+		// Обрезать log: удалить записи с индексом <= lastSnapshotIndex.
+		cm.log = cm.log[:0]
+		cm.dLogf("... log truncated, snapshot applied")
+		// Обновить commitIndex и lastApplied.
+		if cm.commitIndex < args.LastSnapshotIndex {
+			cm.commitIndex = args.LastSnapshotIndex
+		}
+		if cm.lastApplied < args.LastSnapshotIndex {
+			cm.lastApplied = args.LastSnapshotIndex
+		}
+		// Отправить snapshot в commitChan для применения к state machine.
+		cm.snapshotApplyWg.Add(1)
+		go func() {
+			defer cm.snapshotApplyWg.Done()
+			cm.dLogf("sending snapshot to commitChan (index=%d)", args.LastSnapshotIndex)
+			cm.commitChan <- CommitEntry{
+				Command:  args.Data,
+				Index:    args.LastSnapshotIndex,
+				Term:     args.LastSnapshotTerm,
+				Snapshot: true,
+			}
+		}()
+		reply.Success = true
+	}
+	cm.dLogf("InstallSnapshot reply: %+v", *reply)
+	return nil
+}
+
+// sendInstallSnapshot отправляет InstallSnapshot RPC указанному узлу.
+// Предполагается, что cm.mu не заблокирован (вызывается из leaderSendAEs).
+func (cm *ConsensusModule) sendInstallSnapshot(peerID int) {
+	cm.mu.Lock()
+	savedTerm := cm.currentTerm
+	args := InstallSnapshotArgs{
+		Term:              savedTerm,
+		LeaderID:          cm.id,
+		LastSnapshotIndex: cm.lastSnapshotIndex,
+		LastSnapshotTerm:  cm.lastSnapshotTerm,
+		Data:              cm.snapshotData,
+	}
+	cm.mu.Unlock()
+	cm.dLogf("sending InstallSnapshot to %d: lastIndex=%d, lastTerm=%d", peerID, args.LastSnapshotIndex, args.LastSnapshotTerm)
+
+	var reply InstallSnapshotReply
+	if err := cm.server.Call(peerID, "ConsensusModule.InstallSnapshot", args, &reply); err == nil {
+		cm.mu.Lock()
+		if reply.Term > cm.currentTerm {
+			cm.becomeFollower(reply.Term)
+		} else if cm.state == Leader && savedTerm == reply.Term && reply.Success {
+			cm.nextIndex[peerID] = args.LastSnapshotIndex + 1
+			cm.matchIndex[peerID] = args.LastSnapshotIndex
+			cm.dLogf("InstallSnapshot reply from %d success: nextIndex=%d", peerID, cm.nextIndex[peerID])
+		}
+		cm.mu.Unlock()
+	} else {
+		cm.dLogf("warning while sending InstallSnapshot to %d; error: %v", peerID, err)
+
+		// Переподключаемся, если клиент был обнулён из-за разрыва TCP
+		// (shut down) или если есть флаг peerWantsReconnect.
+		shouldReconnect := strings.Contains(err.Error(), "shut down")
+		if !shouldReconnect {
+			cm.server.mu.Lock()
+			shouldReconnect = cm.server.peerWantsReconnect[peerID]
+			cm.server.mu.Unlock()
+		}
+		if shouldReconnect {
+			cm.mu.Lock()
+			if cm.state == Leader {
+				cm.mu.Unlock()
+				cm.dLogf("reconnecting to peer %d after InstallSnapshot error", peerID)
+				if err := cm.server.ReconnectToPeer(peerID); err != nil {
+					cm.dLogf("failed to reconnect to peer %d: %v", peerID, err)
+				}
+			} else {
+				cm.mu.Unlock()
+			}
+		}
+	}
+}
+
+// takeSnapshot сохраняет snapshot-данные, обрезает журнал и обновляет
+// метаданные. Предполагается, что cm.mu уже заблокирован.
+func (cm *ConsensusModule) takeSnapshot(data []byte, index, term int) {
+	cm.dLogf("takeSnapshot: index=%d, term=%d", index, term)
+	cm.lastSnapshotIndex = index
+	cm.lastSnapshotTerm = term
+	cm.snapshotData = data
+
+	// Обрезать log: все записи с индексом <= lastSnapshotIndex удаляются.
+	cm.log = cm.log[:0]
+	cm.persistToStorage()
+
+	// Обновить nextIndex/matchIndex для всех peers.
+	for _, peerID := range cm.peerIds {
+		cm.nextIndex[peerID] = cm.lastSnapshotIndex + 1
+		cm.matchIndex[peerID] = cm.lastSnapshotIndex
+	}
+	cm.dLogf("snapshot taken, log truncated, nextIndex updated")
+}
+
+// runTakeSnapshotLoop — горутина, обрабатывающая запросы на взятие snapshot.
+// Получает функции через takeSnapshotChan, вызывает их для получения
+// snapshot-данных от машины состояний, затем сохраняет snapshot.
+func (cm *ConsensusModule) runTakeSnapshotLoop() {
+	for fn := range cm.takeSnapshotChan {
+		data, index, term := fn()
+		cm.mu.Lock()
+		cm.takeSnapshot(data, index, term)
+		cm.mu.Unlock()
+		cm.dLogf("snapshot loop: snapshot saved (index=%d)", index)
+	}
+}
+
 // electionTimeout генерирует псевдослучайную длительность тайм-аута выборов.
 func (cm *ConsensusModule) electionTimeout() time.Duration {
 	// Если установлен параметр RAFT_FORCE_MORE_REELECTION, проведите стресс-тест, намеренно
 	// генерируя жестко заданное число очень часто. Это вызовет коллизии
 	// между различными серверами и приведет к увеличению количества перевыборов.
 	if os.Getenv("RAFT_FORCE_MORE_REELECTION") != "" && rand.Intn(3) == 0 {
-		return time.Duration(150) * time.Millisecond
+		return time.Duration(ReelectionTimeoutMs) * time.Millisecond
 	}
-	return time.Duration(150+rand.Intn(150)) * time.Millisecond
+	return time.Duration(ReelectionTimeoutMs+rand.Intn(ReelectionTimeoutMs)) * time.Millisecond
 }
 
 // runElectionTimer реализует таймер выборов. Она должна запускаться всякий раз, когда
@@ -449,7 +746,7 @@ func (cm *ConsensusModule) runElectionTimer() {
 	// - таймер выборов не истечёт и данный CM не станет кандидатом.
 	// Для ведомого узла этот цикл обычно продолжает работать в фоновом режиме
 	// в течение всего времени жизни CM.
-	ticker := time.NewTicker(10 * time.Millisecond)
+	ticker := time.NewTicker(TickerTimeoutMs * time.Millisecond)
 	defer ticker.Stop()
 	for {
 		<-ticker.C
@@ -532,6 +829,8 @@ func (cm *ConsensusModule) startElection() {
 						}
 					}
 				}
+			} else {
+				cm.dLogf("warning while sending RequestVote to %v; error: %v", peerID, err)
 			}
 		}()
 	}
@@ -561,7 +860,7 @@ func (cm *ConsensusModule) startLeader() {
 	cm.state = Leader
 
 	for _, peerID := range cm.peerIds {
-		cm.nextIndex[peerID] = len(cm.log)
+		cm.nextIndex[peerID] = cm.lastSnapshotIndex + 1 + len(cm.log)
 		cm.matchIndex[peerID] = -1
 	}
 	cm.dLogf("becomes Leader; term=%d, nextIndex=%v, matchIndex=%v; log=%v", cm.currentTerm, cm.nextIndex, cm.matchIndex, cm.log)
@@ -569,7 +868,7 @@ func (cm *ConsensusModule) startLeader() {
 	// Эта горутина выполняется в фоновом режиме и отправляет сообщения
 	// AppendEntries соседям:
 	// * каждый раз, когда в triggerAEChan поступает уведомление;
-	// * либо каждые 50 мс, если в triggerAEChan не происходит событий.
+	// * либо каждые HeartbeatTimeoutMs мс, если в triggerAEChan не происходит событий.
 	go func(heartbeatTimeout time.Duration) {
 		// Немедленно отправить сообщения AppendEntries всем соседям.
 		cm.leaderSendAEs()
@@ -612,11 +911,13 @@ func (cm *ConsensusModule) startLeader() {
 				cm.leaderSendAEs()
 			}
 		}
-	}(50 * time.Millisecond)
+	}(HeartbeatTimeoutMs * time.Millisecond)
 }
 
 // leaderSendAEs отправляет очередной раунд сообщений AppendEntries всем
 // соседям, обрабатывает их ответы и обновляет состояние CM.
+// Если узел отстаёт настолько, что его nextIndex <= lastSnapshotIndex,
+// вместо AppendEntries отправляется InstallSnapshot.
 func (cm *ConsensusModule) leaderSendAEs() {
 	cm.mu.Lock()
 	if cm.state != Leader {
@@ -630,12 +931,29 @@ func (cm *ConsensusModule) leaderSendAEs() {
 		go func() {
 			cm.mu.Lock()
 			ni := cm.nextIndex[peerID]
+
+			// Если узел отстаёт за snapshot, отправить InstallSnapshot.
+			if ni <= cm.lastSnapshotIndex {
+				cm.mu.Unlock()
+				cm.sendInstallSnapshot(peerID)
+				return
+			}
+
 			prevLogIndex := ni - 1
 			prevLogTerm := -1
-			if prevLogIndex >= 0 {
-				prevLogTerm = cm.log[prevLogIndex].Term
+			if prevLogIndex == cm.lastSnapshotIndex {
+				prevLogTerm = cm.lastSnapshotTerm
+			} else if prevLogIndex > cm.lastSnapshotIndex {
+				sliceIdx := prevLogIndex - cm.lastSnapshotIndex - 1
+				if sliceIdx < len(cm.log) {
+					prevLogTerm = cm.log[sliceIdx].Term
+				}
 			}
-			entries := cm.log[ni:]
+			entriesSliceStart := max(0, ni-cm.lastSnapshotIndex-1)
+			if entriesSliceStart > len(cm.log) {
+				entriesSliceStart = len(cm.log)
+			}
+			entries := cm.log[entriesSliceStart:]
 
 			args := AppendEntriesArgs{
 				Term:         savedCurrentTerm,
@@ -650,11 +968,6 @@ func (cm *ConsensusModule) leaderSendAEs() {
 			var reply AppendEntriesReply
 			if err := cm.server.Call(peerID, "ConsensusModule.AppendEntries", args, &reply); err == nil {
 				cm.mu.Lock()
-				// К сожалению, здесь нельзя просто использовать
-				// defer cm.mu.Unlock(), поскольку в одной из ветвей
-				// выполнения требуется отправка данных в каналы.
-				// Поэтому необходимо явно вызывать cm.mu.Unlock()
-				// во всех путях выхода, начиная с этого места.
 				if reply.Term > cm.currentTerm {
 					cm.dLogf("term out of date in heartbeat reply")
 					cm.becomeFollower(reply.Term)
@@ -665,19 +978,27 @@ func (cm *ConsensusModule) leaderSendAEs() {
 				if cm.state == Leader && savedCurrentTerm == reply.Term {
 					if reply.Success {
 						cm.nextIndex[peerID] = ni + len(entries)
+						// Ограничить nextIndex, чтобы он не выходил за текущий журнал после snapshot
+						maxNextIndex := cm.lastSnapshotIndex + len(cm.log) + 1
+						if cm.nextIndex[peerID] > maxNextIndex {
+							cm.nextIndex[peerID] = maxNextIndex
+						}
 						cm.matchIndex[peerID] = cm.nextIndex[peerID] - 1
 
 						savedCommitIndex := cm.commitIndex
-						for i := cm.commitIndex + 1; i < len(cm.log); i++ {
-							if cm.log[i].Term == cm.currentTerm {
+						// Итерация по абсолютным индексам журнала.
+						maxAbsIndex := cm.lastSnapshotIndex + len(cm.log)
+						for absIdx := cm.commitIndex + 1; absIdx <= maxAbsIndex; absIdx++ {
+							sliceIdx := absIdx - cm.lastSnapshotIndex - 1
+							if sliceIdx >= 0 && sliceIdx < len(cm.log) && cm.log[sliceIdx].Term == cm.currentTerm {
 								matchCount := 1
-								for _, peerID := range cm.peerIds {
-									if cm.matchIndex[peerID] >= i {
+								for _, pID := range cm.peerIds {
+									if cm.matchIndex[pID] >= absIdx {
 										matchCount++
 									}
 								}
 								if matchCount*2 > len(cm.peerIds)+1 {
-									cm.commitIndex = i
+									cm.commitIndex = absIdx
 								}
 							}
 						}
@@ -687,24 +1008,28 @@ func (cm *ConsensusModule) leaderSendAEs() {
 						)
 						if cm.commitIndex != savedCommitIndex {
 							cm.dLogf("leader sets commitIndex := %d", cm.commitIndex)
-							// Индекс фиксации изменился: лидер считает новые
-							// записи журнала зафиксированными. Отправить новые
-							// записи в канал фиксации клиентам этого лидера
-							// и уведомить ведомых, отправив им сообщения
-							// AppendEntries.
 							cm.mu.Unlock()
 							cm.newCommitReadyChan <- struct{}{}
 							cm.triggerAEChan <- struct{}{}
+
+							// Проверить, не пора ли взять snapshot.
+							cm.mu.Lock()
+							if cm.snapshotter != nil && cm.commitIndex-cm.lastSnapshotIndex >= cm.snapshotThreshold {
+								cm.dLogf("triggering snapshot: commitIndex=%d, lastSnapshotIndex=%d", cm.commitIndex, cm.lastSnapshotIndex)
+								cm.takeSnapshotChan <- cm.snapshotter
+							}
+							cm.mu.Unlock()
 						} else {
 							cm.mu.Unlock()
 						}
 					} else {
 						if reply.ConflictTerm >= 0 {
+							// Поиск последнего вхождения ConflictTerm в журнале
+							// с учётом snapshot offset.
 							lastIndexOfTerm := -1
-							//nolint:modernize
 							for i := len(cm.log) - 1; i >= 0; i-- {
 								if cm.log[i].Term == reply.ConflictTerm {
-									lastIndexOfTerm = i
+									lastIndexOfTerm = cm.lastSnapshotIndex + 1 + i
 									break
 								}
 							}
@@ -722,6 +1047,31 @@ func (cm *ConsensusModule) leaderSendAEs() {
 				} else {
 					cm.mu.Unlock()
 				}
+			} else {
+				cm.dLogf("warning while sending AppendEntries to %v; error: %v", peerID, err)
+
+				// Переподключаемся, если клиент был обнулён из-за разрыва TCP
+				// (shut down) или если есть флаг peerWantsReconnect
+				// (предыдущий shut down). Не переподключаемся, если клиент
+				// был явно отключён через DisconnectPeer (флаг сброшен).
+				shouldReconnect := strings.Contains(err.Error(), "shut down")
+				if !shouldReconnect {
+					cm.server.mu.Lock()
+					shouldReconnect = cm.server.peerWantsReconnect[peerID]
+					cm.server.mu.Unlock()
+				}
+				if shouldReconnect {
+					cm.mu.Lock()
+					if cm.state == Leader {
+						cm.mu.Unlock()
+						cm.dLogf("reconnecting to peer %d", peerID)
+						if err := cm.server.ReconnectToPeer(peerID); err != nil {
+							cm.dLogf("failed to reconnect to peer %d: %v", peerID, err)
+						}
+					} else {
+						cm.mu.Unlock()
+					}
+				}
 			}
 		}()
 	}
@@ -729,14 +1079,32 @@ func (cm *ConsensusModule) leaderSendAEs() {
 
 // lastLogIndexAndTerm возвращает индекс последней записи журнала
 // и терм последней записи журнала данного сервера
-// (или -1, если журнал пуст).
+// (или -1, -1, если журнал пуст и snapshot отсутствует).
+// Учитывает snapshot: если журнал не пуст, реальный последний индекс
+// равен lastSnapshotIndex + len(cm.log).
 // Предполагается, что cm.mu уже заблокирован.
 func (cm *ConsensusModule) lastLogIndexAndTerm() (int, int) {
 	if len(cm.log) > 0 {
-		lastIndex := len(cm.log) - 1
-		return lastIndex, cm.log[lastIndex].Term
+		lastIndex := cm.lastSnapshotIndex + len(cm.log)
+		return lastIndex, cm.log[len(cm.log)-1].Term
+	}
+	if cm.lastSnapshotIndex >= 0 {
+		return cm.lastSnapshotIndex, cm.lastSnapshotTerm
 	}
 	return -1, -1
+}
+
+// logIndexToSliceIdx преобразует абсолютный индекс журнала в индекс
+// в срезе cm.log. Требует, чтобы absoluteIndex > cm.lastSnapshotIndex.
+// Если absoluteIndex <= cm.lastSnapshotIndex, возвращает -1.
+// Предполагается, что cm.mu уже заблокирован.
+//
+//nolint:unused
+func (cm *ConsensusModule) logIndexToSliceIdx(absoluteIndex int) int {
+	if absoluteIndex <= cm.lastSnapshotIndex {
+		return -1
+	}
+	return absoluteIndex - cm.lastSnapshotIndex - 1
 }
 
 // commitChanSender отвечает за отправку зафиксированных записей журнала
@@ -746,17 +1114,24 @@ func (cm *ConsensusModule) lastLogIndexAndTerm() (int, int) {
 // cm.commitChan может быть буферизированным, что будет ограничивать скорость,
 // с которой клиент получает новые зафиксированные записи журнала.
 // Метод завершает работу после закрытия newCommitReadyChan.
+// Учитывает snapshot: lastApplied и commitIndex — абсолютные индексы,
+// поэтому для доступа к cm.log используется преобразование через
+// lastSnapshotIndex.
 func (cm *ConsensusModule) commitChanSender() {
 	defer cm.newCommitReadyChanWg.Done()
 
 	for range cm.newCommitReadyChan {
-		// Определить, какие записи журнала необходимо применить.
 		cm.mu.Lock()
 		savedTerm := cm.currentTerm
 		savedLastApplied := cm.lastApplied
 		var entries []LogEntry
 		if cm.commitIndex > cm.lastApplied {
-			entries = cm.log[cm.lastApplied+1 : cm.commitIndex+1]
+			// Преобразование абсолютных индексов в индексы среза cm.log.
+			startSliceIdx := max(0, cm.lastApplied+1-cm.lastSnapshotIndex-1)
+			endSliceIdx := min(cm.commitIndex+1-cm.lastSnapshotIndex-1, len(cm.log))
+			if startSliceIdx < endSliceIdx && startSliceIdx < len(cm.log) {
+				entries = cm.log[startSliceIdx:endSliceIdx]
+			}
 			cm.lastApplied = cm.commitIndex
 		}
 		cm.mu.Unlock()

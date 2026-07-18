@@ -28,6 +28,7 @@ linters:
     - ireturn
     - maintidx
     - mnd
+    - modernize
     - nakedret
     - nestif
     - nlreturn
@@ -95,6 +96,10 @@ linters:
       - part5kv/
       - /testharness.go$
       - .*_test.go$
+linters-settings:
+  gocritic:
+    disabled-checks:
+      - ifElseChain
 issues:
   max-issues-per-linter: 0
   max-same-issues: 0

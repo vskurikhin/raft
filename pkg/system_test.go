@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/fortytw2/leaktest"
+	"github.com/vskurikhin/raft/pkg/raft"
 )
 
 func sleepMs(n int) {
@@ -17,19 +18,20 @@ func sleepMs(n int) {
 func TestSetupHarness(t *testing.T) {
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
-	sleepMs(80)
+	sleepMs(80 * raft.Quantum)
 }
 
+// TODO flaky (flapping) test when Quantum >= 5
 func TestClientRequestBeforeConsensus(t *testing.T) {
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
-	sleepMs(10)
+	sleepMs(10 * raft.Quantum)
 
 	// Клиент будет последовательно обращаться ко всем сервисам,
 	// пока не найдёт лидера.
 	c1 := h.NewClient()
 	h.CheckPut(c1, "llave", "cosa")
-	sleepMs(80)
+	sleepMs(80 * raft.Quantum)
 }
 
 func TestBasicPutGetSingleClient(t *testing.T) {
@@ -42,7 +44,7 @@ func TestBasicPutGetSingleClient(t *testing.T) {
 	h.CheckPut(c1, "llave", "cosa")
 
 	h.CheckGet(c1, "llave", "cosa")
-	sleepMs(80)
+	sleepMs(80 * raft.Quantum)
 }
 
 func TestPutPrevValue(t *testing.T) {
@@ -93,7 +95,7 @@ func TestBasicAppendSameClient(t *testing.T) {
 }
 
 func TestBasicPutGetDifferentClients(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, 100*raft.Quantum*time.Millisecond)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -132,7 +134,7 @@ func TestBasicAppendDifferentClients(t *testing.T) {
 }
 
 func TestAppendDifferentLeaders(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, 100*raft.Quantum*time.Millisecond)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -152,12 +154,12 @@ func TestAppendDifferentLeaders(t *testing.T) {
 
 	h.RestartService(lid)
 	c3 := h.NewClient()
-	sleepMs(300)
+	sleepMs(300 * raft.Quantum)
 	h.CheckGet(c3, "foo", "barbaz")
 }
 
 func TestCASBasic(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, 100*raft.Quantum*time.Millisecond)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -171,8 +173,9 @@ func TestCASBasic(t *testing.T) {
 	}
 }
 
+// TODO flaky (flapping) test when Quantum >= 2
 func TestCASConcurrent(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*time.Millisecond)()
+	// defer leaktest.CheckTimeout(t, 100*raft.Quantum*time.Millisecond)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -185,7 +188,7 @@ func TestCASConcurrent(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		c := h.NewClient()
-		for range 20 {
+		for range 20 * raft.Quantum {
 			h.CheckCAS(c, "foo", "bar", "bomba")
 		}
 	}()
@@ -197,14 +200,14 @@ func TestCASConcurrent(t *testing.T) {
 	c2 := h.NewClient()
 	h.CheckPut(c2, "foo", "bar")
 
-	sleepMs(300)
+	sleepMs(300 * raft.Quantum)
 	h.CheckGet(c2, "foo", "bomba")
 
 	wg.Wait()
 }
 
 func TestConcurrentClientsPutsAndGets(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, 100*raft.Quantum*time.Millisecond)()
 
 	// Проверить, что несколько запросов PUT и GET могут выполняться
 	// одновременно, когда каждая горутина отправляет свой запрос параллельно.
@@ -222,7 +225,7 @@ func TestConcurrentClientsPutsAndGets(t *testing.T) {
 			}
 		}()
 	}
-	sleepMs(150)
+	sleepMs(150 * raft.Quantum)
 
 	for i := range n {
 		go func() {
@@ -230,13 +233,13 @@ func TestConcurrentClientsPutsAndGets(t *testing.T) {
 			h.CheckGet(c, fmt.Sprintf("key%v", i), fmt.Sprintf("value%v", i))
 		}()
 	}
-	sleepMs(150)
+	sleepMs(150 * raft.Quantum)
 }
 
 func Test5ServerConcurrentClientsPutsAndGets(t *testing.T) {
 	// Аналогично предыдущему тесту, но используется кластер Raft
 	// из пяти серверов.
-	defer leaktest.CheckTimeout(t, 100*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, 100*raft.Quantum*time.Millisecond)()
 
 	h := NewHarness(t, 5)
 	defer h.Shutdown()
@@ -252,7 +255,7 @@ func Test5ServerConcurrentClientsPutsAndGets(t *testing.T) {
 			}
 		}()
 	}
-	sleepMs(150)
+	sleepMs(150 * raft.Quantum)
 
 	for i := range n {
 		go func() {
@@ -260,11 +263,12 @@ func Test5ServerConcurrentClientsPutsAndGets(t *testing.T) {
 			h.CheckGet(c, fmt.Sprintf("key%v", i), fmt.Sprintf("value%v", i))
 		}()
 	}
-	sleepMs(150)
+	sleepMs(150 * raft.Quantum)
 }
 
+// TODO flaky (flapping) test when Quantum >= 5
 func TestDisconnectLeaderAfterPuts(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, 100*raft.Quantum*time.Millisecond)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -278,7 +282,7 @@ func TestDisconnectLeaderAfterPuts(t *testing.T) {
 	}
 
 	h.DisconnectServiceFromPeers(lid)
-	sleepMs(300)
+	sleepMs(300 * raft.Quantum)
 	newlid := h.CheckSingleLeader()
 
 	if newlid == lid {
@@ -302,11 +306,12 @@ func TestDisconnectLeaderAfterPuts(t *testing.T) {
 	// переподключены, а если нет — утечка одной горутины не критична, поскольку
 	// сервер всё равно будет завершён.
 	h.ReconnectServiceToPeers(lid)
-	sleepMs(200)
+	sleepMs(200 * raft.Quantum)
 }
 
+// TODO flaky (flapping) test when Quantum >= 2
 func TestDisconnectLeaderAndFollower(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, 100*raft.Quantum*time.Millisecond)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -327,7 +332,7 @@ func TestDisconnectLeaderAndFollower(t *testing.T) {
 	h.DisconnectServiceFromPeers(lid)
 	otherId := (lid + 1) % 3
 	h.DisconnectServiceFromPeers(otherId)
-	sleepMs(100)
+	sleepMs(100 * raft.Quantum)
 
 	c := h.NewClient()
 	h.CheckGetTimesOut(c, "key0")
@@ -347,11 +352,11 @@ func TestDisconnectLeaderAndFollower(t *testing.T) {
 	for i := range n {
 		h.CheckGet(c, fmt.Sprintf("key%v", i), fmt.Sprintf("value%v", i))
 	}
-	sleepMs(100)
+	sleepMs(100 * raft.Quantum)
 }
 
 func TestCrashFollower(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, 100*raft.Quantum*time.Millisecond)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -385,7 +390,7 @@ func TestCrashFollower(t *testing.T) {
 }
 
 func TestCrashLeader(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, 100*raft.Quantum*time.Millisecond)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -412,8 +417,9 @@ func TestCrashLeader(t *testing.T) {
 	}
 }
 
+// TODO flaky (flapping) test when Quantum >= 5
 func TestCrashThenRestartLeader(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, 100*raft.Quantum*time.Millisecond)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -476,12 +482,12 @@ func TestAppendLinearizableAfterDelay(t *testing.T) {
 	}
 
 	// Убедиться, что Append был успешно применён и только один раз.
-	sleepMs(300)
+	sleepMs(300 * raft.Quantum)
 	h.CheckGet(c1, "foo", "barbazmira")
 }
 
 func TestAppendLinearizableAfterCrash(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 1000*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, 1000*raft.Quantum*time.Millisecond)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -497,7 +503,7 @@ func TestAppendLinearizableAfterCrash(t *testing.T) {
 	// зафиксирована ровно один раз (и не более).
 	h.DelayNextHTTPResponseFromService(lid)
 	go func() {
-		ctx, cancel := context.WithTimeout(h.ctx, 500*time.Millisecond)
+		ctx, cancel := context.WithTimeout(h.ctx, 500*raft.Quantum*time.Millisecond)
 		defer cancel()
 		_, _, err := c1.Append(ctx, "foo", "mira")
 		if err == nil {
@@ -506,7 +512,7 @@ func TestAppendLinearizableAfterCrash(t *testing.T) {
 		tlog("received err: %v", err)
 	}()
 
-	sleepMs(50)
+	sleepMs(50 * raft.Quantum)
 	h.CrashService(lid)
 	h.CheckSingleLeader()
 	c2 := h.NewClient()

@@ -16,6 +16,7 @@ func TestElectionBasic(t *testing.T) {
 	h.CheckSingleLeader()
 }
 
+// TODO flaky (flapping) test when Quantum >= 5
 func TestElectionLeaderDisconnect(t *testing.T) {
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -23,7 +24,7 @@ func TestElectionLeaderDisconnect(t *testing.T) {
 	origLeaderId, origTerm := h.CheckSingleLeader()
 
 	h.DisconnectPeer(origLeaderId)
-	sleepMs(350)
+	sleepMs(350 * Quantum)
 
 	newLeaderId, newTerm := h.CheckSingleLeader()
 	if newLeaderId == origLeaderId {
@@ -45,7 +46,7 @@ func TestElectionLeaderAndAnotherDisconnect(t *testing.T) {
 	h.DisconnectPeer(otherId)
 
 	// Нет кворума.
-	sleepMs(450)
+	sleepMs(450 * Quantum)
 	h.CheckNoLeader()
 
 	// Повторно подключаем ещё один сервер; теперь кворум будет достигнут.
@@ -57,12 +58,12 @@ func TestDisconnectAllThenRestore(t *testing.T) {
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
-	sleepMs(100)
+	sleepMs(100 * Quantum)
 	// Отключаем все серверы с самого начала. Лидера не будет.
 	for i := 0; i < 3; i++ {
 		h.DisconnectPeer(i)
 	}
-	sleepMs(450)
+	sleepMs(450 * Quantum)
 	h.CheckNoLeader()
 
 	// Повторно подключаем все серверы. Будет выбран лидер.
@@ -79,11 +80,11 @@ func TestElectionLeaderDisconnectThenReconnect(t *testing.T) {
 
 	h.DisconnectPeer(origLeaderId)
 
-	sleepMs(350)
+	sleepMs(350 * Quantum)
 	newLeaderId, newTerm := h.CheckSingleLeader()
 
 	h.ReconnectPeer(origLeaderId)
-	sleepMs(150)
+	sleepMs(150 * Quantum)
 
 	againLeaderId, againTerm := h.CheckSingleLeader()
 
@@ -96,7 +97,7 @@ func TestElectionLeaderDisconnectThenReconnect(t *testing.T) {
 }
 
 func TestElectionLeaderDisconnectThenReconnect5(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
 
 	h := NewHarness(t, 5)
 	defer h.Shutdown()
@@ -104,11 +105,11 @@ func TestElectionLeaderDisconnectThenReconnect5(t *testing.T) {
 	origLeaderId, _ := h.CheckSingleLeader()
 
 	h.DisconnectPeer(origLeaderId)
-	sleepMs(150)
+	sleepMs(150 * Quantum)
 	newLeaderId, newTerm := h.CheckSingleLeader()
 
 	h.ReconnectPeer(origLeaderId)
-	sleepMs(150)
+	sleepMs(150 * Quantum)
 
 	againLeaderId, againTerm := h.CheckSingleLeader()
 
@@ -121,7 +122,7 @@ func TestElectionLeaderDisconnectThenReconnect5(t *testing.T) {
 }
 
 func TestElectionFollowerComesBack(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -130,9 +131,9 @@ func TestElectionFollowerComesBack(t *testing.T) {
 
 	otherId := (origLeaderId + 1) % 3
 	h.DisconnectPeer(otherId)
-	time.Sleep(650 * time.Millisecond)
+	time.Sleep(650 * Quantum * time.Millisecond)
 	h.ReconnectPeer(otherId)
-	sleepMs(150)
+	sleepMs(150 * Quantum)
 
 	// Здесь мы не можем проверить идентификатор нового лидера,
 	// поскольку он зависит от относительных тайм-аутов выборов.
@@ -145,7 +146,7 @@ func TestElectionFollowerComesBack(t *testing.T) {
 }
 
 func TestElectionDisconnectLoop(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -156,7 +157,7 @@ func TestElectionDisconnectLoop(t *testing.T) {
 		h.DisconnectPeer(leaderId)
 		otherId := (leaderId + 1) % 3
 		h.DisconnectPeer(otherId)
-		sleepMs(310)
+		sleepMs(310 * Quantum)
 		h.CheckNoLeader()
 
 		// Повторно подключаем оба сервера.
@@ -164,12 +165,13 @@ func TestElectionDisconnectLoop(t *testing.T) {
 		h.ReconnectPeer(leaderId)
 
 		// Даём системе время стабилизироваться.
-		sleepMs(150)
+		sleepMs(150 * Quantum)
 	}
 }
 
+// TODO flaky (flapping) test when Quantum >= 5
 func TestCommitOneCommand(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -187,7 +189,7 @@ func TestCommitOneCommand(t *testing.T) {
 }
 
 func TestCommitAfterCallDrops(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -195,10 +197,10 @@ func TestCommitAfterCallDrops(t *testing.T) {
 	lid, _ := h.CheckSingleLeader()
 	h.PeerDropCallsAfterN(lid, 2)
 	h.SubmitToServer(lid, 99)
-	sleepMs(30)
+	sleepMs(30 * Quantum)
 	h.PeerDontDropCalls(lid)
 
-	sleepMs(60)
+	sleepMs(60 * Quantum)
 	h.CheckCommittedN(99, 3)
 }
 
@@ -213,11 +215,12 @@ func TestSubmitNonLeaderFails(t *testing.T) {
 	if isLeader {
 		t.Errorf("want id=%d !leader, but it is", sid)
 	}
-	sleepMs(10)
+	sleepMs(10 * Quantum)
 }
 
+// TODO flaky (flapping) test when Quantum >= 5
 func TestCommitMultipleCommands(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -231,10 +234,10 @@ func TestCommitMultipleCommands(t *testing.T) {
 		if !isLeader {
 			t.Errorf("want id=%d leader, but it's not", origLeaderId)
 		}
-		sleepMs(100)
+		sleepMs(100 * Quantum)
 	}
 
-	sleepMs(250)
+	sleepMs(250 * Quantum)
 	nc, i1 := h.CheckCommitted(42)
 	_, i2 := h.CheckCommitted(55)
 	if nc != 3 {
@@ -251,7 +254,7 @@ func TestCommitMultipleCommands(t *testing.T) {
 }
 
 func TestCommitWithDisconnectionAndRecover(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -261,23 +264,23 @@ func TestCommitWithDisconnectionAndRecover(t *testing.T) {
 	h.SubmitToServer(origLeaderId, 5)
 	h.SubmitToServer(origLeaderId, 6)
 
-	sleepMs(250)
+	sleepMs(250 * Quantum)
 	h.CheckCommittedN(6, 3)
 
 	dPeerId := (origLeaderId + 1) % 3
 	h.DisconnectPeer(dPeerId)
-	sleepMs(250)
+	sleepMs(250 * Quantum)
 
 	// Отправляем новую команду; она будет зафиксирована,
 	// но только на двух серверах.
 	h.SubmitToServer(origLeaderId, 7)
-	sleepMs(250)
+	sleepMs(250 * Quantum)
 	h.CheckCommittedN(7, 2)
 
 	// Теперь повторно подключаем dPeerId и немного ждём;
 	// он также должен получить новую команду.
 	h.ReconnectPeer(dPeerId)
-	sleepMs(250)
+	sleepMs(250 * Quantum)
 	h.CheckSingleLeader()
 
 	sleepMs(150)
@@ -285,7 +288,7 @@ func TestCommitWithDisconnectionAndRecover(t *testing.T) {
 }
 
 func TestNoCommitWithNoQuorum(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -295,7 +298,7 @@ func TestNoCommitWithNoQuorum(t *testing.T) {
 	h.SubmitToServer(origLeaderId, 5)
 	h.SubmitToServer(origLeaderId, 6)
 
-	sleepMs(250)
+	sleepMs(250 * Quantum)
 	h.CheckCommittedN(6, 3)
 
 	// Отключаем обоих ведомых.
@@ -303,17 +306,17 @@ func TestNoCommitWithNoQuorum(t *testing.T) {
 	dPeer2 := (origLeaderId + 2) % 3
 	h.DisconnectPeer(dPeer1)
 	h.DisconnectPeer(dPeer2)
-	sleepMs(250)
+	sleepMs(250 * Quantum)
 
 	h.SubmitToServer(origLeaderId, 8)
-	sleepMs(250)
+	sleepMs(250 * Quantum)
 	h.CheckNotCommitted(8)
 
 	// Повторно подключаем оба остальных сервера;
 	// теперь у нас снова будет кворум.
 	h.ReconnectPeer(dPeer1)
 	h.ReconnectPeer(dPeer2)
-	sleepMs(600)
+	sleepMs(600 * Quantum)
 
 	// Команда 8 по-прежнему не зафиксирована,
 	// поскольку терм изменился.
@@ -333,7 +336,7 @@ func TestNoCommitWithNoQuorum(t *testing.T) {
 	h.SubmitToServer(newLeaderId, 9)
 	h.SubmitToServer(newLeaderId, 10)
 	h.SubmitToServer(newLeaderId, 11)
-	sleepMs(350)
+	sleepMs(350 * Quantum)
 
 	for _, v := range []int{9, 10, 11} {
 		h.CheckCommittedN(v, 3)
@@ -348,22 +351,22 @@ func TestDisconnectLeaderBriefly(t *testing.T) {
 	origLeaderId, _ := h.CheckSingleLeader()
 	h.SubmitToServer(origLeaderId, 5)
 	h.SubmitToServer(origLeaderId, 6)
-	sleepMs(250)
+	sleepMs(250 * Quantum)
 	h.CheckCommittedN(6, 3)
 
 	// Отключаем лидера на короткое время (меньше тайм-аута выборов у соседей).
 	h.DisconnectPeer(origLeaderId)
-	sleepMs(90)
+	sleepMs(90 * Quantum)
 	h.ReconnectPeer(origLeaderId)
-	sleepMs(200)
+	sleepMs(200 * Quantum)
 
 	h.SubmitToServer(origLeaderId, 7)
-	sleepMs(250)
+	sleepMs(250 * Quantum)
 	h.CheckCommittedN(7, 3)
 }
 
 func TestCommitsWithLeaderDisconnects(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
 
 	h := NewHarness(t, 5)
 	defer h.Shutdown()
@@ -373,32 +376,32 @@ func TestCommitsWithLeaderDisconnects(t *testing.T) {
 	h.SubmitToServer(origLeaderId, 5)
 	h.SubmitToServer(origLeaderId, 6)
 
-	sleepMs(250)
+	sleepMs(250 * Quantum)
 	h.CheckCommittedN(6, 5)
 
 	// Лидер отключён...
 	h.DisconnectPeer(origLeaderId)
-	sleepMs(10)
+	sleepMs(10 * Quantum)
 
 	// Отправляем команду 7 исходному лидеру,
 	// несмотря на то, что он отключён.
 	h.SubmitToServer(origLeaderId, 7)
 
-	sleepMs(250)
+	sleepMs(250 * Quantum)
 	h.CheckNotCommitted(7)
 
 	newLeaderId, _ := h.CheckSingleLeader()
 
 	// Отправляем команду 8 новому лидеру.
 	h.SubmitToServer(newLeaderId, 8)
-	sleepMs(250)
+	sleepMs(250 * Quantum)
 	h.CheckCommittedN(8, 4)
 
 	// Повторно подключаем прежнего лидера и даём кластеру
 	// время стабилизироваться. Прежний лидер не должен
 	// снова стать лидером.
 	h.ReconnectPeer(origLeaderId)
-	sleepMs(600)
+	sleepMs(600 * Quantum)
 
 	finalLeaderId, _ := h.CheckSingleLeader()
 	if finalLeaderId == origLeaderId {
@@ -408,7 +411,7 @@ func TestCommitsWithLeaderDisconnects(t *testing.T) {
 	// Отправляем команду 9 и проверяем,
 	// что она полностью зафиксирована.
 	h.SubmitToServer(newLeaderId, 9)
-	sleepMs(250)
+	sleepMs(250 * Quantum)
 	h.CheckCommittedN(9, 5)
 	h.CheckCommittedN(8, 5)
 
@@ -418,7 +421,7 @@ func TestCommitsWithLeaderDisconnects(t *testing.T) {
 
 func TestCrashFollower(t *testing.T) {
 	// Базовый тест, проверяющий, что сбой одного узла не приводит к отказу системы.
-	defer leaktest.CheckTimeout(t, 100*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -426,16 +429,16 @@ func TestCrashFollower(t *testing.T) {
 	origLeaderId, _ := h.CheckSingleLeader()
 	h.SubmitToServer(origLeaderId, 5)
 
-	sleepMs(350)
+	sleepMs(350 * Quantum)
 	h.CheckCommittedN(5, 3)
 
 	h.CrashPeer((origLeaderId + 1) % 3)
-	sleepMs(350)
+	sleepMs(350 * Quantum)
 	h.CheckCommittedN(5, 2)
 }
 
 func TestCrashThenRestartFollower(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -447,13 +450,13 @@ func TestCrashThenRestartFollower(t *testing.T) {
 
 	vals := []int{5, 6, 7}
 
-	sleepMs(350)
+	sleepMs(350 * Quantum)
 	for _, v := range vals {
 		h.CheckCommittedN(v, 3)
 	}
 
 	h.CrashPeer((origLeaderId + 1) % 3)
-	sleepMs(350)
+	sleepMs(350 * Quantum)
 	for _, v := range vals {
 		h.CheckCommittedN(v, 2)
 	}
@@ -461,14 +464,14 @@ func TestCrashThenRestartFollower(t *testing.T) {
 	// Перезапускаем завершившийся с ошибкой ведомый узел и даём ему время
 	// синхронизироваться с остальными.
 	h.RestartPeer((origLeaderId + 1) % 3)
-	sleepMs(650)
+	sleepMs(650 * Quantum)
 	for _, v := range vals {
 		h.CheckCommittedN(v, 3)
 	}
 }
 
 func TestCrashThenRestartLeader(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -480,26 +483,26 @@ func TestCrashThenRestartLeader(t *testing.T) {
 
 	vals := []int{5, 6, 7}
 
-	sleepMs(350)
+	sleepMs(350 * Quantum)
 	for _, v := range vals {
 		h.CheckCommittedN(v, 3)
 	}
 
 	h.CrashPeer(origLeaderId)
-	sleepMs(350)
+	sleepMs(350 * Quantum)
 	for _, v := range vals {
 		h.CheckCommittedN(v, 2)
 	}
 
 	h.RestartPeer(origLeaderId)
-	sleepMs(550)
+	sleepMs(550 * Quantum)
 	for _, v := range vals {
 		h.CheckCommittedN(v, 3)
 	}
 }
 
 func TestCrashThenRestartAll(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -511,7 +514,7 @@ func TestCrashThenRestartAll(t *testing.T) {
 
 	vals := []int{5, 6, 7}
 
-	sleepMs(350)
+	sleepMs(350 * Quantum)
 	for _, v := range vals {
 		h.CheckCommittedN(v, 3)
 	}
@@ -520,17 +523,17 @@ func TestCrashThenRestartAll(t *testing.T) {
 		h.CrashPeer((origLeaderId + i) % 3)
 	}
 
-	sleepMs(350)
+	sleepMs(350 * Quantum)
 
 	for i := 0; i < 3; i++ {
 		h.RestartPeer((origLeaderId + i) % 3)
 	}
 
-	sleepMs(150)
+	sleepMs(150 * Quantum)
 	newLeaderId, _ := h.CheckSingleLeader()
 
 	h.SubmitToServer(newLeaderId, 8)
-	sleepMs(250)
+	sleepMs(250 * Quantum)
 
 	vals = []int{5, 6, 7, 8}
 	for _, v := range vals {
@@ -538,6 +541,7 @@ func TestCrashThenRestartAll(t *testing.T) {
 	}
 }
 
+// TODO flaky (flapping) test when Quantum >= 5
 func TestReplaceMultipleLogEntries(t *testing.T) {
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -547,33 +551,33 @@ func TestReplaceMultipleLogEntries(t *testing.T) {
 	h.SubmitToServer(origLeaderId, 5)
 	h.SubmitToServer(origLeaderId, 6)
 
-	sleepMs(250)
+	sleepMs(250 * Quantum)
 	h.CheckCommittedN(6, 3)
 
 	// Лидер отключается...
 	h.DisconnectPeer(origLeaderId)
-	sleepMs(10)
+	sleepMs(10 * Quantum)
 
 	// Отправляем несколько записей исходному лидеру; поскольку он отключён,
 	// они не будут реплицированы.
 	h.SubmitToServer(origLeaderId, 21)
-	sleepMs(5)
+	sleepMs(5 * Quantum)
 	h.SubmitToServer(origLeaderId, 22)
-	sleepMs(5)
+	sleepMs(5 * Quantum)
 	h.SubmitToServer(origLeaderId, 23)
-	sleepMs(5)
+	sleepMs(5 * Quantum)
 	h.SubmitToServer(origLeaderId, 24)
-	sleepMs(5)
+	sleepMs(5 * Quantum)
 
 	newLeaderId, _ := h.CheckSingleLeader()
 
 	// Отправляем записи новому лидеру — они будут реплицированы.
 	h.SubmitToServer(newLeaderId, 8)
-	sleepMs(5)
+	sleepMs(5 * Quantum)
 	h.SubmitToServer(newLeaderId, 9)
-	sleepMs(5)
+	sleepMs(5 * Quantum)
 	h.SubmitToServer(newLeaderId, 10)
-	sleepMs(250)
+	sleepMs(250 * Quantum)
 	h.CheckNotCommitted(21)
 	h.CheckCommittedN(10, 2)
 
@@ -582,20 +586,20 @@ func TestReplaceMultipleLogEntries(t *testing.T) {
 	// может оказаться и третий сервер) попытается заменить нереплицированные
 	// записи исходного лидера, начиная с самого конца журнала.
 	h.CrashPeer(newLeaderId)
-	sleepMs(60)
+	sleepMs(60 * Quantum)
 	h.RestartPeer(newLeaderId)
 
-	sleepMs(100)
+	sleepMs(100 * Quantum)
 	finalLeaderId, _ := h.CheckSingleLeader()
 	h.ReconnectPeer(origLeaderId)
-	sleepMs(400)
+	sleepMs(400 * Quantum)
 
 	// Отправляем ещё одну запись. Это необходимо, потому что лидеры не
 	// фиксируют записи из предыдущих термов (раздел 5.4.2 статьи), поэтому
 	// записи 8, 9 и 10 после перезапуска могут остаться незафиксированными
 	// на всех серверах, пока не поступит новая команда.
 	h.SubmitToServer(finalLeaderId, 11)
-	sleepMs(250)
+	sleepMs(250 * Quantum)
 
 	// На этом этапе записи 11 и 10 должны быть реплицированы на всех серверах,
 	// а запись 21 — нет.
@@ -604,6 +608,7 @@ func TestReplaceMultipleLogEntries(t *testing.T) {
 	h.CheckCommittedN(10, 3)
 }
 
+// TODO flaky (flapping) test when Quantum >= 5
 func TestCrashAfterSubmit(t *testing.T) {
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -620,26 +625,27 @@ func TestCrashAfterSubmit(t *testing.T) {
 
 	// Убеждаемся, что запись 5 не зафиксирована после выбора нового лидера.
 	// Лидеры не фиксируют команды из предыдущих термов.
-	sleepMs(10)
+	sleepMs(10 * Quantum)
 	h.CheckSingleLeader()
-	sleepMs(300)
+	sleepMs(300 * Quantum)
 	h.CheckNotCommitted(5)
 
 	// Старый лидер перезапускается. Спустя некоторое время запись 5 всё ещё
 	// не должна быть зафиксирована.
 	h.RestartPeer(origLeaderId)
-	sleepMs(150)
+	sleepMs(150 * Quantum)
 	newLeaderId, _ := h.CheckSingleLeader()
 	h.CheckNotCommitted(5)
 
 	// После отправки новой команды она будет зафиксирована вместе с записью 5,
 	// поскольку запись 5 уже присутствует в журналах всех серверов.
 	h.SubmitToServer(newLeaderId, 6)
-	sleepMs(100)
+	sleepMs(100 * Quantum)
 	h.CheckCommittedN(5, 3)
 	h.CheckCommittedN(6, 3)
 }
 
+// TODO flaky (flapping) test when Quantum >= 5
 func TestDisconnectAfterSubmit(t *testing.T) {
 	// Аналогично TestCrashAfterSubmit, но лидер не завершается аварийно,
 	// а отключается вскоре после отправки первой команды.
@@ -654,20 +660,20 @@ func TestDisconnectAfterSubmit(t *testing.T) {
 
 	// Убеждаемся, что запись 5 не зафиксирована после выбора нового лидера.
 	// Лидеры не фиксируют команды из предыдущих термов.
-	sleepMs(10)
+	sleepMs(10 * Quantum)
 	h.CheckSingleLeader()
-	sleepMs(300)
+	sleepMs(300 * Quantum)
 	h.CheckNotCommitted(5)
 
 	h.ReconnectPeer(origLeaderId)
-	sleepMs(150)
+	sleepMs(150 * Quantum)
 	newLeaderId, _ := h.CheckSingleLeader()
 	h.CheckNotCommitted(5)
 
 	// После отправки новой команды она будет зафиксирована вместе с записью 5,
 	// поскольку запись 5 уже присутствует в журналах всех серверов.
 	h.SubmitToServer(newLeaderId, 6)
-	sleepMs(100)
+	sleepMs(100 * Quantum)
 	h.CheckCommittedN(5, 3)
 	h.CheckCommittedN(6, 3)
 }
@@ -687,6 +693,7 @@ func getPersistedTerm(storage *MapStorage) int {
 	return term
 }
 
+// TODO flaky (flapping) test when Quantum >= 5
 func TestBug_StartElectionMissingPersist(t *testing.T) {
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -700,7 +707,7 @@ func TestBug_StartElectionMissingPersist(t *testing.T) {
 
 	// Даём узлу достаточно времени, чтобы он выполнил несколько выборов
 	// (каждые выборы увеличивают currentTerm).
-	time.Sleep(1200 * time.Millisecond)
+	time.Sleep(1200 * Quantum * time.Millisecond)
 
 	// Считываем значение терма жертвы из памяти и из постоянного хранилища.
 	cm := h.cluster[victim].cm
@@ -727,7 +734,7 @@ func TestBug_BecomeFollowerMissingPersist(t *testing.T) {
 	// Изолируем лидера, чтобы два остальных сервера смогли выбрать нового
 	// лидера с более высоким термом.
 	h.DisconnectPeer(origLeaderId)
-	sleepMs(350)
+	sleepMs(350 * Quantum)
 
 	newLeaderId, newTerm := h.CheckSingleLeader()
 	if newTerm <= origTerm {
@@ -743,7 +750,7 @@ func TestBug_BecomeFollowerMissingPersist(t *testing.T) {
 	defer h.PeerDontDropCalls(newLeaderId)
 
 	h.ReconnectPeer(origLeaderId)
-	sleepMs(120)
+	sleepMs(120 * Quantum)
 
 	_, steppedDownTerm, isLeader := h.cluster[origLeaderId].cm.Report()
 	if isLeader {
@@ -771,6 +778,7 @@ func TestBug_BecomeFollowerMissingPersist(t *testing.T) {
 // переходе в состояние ведомого в пределах того же терма позволил бы узлу
 // проголосовать дважды в одном терме, нарушив гарантию безопасности Raft,
 // согласно которой в каждом терме узел может голосовать только один раз.
+// TODO flaky (flapping) test when Quantum >= 5
 func TestBecomeFollowerSameTermPreservesVotedFor(t *testing.T) {
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -802,6 +810,7 @@ func TestBecomeFollowerSameTermPreservesVotedFor(t *testing.T) {
 // votedFor в -1, чтобы иметь возможность проголосовать в новом терме.
 // Без этого сброса узел будет отклонять все запросы RequestVote в новом
 // терме, что может помешать выбору лидера.
+// TODO flaky (flapping) test when Quantum >= 5
 func TestBecomeFollowerHigherTermResetsVotedFor(t *testing.T) {
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -840,7 +849,7 @@ func TestStaleVoteReplyIgnored(t *testing.T) {
 	origLeaderId, origTerm := h.CheckSingleLeader()
 
 	h.DisconnectPeer(origLeaderId)
-	sleepMs(450)
+	sleepMs(450 * Quantum)
 
 	newLeaderId, newTerm := h.CheckSingleLeader()
 	if newTerm <= origTerm {
@@ -848,11 +857,11 @@ func TestStaleVoteReplyIgnored(t *testing.T) {
 	}
 
 	h.DisconnectPeer(newLeaderId)
-	sleepMs(450)
+	sleepMs(450 * Quantum)
 
 	h.ReconnectPeer(origLeaderId)
 	h.ReconnectPeer(newLeaderId)
-	sleepMs(450)
+	sleepMs(450 * Quantum)
 
 	h.CheckSingleLeader()
 }
@@ -861,6 +870,7 @@ func TestStaleVoteReplyIgnored(t *testing.T) {
 // отклонить запрос RequestVote от другого кандидата в том же терме.
 // Предоставление второго голоса позволило бы выбрать двух лидеров
 // в одном и том же терме.
+// TODO flaky (flapping) test when Quantum >= 5
 func TestSameTermDoubleVotePrevented(t *testing.T) {
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -921,14 +931,176 @@ func TestElectionSafetyStress(t *testing.T) {
 	for cycle := 0; cycle < 8; cycle++ {
 		leaderId, _ := h.CheckSingleLeader()
 		h.DisconnectPeer(leaderId)
-		sleepMs(350)
+		sleepMs(350 * Quantum)
 
 		h.CheckSingleLeader()
 
 		h.ReconnectPeer(leaderId)
-		sleepMs(150)
+		sleepMs(150 * Quantum)
 	}
 
-	time.Sleep(300 * time.Millisecond)
+	time.Sleep(300 * Quantum * time.Millisecond)
+	h.CheckSingleLeader()
+}
+
+// TestSnapshotDuringHeartbeatRace проверяет, что после snapshot не возникает
+// panic slice bounds out of range при доступе к cm.log в leaderSendAEs.
+// Воспроизводит race condition: heartbeat-горутина читает nextIndex и cm.log
+// до snapshot, а snapshot обрезает cm.log, после чего следующий heartbeat
+// пытается обратиться к cm.log за границами.
+func TestSnapshotDuringHeartbeatRace(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 600*Quantum*time.Millisecond)()
+
+	h := NewHarness(t, 3)
+	defer h.Shutdown()
+
+	// Устанавливаем низкий порог snapshot, чтобы триггернуть snapshot малым
+	// количеством команд.
+	origLeaderId, _ := h.CheckSingleLeader()
+	cm := h.cluster[origLeaderId].cm
+	cm.SetSnapshotThreshold(5)
+	cm.SetSnapshotter(func() ([]byte, int, int) {
+		return []byte("snapshot"), 0, 0
+	})
+
+	// Отключаем один follower, чтобы heartbeat к нему падал, а leader
+	// обновлял nextIndex только для connected follower.
+	otherId := (origLeaderId + 1) % 3
+	h.DisconnectPeer(otherId)
+
+	// Отправляем 6 команд — этого достаточно, чтобы commitIndex вырос
+	// на 5+ относительно lastSnapshotIndex (-1), и snapshot сработал.
+	for i := 0; i < 6; i++ {
+		h.SubmitToServer(origLeaderId, i+100)
+		sleepMs(50 * Quantum)
+	}
+
+	// Ждём, пока snapshot выполнится.
+	sleepMs(200 * Quantum)
+
+	// Даём время для нескольких heartbeat-циклов. Если panic есть — тест
+	// упадёт в горутине.
+	sleepMs(500 * Quantum)
+
+	// Повторно подключаем отключённый follower и проверяем, что кластер
+	// стабилен.
+	h.ReconnectPeer(otherId)
+	sleepMs(300 * Quantum)
+	h.CheckSingleLeader()
+}
+
+// TestSnapshotWithInflightHeartbeatReply проверяет, что heartbeat-ответ,
+// пришедший после snapshot, не вызывает panic и nextIndex остаётся
+// консистентным с обрезанным журналом.
+// TODO flaky (flapping) test when Quantum >= 2
+func TestSnapshotWithInflightHeartbeatReply(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 600*Quantum*time.Millisecond)()
+
+	h := NewHarness(t, 3)
+	defer h.Shutdown()
+
+	origLeaderId, _ := h.CheckSingleLeader()
+	cm := h.cluster[origLeaderId].cm
+	cm.SetSnapshotThreshold(5)
+	cm.SetSnapshotter(func() ([]byte, int, int) {
+		return []byte("snapshot"), 0, 0
+	})
+
+	// Отключаем follower 2, чтобы heartbeat к нему падал.
+	otherId := (origLeaderId + 1) % 3
+	h.DisconnectPeer(otherId)
+
+	// Отправляем 5 команд.
+	for i := 0; i < 5; i++ {
+		h.SubmitToServer(origLeaderId, i+200)
+		sleepMs(50 * Quantum)
+	}
+
+	// Ждём snapshot.
+	sleepMs(200 * Quantum)
+
+	// Проверяем, что cm.log обрезан и nextIndex не превышает границ.
+	cm.mu.Lock()
+	if len(cm.log) != 0 {
+		t.Errorf("expected empty log after snapshot, got len=%d", len(cm.log))
+	}
+	for _, pid := range cm.peerIds {
+		maxNext := cm.lastSnapshotIndex + len(cm.log) + 1
+		if cm.nextIndex[pid] > maxNext {
+			t.Errorf("nextIndex[%d]=%d exceeds maxNext=%d after snapshot",
+				pid, cm.nextIndex[pid], maxNext)
+		}
+	}
+	cm.mu.Unlock()
+
+	h.SubmitToServer(origLeaderId, 205)
+	sleepMs(50 * Quantum)
+
+	// Проверяем, что в cm.log один элемент и nextIndex не превышает границ.
+	cm.mu.Lock()
+	if len(cm.log) != 1 {
+		t.Errorf("expected one entry in log after snapshot, got len=%d", len(cm.log))
+	}
+	for _, pid := range cm.peerIds {
+		maxNext := cm.lastSnapshotIndex + len(cm.log) + 1
+		if cm.nextIndex[pid] > maxNext {
+			t.Errorf("nextIndex[%d]=%d exceeds maxNext=%d after snapshot",
+				pid, cm.nextIndex[pid], maxNext)
+		}
+	}
+	cm.mu.Unlock()
+
+	// Даём время для нескольких heartbeat-циклов.
+	sleepMs(500 * Quantum)
+
+	// Повторно подключаем follower и проверяем стабильность.
+	h.ReconnectPeer(otherId)
+	sleepMs(300 * Quantum)
+	h.CheckSingleLeader()
+}
+
+// TestSnapshotTruncateLogThenHeartbeat — нагрузочный тест, проверяющий,
+// что после многократных snapshot не возникает panic при любых значениях
+// nextIndex.
+func TestSnapshotTruncateLogThenHeartbeat(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 1200*Quantum*time.Millisecond)()
+
+	h := NewHarness(t, 3)
+	defer h.Shutdown()
+
+	origLeaderId, _ := h.CheckSingleLeader()
+	cm := h.cluster[origLeaderId].cm
+	cm.SetSnapshotThreshold(10)
+	cm.SetSnapshotter(func() ([]byte, int, int) {
+		return []byte("snapshot-load"), 0, 0
+	})
+
+	for cycle := 0; cycle < 5; cycle++ {
+		// Отправляем 12 команд (чуть больше порога 10).
+		for i := 0; i < 12; i++ {
+			h.SubmitToServer(origLeaderId, cycle*1000+i)
+			sleepMs(30 * Quantum)
+		}
+
+		// Ждём snapshot.
+		sleepMs(200 * Quantum)
+
+		// Проверяем консистентность nextIndex.
+		cm.mu.Lock()
+		for _, pid := range cm.peerIds {
+			maxNext := cm.lastSnapshotIndex + len(cm.log) + 1
+			if cm.nextIndex[pid] > maxNext {
+				t.Errorf("cycle %d: nextIndex[%d]=%d exceeds maxNext=%d",
+					cycle, pid, cm.nextIndex[pid], maxNext)
+			}
+		}
+		cm.mu.Unlock()
+
+		// Отправляем ещё одну команду и даём время heartbeat.
+		h.SubmitToServer(origLeaderId, cycle*1000+99)
+		sleepMs(100 * Quantum)
+	}
+
+	// Проверяем, что кластер стабилен.
 	h.CheckSingleLeader()
 }

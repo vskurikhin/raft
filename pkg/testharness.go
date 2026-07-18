@@ -90,7 +90,7 @@ func NewHarness(t *testing.T, n int) *Harness {
 	kvServiceAddrs := make([]string, n)
 	for i := range n {
 		port := 14200 + i
-		kvss[i].ServeHTTP(port)
+		kvss[i].ServeHTTP(fmt.Sprintf(":%d", port))
 
 		kvServiceAddrs[i] = fmt.Sprintf("localhost:%d", port)
 	}
@@ -165,12 +165,12 @@ func (h *Harness) RestartService(id int) {
 	}
 	ready := make(chan any)
 	h.kvCluster[id] = kvservice.New(":0", id, peerIds, h.storage[id], ready)
-	h.kvCluster[id].ServeHTTP(14200 + id)
+	h.kvCluster[id].ServeHTTP(fmt.Sprintf(":%d", 14200+id))
 
 	h.ReconnectServiceToPeers(id)
 	close(ready)
 	h.alive[id] = true
-	time.Sleep(20 * time.Millisecond)
+	time.Sleep(20 * raft.Quantum * time.Millisecond)
 }
 
 // DelayNextHTTPResponseFromService заставляет сервис задержать отправку
@@ -257,7 +257,7 @@ func (h *Harness) CheckSingleLeader() int {
 		if leaderId >= 0 {
 			return leaderId
 		}
-		time.Sleep(150 * time.Millisecond)
+		time.Sleep(150 * raft.Quantum * time.Millisecond)
 	}
 
 	h.t.Fatalf("leader not found")
@@ -267,7 +267,7 @@ func (h *Harness) CheckSingleLeader() int {
 // CheckPut отправляет через клиента c запрос Put и проверяет, что он
 // завершился без ошибок. Возвращает (prevValue, keyFound).
 func (h *Harness) CheckPut(c *kvclient.KVClient, key, value string) (string, bool) {
-	ctx, cancel := context.WithTimeout(h.ctx, 500*time.Millisecond)
+	ctx, cancel := context.WithTimeout(h.ctx, 500*raft.Quantum*time.Millisecond)
 	defer cancel()
 	pv, f, err := c.Put(ctx, key, value)
 	if err != nil {
@@ -292,7 +292,7 @@ func (h *Harness) CheckAppend(c *kvclient.KVClient, key, value string) (string, 
 // ошибок. Также проверяет, что ключ найден и его значение совпадает с
 // ожидаемым.
 func (h *Harness) CheckGet(c *kvclient.KVClient, key string, wantValue string) {
-	ctx, cancel := context.WithTimeout(h.ctx, 500*time.Millisecond)
+	ctx, cancel := context.WithTimeout(h.ctx, 500*raft.Quantum*time.Millisecond)
 	defer cancel()
 	gv, f, err := c.Get(ctx, key)
 	if err != nil {
@@ -309,7 +309,7 @@ func (h *Harness) CheckGet(c *kvclient.KVClient, key string, wantValue string) {
 // CheckCAS отправляет через клиента c запрос CAS и проверяет, что он
 // завершился без ошибок. Возвращает (prevValue, keyFound).
 func (h *Harness) CheckCAS(c *kvclient.KVClient, key, compare, value string) (string, bool) {
-	ctx, cancel := context.WithTimeout(h.ctx, 500*time.Millisecond)
+	ctx, cancel := context.WithTimeout(h.ctx, 500*raft.Quantum*time.Millisecond)
 	defer cancel()
 	pv, f, err := c.CAS(ctx, key, compare, value)
 	if err != nil {

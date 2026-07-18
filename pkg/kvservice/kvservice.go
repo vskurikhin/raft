@@ -53,11 +53,19 @@ type KVService struct {
 	// должен быть искусственно задержан. После использования флаг
 	// автоматически сбрасывается.
 	delayNextHTTPResponse atomic.Bool
+
+	// lastAppliedIndex — индекс последней записи журнала, применённой
+	// к DataStore. Используется для создания snapshot.
+	lastAppliedIndex int
+
+	// lastAppliedTerm — терм последней записи журнала, применённой
+	// к DataStore. Используется для создания snapshot.
+	lastAppliedTerm int
 }
 
 // New создаёт новый экземпляр KVService.
 //
-//   - address - адрес который будет слушать Raft сервер.
+//   - address - адрес, который будет слушать Raft сервер.
 //   - id — идентификатор данного сервиса в кластере Raft.
 //   - peerIds — идентификаторы остальных узлов Raft в кластере.
 //   - storage — реализация интерфейса raft.Storage, используемая сервисом
@@ -81,7 +89,15 @@ func New(address string, id int, peerIds []int, storage raft.Storage, readyChan 
 		ds:                     NewDataStore(),
 		commitSubs:             make(map[int]chan Command),
 		lastRequestIDPerClient: make(map[int64]int64),
+		lastAppliedIndex:       -1,
+		lastAppliedTerm:        -1,
 	}
+
+	// Установить snapshotter: функция, вызываемая лидером Raft для
+	// получения snapshot-данных.
+	rs.SetSnapshotter(func() ([]byte, int, int) {
+		return kvs.TakeSnapshot()
+	})
 
 	kvs.runUpdater()
 	return kvs
@@ -97,7 +113,7 @@ func (kvs *KVService) IsLeader() bool {
 // на указанном TCP-порту. Метод не блокирует выполнение: он запускает
 // HTTP-сервер в отдельной горутине и сразу возвращает управление.
 // Для корректной остановки сервера вызовите метод Shutdown.
-func (kvs *KVService) ServeHTTP(port int) {
+func (kvs *KVService) ServeHTTP(address string) {
 	if kvs.srv != nil {
 		panic("ServeHTTP called with existing server")
 	}
@@ -108,7 +124,7 @@ func (kvs *KVService) ServeHTTP(port int) {
 	mux.HandleFunc("POST /cas/", kvs.handleCAS)
 
 	kvs.srv = &http.Server{
-		Addr:    fmt.Sprintf(":%d", port),
+		Addr:    address,
 		Handler: mux,
 	}
 
@@ -372,9 +388,20 @@ func (kvs *KVService) handleCAS(w http.ResponseWriter, req *http.Request) {
 // распределённого консенсуса.
 // Кроме того, updater уведомляет подписчиков, зарегистрированных через
 // createCommitSubscription.
+// Обрабатывает как обычные записи журнала, так и snapshot-уведомления.
 func (kvs *KVService) runUpdater() {
 	go func() {
 		for entry := range kvs.commitChan {
+			if entry.Snapshot {
+				// Это snapshot-уведомление: применяем snapshot к DataStore.
+				data := entry.Command.([]byte)
+				kvs.kvLogf("applying snapshot at index=%d", entry.Index)
+				kvs.ApplySnapshot(data)
+				kvs.lastAppliedIndex = entry.Index
+				kvs.lastAppliedTerm = entry.Term
+				continue
+			}
+
 			cmd := entry.Command.(Command)
 
 			// Обнаружение дублирующихся команд.
@@ -413,8 +440,30 @@ func (kvs *KVService) runUpdater() {
 				sub <- cmd
 				close(sub)
 			}
+
+			// Обновить lastAppliedIndex/lastAppliedTerm для snapshot.
+			kvs.lastAppliedIndex = entry.Index
+			kvs.lastAppliedTerm = entry.Term
 		}
 	}()
+}
+
+// TakeSnapshot возвращает сериализованное состояние DataStore вместе
+// с индексом и термом последней применённой записи. Вызывается лидером
+// Raft для создания snapshot.
+func (kvs *KVService) TakeSnapshot() ([]byte, int, int) {
+	kvs.mu.Lock()
+	defer kvs.mu.Unlock()
+	data := kvs.ds.Serialize()
+	return data, kvs.lastAppliedIndex, kvs.lastAppliedTerm
+}
+
+// ApplySnapshot восстанавливает состояние DataStore из snapshot-данных.
+// Вызывается при получении snapshot от лидера (InstallSnapshot RPC).
+func (kvs *KVService) ApplySnapshot(data []byte) {
+	kvs.mu.Lock()
+	defer kvs.mu.Unlock()
+	kvs.ds.Deserialize(data)
 }
 
 // createCommitSubscription создаёт "подписку на фиксацию" для указанного
@@ -461,6 +510,10 @@ func (kvs *KVService) kvLogf(format string, args ...any) {
 
 func (kvs *KVService) ConnectToRaftPeer(peerID int, addr net.Addr) error {
 	return kvs.rs.ConnectToPeer(peerID, addr)
+}
+
+func (kvs *KVService) ReconnectToRaftPeer(peerID int) error {
+	return kvs.rs.ReconnectToPeer(peerID)
 }
 
 func (kvs *KVService) DisconnectFromAllRaftPeers() {

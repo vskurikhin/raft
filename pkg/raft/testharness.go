@@ -77,7 +77,7 @@ func NewHarness(t *testing.T, n int) *Harness {
 	for i := 0; i < n; i++ {
 		for j := 0; j < n; j++ {
 			if i != j {
-				ns[i].ConnectToPeer(j, ns[j].GetListenAddr())
+				_ = ns[i].ConnectToPeer(j, ns[j].GetListenAddr())
 			}
 		}
 		connected[i] = true
@@ -124,7 +124,7 @@ func (h *Harness) DisconnectPeer(id int) {
 	h.cluster[id].DisconnectAll()
 	for j := 0; j < h.n; j++ {
 		if j != id {
-			h.cluster[j].DisconnectPeer(id)
+			_ = h.cluster[j].DisconnectPeer(id)
 		}
 	}
 	h.connected[id] = false
@@ -225,7 +225,7 @@ func (h *Harness) CheckSingleLeader() (int, int) {
 		if leaderId >= 0 {
 			return leaderId, leaderTerm
 		}
-		time.Sleep(150 * time.Millisecond)
+		time.Sleep(150 * Quantum * time.Millisecond)
 	}
 
 	h.t.Fatalf("leader not found")
@@ -264,7 +264,7 @@ func (h *Harness) CheckCommitted(cmd int) (nc int, index int) {
 			if commitsLen >= 0 {
 				// If this was set already, expect the new length to be the same.
 				if len(h.commits[i]) != commitsLen {
-					h.t.Fatalf("commits[%d] = %d, commitsLen = %d", i, h.commits[i], commitsLen)
+					h.t.Fatalf("commits[%d] len = %d, commitsLen = %d", i, len(h.commits[i]), commitsLen)
 				}
 			} else {
 				commitsLen = len(h.commits[i])

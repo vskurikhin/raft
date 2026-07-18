@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/rpc"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -29,8 +30,15 @@ type Server struct {
 	rpcServer *rpc.Server
 	listener  net.Listener
 
-	commitChan  chan<- CommitEntry
-	peerClients map[int]*rpc.Client
+	commitChan    chan<- CommitEntry
+	peerClients   map[int]*rpc.Client
+	peerAddresses map[int]net.Addr // адреса пиров, используются для переподключения
+
+	// peerWantsReconnect отслеживает, был ли клиент пира обнулён из-за
+	// разрыва TCP-соединения (shut down), а не из-за явного DisconnectPeer.
+	// Используется в leaderSendAEs, чтобы отличить случай перезапуска пира
+	// от случая изоляции лидера тестовым harness.
+	peerWantsReconnect map[int]bool
 
 	ready <-chan any
 	quit  chan any
@@ -42,6 +50,8 @@ func NewServer(serverID int, peerIds []int, storage Storage, ready <-chan any, c
 	s.serverID = serverID
 	s.peerIds = peerIds
 	s.peerClients = make(map[int]*rpc.Client)
+	s.peerAddresses = make(map[int]net.Addr)
+	s.peerWantsReconnect = make(map[int]bool)
 	s.storage = storage
 	s.ready = ready
 	s.commitChan = commitChan
@@ -103,9 +113,10 @@ func (s *Server) DisconnectAll() {
 	defer s.mu.Unlock()
 	for id := range s.peerClients {
 		if s.peerClients[id] != nil {
-			s.peerClients[id].Close()
+			_ = s.peerClients[id].Close()
 			s.peerClients[id] = nil
 		}
+		s.peerWantsReconnect[id] = false
 	}
 }
 
@@ -113,7 +124,7 @@ func (s *Server) DisconnectAll() {
 func (s *Server) Shutdown() {
 	s.cm.Stop()
 	close(s.quit)
-	s.listener.Close()
+	_ = s.listener.Close()
 	s.wg.Wait()
 }
 
@@ -126,13 +137,47 @@ func (s *Server) GetListenAddr() net.Addr {
 func (s *Server) ConnectToPeer(peerID int, addr net.Addr) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	log.Printf("[%v] connecting to peer %v", s.serverID, peerID)
 	if s.peerClients[peerID] == nil {
 		client, err := rpc.Dial(addr.Network(), addr.String())
 		if err != nil {
 			return err
 		}
 		s.peerClients[peerID] = client
+		s.peerAddresses[peerID] = addr
+		s.peerWantsReconnect[peerID] = false
+		log.Printf("[%v] connected to peer %v", s.serverID, peerID)
 	}
+	return nil
+}
+
+// ReconnectToPeer принудительно переустанавливает соединение к пиру.
+// Закрывает существующее соединение (если есть) и создаёт новое.
+// Адрес пира должен быть предварительно сохранён через ConnectToPeer.
+// Использует таймаут, чтобы не блокировать s.mu надолго при мёртвом пире.
+func (s *Server) ReconnectToPeer(peerID int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	addr, ok := s.peerAddresses[peerID]
+	if !ok {
+		return fmt.Errorf("no address for peer %d", peerID)
+	}
+
+	// Закрыть старое соединение, если оно ещё открыто.
+	if s.peerClients[peerID] != nil {
+		_ = s.peerClients[peerID].Close()
+	}
+
+	conn, err := net.DialTimeout(addr.Network(), addr.String(), 50*Quantum*time.Millisecond)
+	if err != nil {
+		s.peerClients[peerID] = nil
+		return err
+	}
+	client := rpc.NewClient(conn)
+	s.peerClients[peerID] = client
+	s.peerWantsReconnect[peerID] = false
+	log.Printf("[%v] reconnected to peer %v", s.serverID, peerID)
 	return nil
 }
 
@@ -143,8 +188,10 @@ func (s *Server) DisconnectPeer(peerID int) error {
 	if s.peerClients[peerID] != nil {
 		err := s.peerClients[peerID].Close()
 		s.peerClients[peerID] = nil
+		s.peerWantsReconnect[peerID] = false
 		return err
 	}
+	s.peerWantsReconnect[peerID] = false
 	return nil
 }
 
@@ -158,13 +205,34 @@ func (s *Server) Call(id int, serviceMethod string, args, reply any) error {
 	if peer == nil {
 		return fmt.Errorf("call client %d after it's closed", id)
 	}
-	return s.rpcProxy.Call(peer, serviceMethod, args, reply)
+
+	err := s.rpcProxy.Call(peer, serviceMethod, args, reply)
+
+	// Если клиент закрыт (соединение разорвано сервером), сбросить его
+	// и запомнить, что нужно переподключиться.
+	// Следующий Call вернёт "call client after it's closed",
+	// что является сигналом для leaderSendAEs выполнить ReconnectToPeer.
+	if err != nil && strings.Contains(err.Error(), "shut down") {
+		s.mu.Lock()
+		s.peerClients[id] = nil
+		s.peerWantsReconnect[id] = true
+		s.mu.Unlock()
+	}
+
+	return err
 }
 
 // IsLeader проверяет, считает ли сервер s себя лидером в кластере Raft.
 func (s *Server) IsLeader() bool {
 	_, _, isLeader := s.cm.Report()
 	return isLeader
+}
+
+// SetSnapshotter устанавливает функцию snapshotter на базовом CM.
+// Эта функция будет вызываться лидером для получения snapshot-данных
+// от машины состояний.
+func (s *Server) SetSnapshotter(fn func() ([]byte, int, int)) {
+	s.cm.SetSnapshotter(fn)
 }
 
 // Proxy предоставляет доступ к RPC-прокси, используемому данным сервером.
@@ -235,6 +303,23 @@ func (rpp *RPCProxy) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesR
 		time.Sleep(time.Duration(1+rand.Intn(5)) * time.Millisecond)
 	}
 	return rpp.cm.AppendEntries(args, reply)
+}
+
+func (rpp *RPCProxy) InstallSnapshot(args InstallSnapshotArgs, reply *InstallSnapshotReply) error {
+	if os.Getenv("RAFT_UNRELIABLE_RPC") != "" {
+		dice := rand.Intn(10)
+		switch dice {
+		case 9:
+			rpp.cm.dLogf("drop InstallSnapshot")
+			return fmt.Errorf("RPC failed")
+		case 8:
+			rpp.cm.dLogf("delay InstallSnapshot")
+			time.Sleep(75 * time.Millisecond)
+		}
+	} else {
+		time.Sleep(time.Duration(1+rand.Intn(5)) * time.Millisecond)
+	}
+	return rpp.cm.InstallSnapshot(args, reply)
 }
 
 func (rpp *RPCProxy) Call(peer *rpc.Client, method string, args, reply any) error {
