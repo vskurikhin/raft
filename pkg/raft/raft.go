@@ -640,7 +640,7 @@ func (cm *ConsensusModule) leaderSendAEs() {
 			ni := cm.nextIndex[peerID]
 			prevLogIndex := ni - 1
 			prevLogTerm := -1
-			if prevLogIndex >= 0 {
+			if prevLogIndex >= 0 && prevLogIndex < len(cm.log) {
 				prevLogTerm = cm.log[prevLogIndex].Term
 			}
 			entries := cm.log[ni:]
