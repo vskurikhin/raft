@@ -4,6 +4,7 @@ import (
 	"log"
 	"maps"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -32,29 +33,32 @@ func runWith(values config.Values) error {
 	nums := slices.Collect(maps.Keys(values.Peers))
 	done := make(chan any)
 	ready := make(chan any)
-	count := atomic.Int64{}
 
 	storage := raft.NewMapStorage()
 	kvs := kvservice.New(values.RPCAddress.String(), values.Number, nums, storage, ready)
-	go func() {
-		for _, num := range nums {
-			err := kvs.ConnectToRaftPeer(num, values.Peers[num])
+	var wg sync.WaitGroup
+	var count atomic.Int64
+	wg.Add(len(nums) / 2)
+	for _, num := range nums {
+		go func(n int) {
+			log.Printf("connect to peer %d", n)
+			err := kvs.ConnectToRaftPeer(n, values.Peers[n])
 			for i := 0; i < Try && err != nil; i++ {
 				duration := (i * MinimalDuration) % DurationModulus
 				time.Sleep(time.Duration(duration+MinimalDuration) * time.Millisecond)
-				err = kvs.ConnectToRaftPeer(num, values.Peers[num])
+				log.Printf("try connect to peer %d", n)
+				err = kvs.ConnectToRaftPeer(n, values.Peers[n])
 			}
-
 			if err != nil {
-				log.Printf("warning connect to peer %d: error: %v", num, err)
-				count.Add(1)
-				if count.Load() > int64(len(nums)/2) {
-					log.Fatalf("failed to connect to peer %d: %v, error: not quorum: %d", num, err, len(nums)/2)
-				}
+				log.Printf("warning connect to peer %d: error: %v", n, err)
+			} else if c := count.Load(); c < int64(len(nums)/2) {
+				count.CompareAndSwap(c, c+1)
+				wg.Done()
 			}
-		}
-		ready <- true
-	}()
+		}(num)
+	}
+	wg.Wait()
+	close(ready)
 	kvs.ServeHTTP(values.HTTPAddress.String())
 	<-done
 	return nil

@@ -29,8 +29,9 @@ type Server struct {
 	rpcServer *rpc.Server
 	listener  net.Listener
 
-	commitChan  chan<- CommitEntry
-	peerClients map[int]*rpc.Client
+	commitChan    chan<- CommitEntry
+	peerClients   map[int]*rpc.Client
+	peerAddresses map[int]net.Addr
 
 	ready <-chan any
 	quit  chan any
@@ -41,7 +42,8 @@ func NewServer(serverID int, peerIds []int, storage Storage, ready <-chan any, c
 	s := new(Server)
 	s.serverID = serverID
 	s.peerIds = peerIds
-	s.peerClients = make(map[int]*rpc.Client)
+	s.peerClients = make(map[int]*rpc.Client, len(peerIds))
+	s.peerAddresses = make(map[int]net.Addr, len(peerIds))
 	s.storage = storage
 	s.ready = ready
 	s.commitChan = commitChan
@@ -97,7 +99,7 @@ func (s *Server) DisconnectAll() {
 	defer s.mu.Unlock()
 	for id := range s.peerClients {
 		if s.peerClients[id] != nil {
-			s.peerClients[id].Close()
+			_ = s.peerClients[id].Close()
 			s.peerClients[id] = nil
 		}
 	}
@@ -107,7 +109,7 @@ func (s *Server) DisconnectAll() {
 func (s *Server) Shutdown() {
 	s.cm.Stop()
 	close(s.quit)
-	s.listener.Close()
+	_ = s.listener.Close()
 	s.wg.Wait()
 }
 
@@ -127,18 +129,43 @@ func (s *Server) ConnectToPeer(peerID int, addr net.Addr) error {
 		}
 		s.peerClients[peerID] = client
 	}
+	s.peerAddresses[peerID] = addr
+	return nil
+}
+
+func (s *Server) ConnectToPeerWithTimeout(peerID int, addr net.Addr, timeout time.Duration) error {
+	s.mu.Lock()
+	if s.peerClients[peerID] == nil {
+		s.mu.Unlock()
+		client, err := net.DialTimeout("tcp", addr.String(), timeout)
+		if err != nil {
+			return err
+		}
+		s.mu.Lock()
+		if s.peerClients[peerID] == nil {
+			rpcClient := rpc.NewClient(client)
+			s.peerClients[peerID] = rpcClient
+			s.peerAddresses[peerID] = addr
+		} else {
+			_ = client.Close()
+		}
+		s.mu.Unlock()
+		return nil
+	}
+	s.mu.Unlock()
 	return nil
 }
 
 // DisconnectPeer отключает этот сервер от удаленного узла, идентифицированного по peerId.
 func (s *Server) DisconnectPeer(peerID int) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.peerClients[peerID] != nil {
 		err := s.peerClients[peerID].Close()
 		s.peerClients[peerID] = nil
+		s.mu.Unlock()
 		return err
 	}
+	s.mu.Unlock()
 	return nil
 }
 
@@ -150,9 +177,47 @@ func (s *Server) Call(id int, serviceMethod string, args, reply any) error {
 	// Если этот метод вызывается после завершения работы (когда вызывается client.Close),
 	// он вернет ошибку.
 	if peer == nil {
-		return fmt.Errorf("call client %d after it's closed", id)
+		var err error
+		peer, err = s.reConnect(id, peer)
+		if err != nil {
+			return err
+		}
 	}
-	return s.rpcProxy.Call(peer, serviceMethod, args, reply)
+	err := s.rpcProxy.Call(peer, serviceMethod, args, reply)
+	if err != nil {
+		s.mu.Lock()
+		s.peerClients[id] = nil
+		s.mu.Unlock()
+		_ = peer.Close()
+		peer, err = s.reConnect(id, peer)
+		if err != nil {
+			go s.tryReconnect(id)
+			return err
+		}
+		s.mu.Lock()
+		peerNew := s.peerClients[id]
+		s.mu.Unlock()
+		return s.rpcProxy.Call(peerNew, serviceMethod, args, reply)
+	}
+	return err
+}
+
+func (s *Server) tryReconnect(id int) {
+	s.mu.Lock()
+	s.peerClients[id] = nil
+	s.mu.Unlock()
+	_ = s.ConnectToPeerWithTimeout(id, s.peerAddresses[id], 2*ReelectionTimeoutMs*time.Millisecond)
+}
+
+func (s *Server) reConnect(id int, peer *rpc.Client) (*rpc.Client, error) {
+	errReconnect := s.ConnectToPeerWithTimeout(id, s.peerAddresses[id], ReelectionTimeoutMs/2*time.Millisecond)
+	if errReconnect != nil {
+		return nil, fmt.Errorf("call client %d after it's closed", id)
+	}
+	s.mu.Lock()
+	peer = s.peerClients[id]
+	s.mu.Unlock()
+	return peer, nil
 }
 
 // IsLeader проверяет, считает ли сервер s себя лидером в кластере Raft.

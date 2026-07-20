@@ -355,7 +355,7 @@ func (kvs *KVService) kvLogf(format string, args ...any) {
 // и используются для моделирования различных сбоев.
 
 func (kvs *KVService) ConnectToRaftPeer(peerID int, addr net.Addr) error {
-	return kvs.rs.ConnectToPeer(peerID, addr)
+	return kvs.rs.ConnectToPeerWithTimeout(peerID, addr, 2*time.Second)
 }
 
 func (kvs *KVService) DisconnectFromAllRaftPeers() {

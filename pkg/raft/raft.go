@@ -17,7 +17,7 @@ import (
 
 const (
 	DebugCM = 1
-	Quantum = 2
+	Quantum = 1
 
 	HeartbeatTimeoutMs  = 5 * 10 * Quantum
 	ReelectionTimeoutMs = 15 * 10 * Quantum
@@ -442,6 +442,8 @@ func (cm *ConsensusModule) electionTimeout() time.Duration {
 	return time.Duration(ReelectionTimeoutMs+rand.Intn(ReelectionTimeoutMs)) * time.Millisecond
 }
 
+var runElectionTimerCount atomic.Int64
+
 // runElectionTimer реализует таймер выборов. Она должна запускаться всякий раз, когда
 // мы хотим запустить таймер для выдвижения в качестве кандидата на новых выборах.
 //
@@ -449,6 +451,9 @@ func (cm *ConsensusModule) electionTimeout() time.Duration {
 // она предназначена для работы с одним (одноразовым) таймером выборов, поскольку она завершается
 // всякий раз, когда состояние CM меняется с «ведомый/кандидат» или меняется срок полномочий.
 func (cm *ConsensusModule) runElectionTimer() {
+	count := runElectionTimerCount.Load()
+	runElectionTimerCount.CompareAndSwap(count, count+1)
+	cm.dLogf("runElectionTimer started count: %d", count)
 	timeoutDuration := cm.electionTimeout()
 	cm.mu.Lock()
 	termStarted := cm.currentTerm
@@ -549,6 +554,8 @@ func (cm *ConsensusModule) startElection() {
 						}
 					}
 				}
+			} else {
+				cm.dLogf("warning while sending RequestVote to %v; error: %v", peerID, err)
 			}
 		}()
 	}
@@ -745,6 +752,8 @@ func (cm *ConsensusModule) leaderSendAEs() {
 				} else {
 					cm.mu.Unlock()
 				}
+			} else {
+				cm.dLogf("warning while sending AppendEntries to %v; error: %v", peerID, err)
 			}
 		}()
 	}
