@@ -32,6 +32,7 @@ type Server struct {
 	listener  net.Listener
 
 	commitChan    chan<- CommitEntry
+	snapshotChan  chan<- []byte
 	peerAddresses map[int]net.Addr
 	peerClients   map[int]*rpc.Client
 
@@ -53,7 +54,31 @@ type Config struct {
 // New создаёт новый сервер Raft с заданной конфигурацией cfg, хранилищем storage,
 // каналом уведомления ready (закрывается, когда кластер готов к работе) и
 // каналом фиксации commitChan, в который сервер отправляет зафиксированные записи журнала.
+// snapshotChan передаётся nil — снепшоты не используются.
+// Для поддержки снепшотов используйте NewWithSnapshot.
 func New(cfg Config, storage Storage, ready <-chan any, commitChan chan<- CommitEntry) *Server {
+	return newWithSnapshot(cfg, storage, ready, commitChan, nil)
+}
+
+// NewWithSnapshot создаёт новый сервер Raft с поддержкой снепшотов.
+// Принимает snapshotChan для передачи данных снепшота машине состояний.
+func NewWithSnapshot(
+	cfg Config,
+	storage Storage,
+	ready <-chan any,
+	commitChan chan<- CommitEntry,
+	snapshotChan chan<- []byte,
+) *Server {
+	return newWithSnapshot(cfg, storage, ready, commitChan, snapshotChan)
+}
+
+func newWithSnapshot(
+	cfg Config,
+	storage Storage,
+	ready <-chan any,
+	commitChan chan<- CommitEntry,
+	snapshotChan chan<- []byte,
+) *Server {
 	s := new(Server)
 	s.serverID = cfg.ServerID
 	s.peerIds = cfg.PeerIds
@@ -68,6 +93,7 @@ func New(cfg Config, storage Storage, ready <-chan any, commitChan chan<- Commit
 	s.storage = storage
 	s.ready = ready
 	s.commitChan = commitChan
+	s.snapshotChan = snapshotChan
 	s.quit = make(chan any)
 	return s
 }
@@ -75,17 +101,33 @@ func New(cfg Config, storage Storage, ready <-chan any, commitChan chan<- Commit
 // NewServer создаёт новый сервер Raft с указанными идентификатором serverID,
 // списком идентификаторов узлов-соседей peerIds, хранилищем storage, каналом
 // уведомления ready и каналом фиксации commitChan.
-// Является обёрткой над New для обратной совместимости.
+// snapshotChan передаётся nil для обратной совместимости — снепшоты не используются.
 func NewServer(serverID int, peerIds []int, storage Storage, ready <-chan any, commitChan chan<- CommitEntry) *Server {
-	return New(Config{
+	return newWithSnapshot(Config{
 		ServerID: serverID,
 		PeerIds:  peerIds,
-	}, storage, ready, commitChan)
+	}, storage, ready, commitChan, nil)
+}
+
+// NewServerWithSnapshot создаёт новый сервер Raft с поддержкой снепшотов.
+// Принимает snapshotChan для передачи данных снепшота машине состояний.
+func NewServerWithSnapshot(
+	serverID int,
+	peerIds []int,
+	storage Storage,
+	ready <-chan any,
+	commitChan chan<- CommitEntry,
+	snapshotChan chan<- []byte,
+) *Server {
+	return newWithSnapshot(Config{
+		ServerID: serverID,
+		PeerIds:  peerIds,
+	}, storage, ready, commitChan, snapshotChan)
 }
 
 func (s *Server) Serve(address string) {
 	s.mu.Lock()
-	s.cm = NewConsensusModule(s.serverID, s.peerIds, s, s.storage, s.ready, s.commitChan)
+	s.cm = NewConsensusModule(s.serverID, s.peerIds, s, s.storage, s.ready, s.commitChan, s.snapshotChan)
 
 	// Создаём новый RPC-сервер и регистрируем RPCProxy,
 	// который перенаправляет все методы в n.cm (ConsensusModule)
@@ -332,6 +374,26 @@ func (rpp *RPCProxy) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) 
 		time.Sleep(time.Duration(1+rand.Intn(5)) * time.Millisecond)
 	}
 	return rpp.cm.RequestVote(args, reply)
+}
+
+func (rpp *RPCProxy) InstallSnapshot(
+	args InstallSnapshotArgs,
+	reply *InstallSnapshotReply,
+) error {
+	if os.Getenv("RAFT_UNRELIABLE_RPC") != "" {
+		dice := rand.Intn(10)
+		switch dice {
+		case 9:
+			rpp.cm.dLogf("drop InstallSnapshot")
+			return fmt.Errorf("RPC failed")
+		case 8:
+			rpp.cm.dLogf("delay InstallSnapshot")
+			time.Sleep(75 * time.Millisecond)
+		}
+	} else {
+		time.Sleep(time.Duration(1+rand.Intn(5)) * time.Millisecond)
+	}
+	return rpp.cm.InstallSnapshot(args, reply)
 }
 
 func (rpp *RPCProxy) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {

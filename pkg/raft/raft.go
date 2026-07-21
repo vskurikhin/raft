@@ -20,9 +20,9 @@ const (
 	DebugCM = 1
 	Quantum = 2
 
-	HeartbeatTimeoutMs  = 5 * 13 * Quantum
-	ReelectionTimeoutMs = 17 * 13 * Quantum
-	TickerTimeoutMs     = 17 * Quantum
+	HeartbeatTimeoutMs  = 50 * Quantum
+	ReelectionTimeoutMs = 150 * Quantum
+	TickerTimeoutMs     = 10 * Quantum
 )
 
 // CommitEntry — это данные, которые Raft отправляет в канал фиксации.
@@ -68,6 +68,26 @@ type LogEntry struct {
 	Term    int
 }
 
+// SnapshotHeader — метаданные, хранящиеся вместе с данными снепшота.
+type SnapshotHeader struct {
+	LastIncludedIndex int
+	LastIncludedTerm  int
+}
+
+// InstallSnapshotArgs — аргументы RPC InstallSnapshot.
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderID          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Data              []byte
+}
+
+// InstallSnapshotReply — ответ на InstallSnapshot RPC.
+type InstallSnapshotReply struct {
+	Term int
+}
+
 // ConsensusModule (CM) реализует единый узел консенсуса Raft.
 type ConsensusModule struct {
 	// mu защищает одновременный доступ к CM.
@@ -90,6 +110,10 @@ type ConsensusModule struct {
 	// о записях журнала, зафиксированных в кластере Raft.
 	// Передаётся клиентом при создании CM.
 	commitChan chan<- CommitEntry
+
+	// snapshotChan — канал, через который CM передаёт данные снепшота
+	// машине состояний. Создаётся клиентом и передаётся в конструктор.
+	snapshotChan chan<- []byte
 
 	// newCommitReadyChan — внутренний канал уведомлений, используемый
 	// горутинами, которые фиксируют новые записи журнала, чтобы сообщить,
@@ -121,6 +145,11 @@ type ConsensusModule struct {
 	// Непостоянное состояние Raft на лидерах
 	nextIndex  map[int]int
 	matchIndex map[int]int
+
+	// Состояние снепшота
+	lastIncludedIndex int
+	lastIncludedTerm  int
+	snapshotData      []byte
 }
 
 // NewConsensusModule создаёт новый экземпляр CM с указанными
@@ -136,6 +165,7 @@ func NewConsensusModule(
 	storage Storage,
 	ready <-chan any,
 	commitChan chan<- CommitEntry,
+	snapshotChan chan<- []byte,
 ) *ConsensusModule {
 	cm := new(ConsensusModule)
 	cm.id = id
@@ -143,6 +173,7 @@ func NewConsensusModule(
 	cm.server = server
 	cm.storage = storage
 	cm.commitChan = commitChan
+	cm.snapshotChan = snapshotChan
 	cm.newCommitReadyChan = make(chan struct{}, 16)
 	cm.triggerAEChan = make(chan struct{}, 1)
 	cm.state = Follower
@@ -191,7 +222,7 @@ func (cm *ConsensusModule) Submit(command any) int {
 		return -1
 	}
 	cm.dLogf("Submit received by %v: %v", cm.state, command)
-	submitIndex := len(cm.log)
+	submitIndex := cm.getLogLength()
 	cm.log = append(cm.log, LogEntry{Command: command, Term: cm.currentTerm})
 	cm.persistToStorage()
 	cm.dLogf("... log=%v", cm.log)
@@ -201,6 +232,46 @@ func (cm *ConsensusModule) Submit(command any) int {
 	default:
 	}
 	return submitIndex
+}
+
+// TakeSnapshot сохраняет снепшот состояния машины состояний и обрезает журнал.
+// stateMachineData — сериализованное состояние машины состояний.
+// Предполагается, что cm.mu захвачен вызывающим.
+func (cm *ConsensusModule) TakeSnapshot(stateMachineData []byte) {
+	if stateMachineData == nil {
+		panic("TakeSnapshot: stateMachineData is nil")
+	}
+	if cm.lastApplied < 0 {
+		// Нет зафиксированных записей — снепшот бессмысленен.
+		return
+	}
+	if cm.lastIncludedIndex > 0 && cm.lastApplied <= cm.lastIncludedIndex {
+		// Снепшот уже покрывает последнее применение — ничего не делать.
+		return
+	}
+
+	snapIndex := cm.lastApplied
+	// snapIndex — логический индекс. Преобразуем в физический.
+	snapTerm := cm.log[snapIndex-cm.logOffset()].Term
+
+	cm.lastIncludedIndex = snapIndex
+	cm.lastIncludedTerm = snapTerm
+	cm.snapshotData = stateMachineData
+
+	// Обрезать журнал: оставить записи с логическим индексом > snapIndex.
+	// До снепшота физические индексы совпадают с логическими (offset был 1,
+	// lastIncludedIndex был 0). После снепшота offset = snapIndex + 1.
+	keepFrom := snapIndex + 1
+	if keepFrom >= len(cm.log) {
+		cm.log = cm.log[:0]
+	} else {
+		cm.log = append([]LogEntry{}, cm.log[keepFrom:]...)
+	}
+
+	cm.dLogf("snapshot taken: lastIncludedIndex=%d, lastIncludedTerm=%d, log truncated to %d entries",
+		snapIndex, snapTerm, len(cm.log))
+
+	cm.persistToStorage()
 }
 
 // Stop останавливает этот CM, очищая его состояние. Этот метод быстро возвращает результат,
@@ -246,6 +317,27 @@ func (cm *ConsensusModule) restoreFromStorage() {
 	} else {
 		log.Fatal("log not found in storage")
 	}
+
+	// Новые ключи снепшота (необязательные — обратная совместимость)
+	cm.lastIncludedIndex = 0
+	cm.lastIncludedTerm = 0
+	cm.snapshotData = nil
+
+	if idxData, found := cm.storage.Get("lastIncludedIndex"); found {
+		d := gob.NewDecoder(bytes.NewBuffer(idxData))
+		if err := d.Decode(&cm.lastIncludedIndex); err != nil {
+			log.Fatal(err)
+		}
+	}
+	if termData, found := cm.storage.Get("lastIncludedTerm"); found {
+		d := gob.NewDecoder(bytes.NewBuffer(termData))
+		if err := d.Decode(&cm.lastIncludedTerm); err != nil {
+			log.Fatal(err)
+		}
+	}
+	if snapData, found := cm.storage.Get("snapshot"); found && len(snapData) > 0 {
+		cm.snapshotData = snapData
+	}
 }
 
 // persistToStorage сохраняет всё постоянное состояние CM в cm.storage.
@@ -268,6 +360,21 @@ func (cm *ConsensusModule) persistToStorage() {
 		log.Fatal(err)
 	}
 	cm.storage.Set("log", logData.Bytes())
+
+	// Новые ключи снепшота
+	var snapIdxBuf bytes.Buffer
+	if err := gob.NewEncoder(&snapIdxBuf).Encode(cm.lastIncludedIndex); err != nil {
+		log.Fatal(err)
+	}
+	cm.storage.Set("lastIncludedIndex", snapIdxBuf.Bytes())
+
+	var snapTermBuf bytes.Buffer
+	if err := gob.NewEncoder(&snapTermBuf).Encode(cm.lastIncludedTerm); err != nil {
+		log.Fatal(err)
+	}
+	cm.storage.Set("lastIncludedTerm", snapTermBuf.Bytes())
+
+	cm.storage.Set("snapshot", cm.snapshotData)
 }
 
 // dLogf выводит отладочное сообщение, если DebugCM > 0.
@@ -276,6 +383,57 @@ func (cm *ConsensusModule) dLogf(format string, args ...any) {
 		format = fmt.Sprintf("[%d] ", cm.id) + format
 		log.Printf(format, args...)
 	}
+}
+
+// getLogEntry возвращает запись журнала по логическому индексу i.
+// Если индекс выходит за пределы доступных записей (включая снепшот),
+// возвращает false.
+// Смещение: если снепшот не создавался (lastIncludedIndex == 0), offset = 0,
+// и логические индексы совпадают с физическими для обратной совместимости.
+// После снепшота offset = lastIncludedIndex + 1.
+func (cm *ConsensusModule) getLogEntry(i int) (LogEntry, bool) {
+	offset := cm.logOffset()
+	if i < offset || i >= offset+len(cm.log) {
+		return LogEntry{}, false
+	}
+	return cm.log[i-offset], true
+}
+
+// logOffset возвращает смещение между физическим и логическим индексом.
+// Если снепшот не создавался — 0 (совпадают).
+// После снепшота — lastIncludedIndex + 1.
+func (cm *ConsensusModule) logOffset() int {
+	if cm.lastIncludedIndex > 0 {
+		return cm.lastIncludedIndex + 1
+	}
+	return 0
+}
+
+// getLogLength возвращает полную логическую длину журнала (с учётом снепшота).
+// Для пустого журнала возвращает lastIncludedIndex.
+func (cm *ConsensusModule) getLogLength() int {
+	if cm.lastIncludedIndex > 0 {
+		return cm.lastIncludedIndex + len(cm.log)
+	}
+	return len(cm.log)
+}
+
+// getLastLogIndex возвращает логический индекс последней записи журнала.
+// Если журнал пуст, возвращает lastIncludedIndex.
+func (cm *ConsensusModule) getLastLogIndex() int {
+	if len(cm.log) > 0 {
+		return cm.logOffset() + len(cm.log) - 1
+	}
+	return cm.lastIncludedIndex
+}
+
+// getLastLogTerm возвращает терм последней записи журнала.
+// Если журнал пуст, возвращает lastIncludedTerm.
+func (cm *ConsensusModule) getLastLogTerm() int {
+	if len(cm.log) > 0 {
+		return cm.log[len(cm.log)-1].Term
+	}
+	return cm.lastIncludedTerm
 }
 
 // RequestVoteArgs См. рисунок 2 в статье.
@@ -370,18 +528,26 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 		// у которой терм совпадает с PrevLogTerm.
 		// Обратите внимание, что в особом случае, когда PrevLogIndex == -1,
 		// условие считается истинным автоматически.
-		if args.PrevLogIndex == -1 ||
-			(args.PrevLogIndex < len(cm.log) && args.PrevLogTerm == cm.log[args.PrevLogIndex].Term) {
+		// Для PrevLogIndex, совпадающего с lastIncludedIndex, используем lastIncludedTerm.
+		if args.PrevLogIndex == -1 {
 			reply.Success = true
+		} else if args.PrevLogIndex == cm.lastIncludedIndex && args.PrevLogTerm == cm.lastIncludedTerm {
+			reply.Success = true
+		} else if entry, ok := cm.getLogEntry(args.PrevLogIndex); ok && args.PrevLogTerm == entry.Term {
+			reply.Success = true
+		}
 
+		if reply.Success {
 			// Находит точку вставки — место, где происходит несовпадение термов
-			// между существующими записями журнала, начиная с PrevLogIndex+1,t
+			// между существующими записями журнала, начиная с PrevLogIndex+1,
 			// и новыми записями, отправленными лидером через RPC.
+			offset := cm.logOffset()
 			logInsertIndex := args.PrevLogIndex + 1
 			newEntriesIndex := 0
 
-			for logInsertIndex < len(cm.log) && newEntriesIndex < len(args.Entries) {
-				if cm.log[logInsertIndex].Term != args.Entries[newEntriesIndex].Term {
+			for logInsertIndex < offset+len(cm.log) && newEntriesIndex < len(args.Entries) {
+				entry, ok := cm.getLogEntry(logInsertIndex)
+				if !ok || entry.Term != args.Entries[newEntriesIndex].Term {
 					break
 				}
 				logInsertIndex++
@@ -394,13 +560,17 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 			//   или на индекс, где терм записи отличается от соответствующей записи журнала.
 			if newEntriesIndex < len(args.Entries) {
 				cm.dLogf("... inserting entries %v from index %d", args.Entries[newEntriesIndex:], logInsertIndex)
-				cm.log = append(cm.log[:logInsertIndex], args.Entries[newEntriesIndex:]...)
+				// Обрезаем журнал до logInsertIndex (физический индекс)
+				physIndex := logInsertIndex - offset
+				physIndex = max(physIndex, 0)
+				physIndex = min(physIndex, len(cm.log))
+				cm.log = append(cm.log[:physIndex], args.Entries[newEntriesIndex:]...)
 				cm.dLogf("... log is now: %v", cm.log)
 			}
 
 			// Устанавливает индекс фиксации.
 			if args.LeaderCommit > cm.commitIndex {
-				cm.commitIndex = min(args.LeaderCommit, len(cm.log)-1)
+				cm.commitIndex = min(args.LeaderCommit, cm.getLastLogIndex())
 				cm.dLogf("... setting commitIndex=%d", cm.commitIndex)
 				select {
 				case cm.newCommitReadyChan <- struct{}{}:
@@ -411,18 +581,20 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 			// Не найдено совпадение для PrevLogIndex/PrevLogTerm.
 			// Заполнить ConflictIndex и ConflictTerm, чтобы помочь лидеру
 			// быстрее привести наш журнал в актуальное состояние.
-			if args.PrevLogIndex >= len(cm.log) {
-				reply.ConflictIndex = len(cm.log)
+			logLen := cm.getLogLength()
+			if args.PrevLogIndex >= logLen {
+				reply.ConflictIndex = logLen
 				reply.ConflictTerm = -1
 			} else {
 				// PrevLogIndex указывает на существующую запись в нашем журнале,
-				// но PrevLogTerm не совпадает с термом записи
-				// cm.log[PrevLogIndex].
-				reply.ConflictTerm = cm.log[args.PrevLogIndex].Term
+				// но PrevLogTerm не совпадает с термом записи.
+				entry, _ := cm.getLogEntry(args.PrevLogIndex)
+				reply.ConflictTerm = entry.Term
 
 				var i int
-				for i = args.PrevLogIndex - 1; i >= 0; i-- {
-					if cm.log[i].Term != reply.ConflictTerm {
+				for i = args.PrevLogIndex - 1; i >= cm.lastIncludedIndex; i-- {
+					entry, ok := cm.getLogEntry(i)
+					if !ok || entry.Term != reply.ConflictTerm {
 						break
 					}
 				}
@@ -434,6 +606,91 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 	reply.Term = cm.currentTerm
 	cm.persistToStorage()
 	cm.dLogf("AppendEntries reply: %+v", *reply)
+	return nil
+}
+
+// InstallSnapshot — RPC, который лидер отправляет отстающему узлу.
+// Получатель (follower) применяет снепшот, заменяет свой журнал и персистит.
+func (cm *ConsensusModule) InstallSnapshot(
+	args InstallSnapshotArgs,
+	reply *InstallSnapshotReply,
+) error {
+	cm.mu.Lock()
+	if cm.state == Dead {
+		cm.mu.Unlock()
+		return nil
+	}
+
+	cm.dLogf("InstallSnapshot: %+v [currentTerm=%d, lastIncludedIndex=%d]",
+		args, cm.currentTerm, cm.lastIncludedIndex)
+
+	// Шаг 1: проверка терма
+	if args.Term < cm.currentTerm {
+		reply.Term = cm.currentTerm
+		cm.mu.Unlock()
+		return nil
+	}
+
+	if args.Term > cm.currentTerm {
+		cm.becomeFollower(args.Term)
+	}
+
+	reply.Term = cm.currentTerm
+
+	// Шаг 2: если снепшот новее текущего
+	if args.LastIncludedIndex <= cm.lastIncludedIndex {
+		cm.dLogf("InstallSnapshot: ignoring, already have lastIncludedIndex=%d >= %d",
+			cm.lastIncludedIndex, args.LastIncludedIndex)
+		cm.mu.Unlock()
+		return nil
+	}
+
+	// Шаг 3: принять снепшот
+	cm.lastIncludedIndex = args.LastIncludedIndex
+	cm.lastIncludedTerm = args.LastIncludedTerm
+	cm.snapshotData = args.Data
+
+	if cm.commitIndex < args.LastIncludedIndex {
+		cm.commitIndex = args.LastIncludedIndex
+	}
+	if cm.lastApplied < args.LastIncludedIndex {
+		cm.lastApplied = args.LastIncludedIndex
+	}
+
+	// Шаг 4: обрезать журнал.
+	// До InstallSnapshot записи в cm.log имеют логические индексы
+	// от cm.logOffset() до cm.logOffset()+len(cm.log)-1.
+	// После установки нового lastIncludedIndex нужно удалить записи
+	// с логическим индексом <= args.LastIncludedIndex.
+	oldOffset := cm.logOffset()
+	keepFrom := args.LastIncludedIndex + 1
+	truncateFrom := keepFrom - oldOffset
+	truncateFrom = max(truncateFrom, 0)
+	if truncateFrom >= len(cm.log) {
+		cm.log = cm.log[:0]
+	} else {
+		cm.log = append([]LogEntry{}, cm.log[truncateFrom:]...)
+	}
+
+	cm.dLogf("InstallSnapshot: log truncated to %d entries, lastIncludedIndex=%d",
+		len(cm.log), cm.lastIncludedIndex)
+
+	// Шаг 5: персистенция
+	cm.persistToStorage()
+	cm.mu.Unlock()
+
+	// Шаг 6: уведомить snapshotChan и commitChanSender
+	select {
+	case cm.snapshotChan <- args.Data:
+	default:
+		cm.dLogf("InstallSnapshot: snapshotChan full, dropping snapshot notification")
+	}
+
+	select {
+	case cm.newCommitReadyChan <- struct{}{}:
+	default:
+	}
+
 	return nil
 }
 
@@ -590,8 +847,9 @@ func (cm *ConsensusModule) becomeFollower(term int) {
 func (cm *ConsensusModule) startLeader() {
 	cm.state = Leader
 
+	logLen := cm.getLogLength()
 	for _, peerID := range cm.peerIds {
-		cm.nextIndex[peerID] = len(cm.log)
+		cm.nextIndex[peerID] = logLen
 		cm.matchIndex[peerID] = -1
 	}
 	cm.dLogf(
@@ -654,12 +912,22 @@ func (cm *ConsensusModule) nextIndexArgsEntries(peerID, savedCurrentTerm int) (i
 	ni := cm.nextIndex[peerID]
 	prevLogIndex := ni - 1
 	prevLogTerm := -1
-	if 0 <= prevLogIndex && prevLogIndex < len(cm.log) {
-		prevLogTerm = cm.log[prevLogIndex].Term
+	if prevLogIndex == cm.lastIncludedIndex {
+		prevLogTerm = cm.lastIncludedTerm
+	} else if entry, ok := cm.getLogEntry(prevLogIndex); ok {
+		prevLogTerm = entry.Term
 	}
 	var entries []LogEntry
-	if ni < len(cm.log) {
-		entries = append([]LogEntry{}, cm.log[ni:]...)
+	logLen := cm.getLogLength()
+	if ni < logLen {
+		offset := cm.logOffset()
+		from := ni - offset
+		from = max(from, 0)
+		if from < len(cm.log) {
+			entries = append([]LogEntry{}, cm.log[from:]...)
+		} else {
+			entries = nil
+		}
 	} else {
 		entries = nil
 	}
@@ -679,6 +947,19 @@ func (cm *ConsensusModule) nextIndexArgsEntries(peerID, savedCurrentTerm int) (i
 // peerID - сосед
 // savedCurrentTerm - терм.
 func (cm *ConsensusModule) leaderSendAEsToPeer(peerID, savedCurrentTerm int) {
+	// Проверка: нужен ли InstallSnapshot
+	cm.mu.Lock()
+	if cm.state != Leader {
+		cm.mu.Unlock()
+		return
+	}
+	if cm.nextIndex[peerID] <= cm.lastIncludedIndex && cm.snapshotData != nil {
+		cm.mu.Unlock()
+		cm.sendInstallSnapshot(peerID, savedCurrentTerm)
+		return
+	}
+	cm.mu.Unlock()
+
 	ni, args, entries := cm.nextIndexArgsEntries(peerID, savedCurrentTerm)
 	cm.dLogf("sending AppendEntries to %v: ni=%d, args=%+v", peerID, ni, args)
 	var reply AppendEntriesReply
@@ -707,11 +988,16 @@ func (cm *ConsensusModule) leaderSendAEsToPeer(peerID, savedCurrentTerm int) {
 				cm.matchIndex[peerID] = cm.nextIndex[peerID] - 1
 
 				savedCommitIndex := cm.commitIndex
-				for i := cm.commitIndex + 1; i < len(cm.log); i++ {
-					if cm.log[i].Term == cm.currentTerm {
+				logLen := cm.getLogLength()
+				for i := cm.commitIndex + 1; i < logLen; i++ {
+					entry, ok := cm.getLogEntry(i)
+					if !ok {
+						break
+					}
+					if entry.Term == cm.currentTerm {
 						matchCount := 1
-						for _, peerID := range cm.peerIds {
-							if cm.matchIndex[peerID] >= i {
+						for _, pid := range cm.peerIds {
+							if cm.matchIndex[pid] >= i {
 								matchCount++
 							}
 						}
@@ -746,9 +1032,10 @@ func (cm *ConsensusModule) leaderSendAEsToPeer(peerID, savedCurrentTerm int) {
 			} else {
 				if reply.ConflictTerm >= 0 {
 					lastIndexOfTerm := -1
-					for i, v := range slices.Backward(cm.log) {
-						if v.Term == reply.ConflictTerm {
-							lastIndexOfTerm = i
+					offset := cm.logOffset()
+					for i := range slices.Backward(cm.log) {
+						if cm.log[i].Term == reply.ConflictTerm {
+							lastIndexOfTerm = i + offset
 							break
 						}
 					}
@@ -769,6 +1056,51 @@ func (cm *ConsensusModule) leaderSendAEsToPeer(peerID, savedCurrentTerm int) {
 	}
 }
 
+// sendInstallSnapshot отправляет InstallSnapshot узлу peerID.
+// Предполагается, что cm.mu НЕ захвачен при входе.
+func (cm *ConsensusModule) sendInstallSnapshot(peerID, savedCurrentTerm int) {
+	cm.mu.Lock()
+	if cm.state != Leader {
+		cm.mu.Unlock()
+		return
+	}
+
+	args := InstallSnapshotArgs{
+		Term:              savedCurrentTerm,
+		LeaderID:          cm.id,
+		LastIncludedIndex: cm.lastIncludedIndex,
+		LastIncludedTerm:  cm.lastIncludedTerm,
+		Data:              cm.snapshotData,
+	}
+	cm.mu.Unlock()
+
+	cm.dLogf("sending InstallSnapshot to %d: lastIncludedIndex=%d, lastIncludedTerm=%d, dataLen=%d",
+		peerID, args.LastIncludedIndex, args.LastIncludedTerm, len(args.Data))
+
+	var reply InstallSnapshotReply
+	if err := cm.server.Call(peerID, "ConsensusModule.InstallSnapshot", args, &reply); err != nil {
+		cm.dLogf("sendInstallSnapshot to %d failed: %v", peerID, err)
+		return
+	}
+
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	if reply.Term > cm.currentTerm {
+		cm.dLogf("term out of date in InstallSnapshot reply")
+		cm.becomeFollower(reply.Term)
+		return
+	}
+
+	if cm.state == Leader && savedCurrentTerm == reply.Term {
+		cm.nextIndex[peerID] = cm.lastIncludedIndex + 1
+		cm.matchIndex[peerID] = cm.lastIncludedIndex
+
+		cm.dLogf("InstallSnapshot to %d success: nextIndex=%d, matchIndex=%d",
+			peerID, cm.nextIndex[peerID], cm.matchIndex[peerID])
+	}
+}
+
 // leaderSendAEs отправляет очередной раунд сообщений AppendEntries всем
 // соседям, обрабатывает их ответы и обновляет состояние CM.
 func (cm *ConsensusModule) leaderSendAEs() {
@@ -785,16 +1117,16 @@ func (cm *ConsensusModule) leaderSendAEs() {
 	}
 }
 
-// lastLogIndexAndTerm возвращает индекс последней записи журнала
-// и терм последней записи журнала данного сервера
-// (или -1, если журнал пуст).
+// lastLogIndexAndTerm возвращает логический индекс последней записи журнала
+// и терм последней записи журнала данного сервера.
+// Если журнал пуст, возвращает lastIncludedIndex, lastIncludedTerm.
 // Предполагается, что cm.mu уже заблокирован.
 func (cm *ConsensusModule) lastLogIndexAndTerm() (int, int) {
 	if len(cm.log) > 0 {
-		lastIndex := len(cm.log) - 1
-		return lastIndex, cm.log[lastIndex].Term
+		lastIndex := cm.logOffset() + len(cm.log) - 1
+		return lastIndex, cm.log[len(cm.log)-1].Term
 	}
-	return -1, -1
+	return cm.lastIncludedIndex, cm.lastIncludedTerm
 }
 
 // commitChanSender отвечает за отправку зафиксированных записей журнала
@@ -819,8 +1151,20 @@ func (cm *ConsensusModule) commitChanSender() {
 		cm.mu.Lock()
 		savedLastApplied := cm.lastApplied
 		var entries []LogEntry
+
 		if cm.commitIndex > cm.lastApplied {
-			entries = append([]LogEntry{}, cm.log[cm.lastApplied+1:cm.commitIndex+1]...)
+			offset := cm.logOffset()
+			from := cm.lastApplied + 1 - offset
+			to := cm.commitIndex + 1 - offset
+			if from < 0 {
+				from = 0
+			}
+			if to > len(cm.log) {
+				to = len(cm.log)
+			}
+			if to > from {
+				entries = append([]LogEntry{}, cm.log[from:to]...)
+			}
 			cm.lastApplied = cm.commitIndex
 		}
 		cm.mu.Unlock()
