@@ -38,10 +38,12 @@ func runWith(values config.Values) error {
 	cfg := kvservice.Config{
 		HTTPAddress: values.HTTPAddress.String(),
 		Config: raft.Config{
-			PeerAddresses: values.Peers,
-			PeerIds:       nums,
-			RPCAddress:    values.RPCAddress.String(),
-			ServerID:      values.Number,
+			PeerAddresses:     values.Peers,
+			PeerIds:           nums,
+			RPCAddress:        values.RPCAddress.String(),
+			ServerID:          values.Number,
+			SnapshotThreshold: 8,
+			SnapshotInterval:  4,
 		},
 	}
 	storage := raft.NewMapStorage()

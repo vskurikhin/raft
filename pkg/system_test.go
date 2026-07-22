@@ -150,7 +150,7 @@ func TestConcurrentClientsPutsAndGets(t *testing.T) {
 			}
 		}()
 	}
-	sleepMs(150)
+	sleepMs(150 * raft.Quantum)
 
 	for i := range n {
 		go func() {
@@ -158,7 +158,7 @@ func TestConcurrentClientsPutsAndGets(t *testing.T) {
 			h.CheckGet(c, fmt.Sprintf("key%v", i), fmt.Sprintf("value%v", i))
 		}()
 	}
-	sleepMs(150)
+	sleepMs(150 * raft.Quantum)
 }
 
 func Test5ServerConcurrentClientsPutsAndGets(t *testing.T) {

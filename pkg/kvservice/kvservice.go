@@ -30,6 +30,10 @@ type KVService struct {
 	// команд они отправляются через этот канал.
 	commitChan chan raft.CommitEntry
 
+	// snapshotChan — канал, через который Raft передаёт данные снепшота
+	// для полной замены состояния машины состояний.
+	snapshotChan chan []byte
+
 	// commitSubs — активные подписки на события фиксации команд в данном
 	// сервисе. Подробнее см. метод createCommitSubscription.
 	commitSubs map[int]chan Command
@@ -61,17 +65,22 @@ type Config struct {
 func New(cfg Config, storage raft.Storage, readyChan <-chan any) *KVService {
 	gob.Register(Command{})
 	commitChan := make(chan raft.CommitEntry)
+	snapshotChan := make(chan []byte, 1)
+	ds := NewDataStore()
 
 	// raft.Server обрабатывает RPC-вызовы протокола Raft в кластере.
 	// После вызова Serve сервер готов принимать RPC-соединения
 	// от остальных узлов.
-	rs := raft.New(cfg.Config, storage, readyChan, commitChan)
+	rs := raft.NewWithSnapshot(cfg.Config, storage, readyChan, commitChan, snapshotChan)
 	rs.Serve(cfg.RPCAddress)
+	rs.SetSnapshotDataFn(ds.Snapshot)
+
 	kvs := &KVService{
 		id:                   cfg.ServerID,
 		rs:                   rs,
 		commitChan:           commitChan,
-		ds:                   NewDataStore(),
+		snapshotChan:         snapshotChan,
+		ds:                   ds,
 		commitSubs:           make(map[int]chan Command),
 		httpResponsesEnabled: true,
 	}
@@ -146,6 +155,8 @@ func (kvs *KVService) Shutdown() error {
 	kvs.rs.Shutdown()
 	kvs.kvLogf("closing commitChan")
 	close(kvs.commitChan)
+	kvs.kvLogf("closing snapshotChan")
+	close(kvs.snapshotChan)
 
 	if kvs.srv != nil {
 		kvs.kvLogf("shutting down HTTP server")
@@ -321,34 +332,47 @@ func (kvs *KVService) handleCAS(w http.ResponseWriter, req *http.Request) {
 // Обрабатывает как обычные записи журнала, так и snapshot-уведомления.
 func (kvs *KVService) runUpdater() {
 	go func() {
-		for entry := range kvs.commitChan {
-			cmd, ok := entry.Command.(Command)
-			if !ok {
-				kvs.kvLogf("unknown command %v", entry.Command)
-				continue
-			}
-
-			switch cmd.Kind {
-			case CommandGet:
-				cmd.ResultValue, cmd.ResultFound = kvs.ds.Get(cmd.Key)
-			case CommandPut:
-				cmd.ResultValue, cmd.ResultFound = kvs.ds.Put(cmd.Key, cmd.Value)
-			case CommandCAS:
-				cmd.ResultValue, cmd.ResultFound = kvs.ds.CAS(cmd.Key, cmd.CompareValue, cmd.Value)
-			default:
-				kvs.kvLogf("unknown command %v", cmd)
-				continue
-			}
-
-			// Передать команду подписчику, ожидающему фиксации записи
-			// с данным индексом журнала, после чего закрыть подписку,
-			// поскольку она является одноразовой.
-			if sub := kvs.popCommitSubscription(entry.Index); sub != nil {
-				select {
-				case sub <- cmd:
-				default:
+		for {
+			select {
+			case snapshotData, ok := <-kvs.snapshotChan:
+				if !ok {
+					return
 				}
-				close(sub)
+				kvs.kvLogf("applying snapshot, %d bytes", len(snapshotData))
+				kvs.ds.RestoreFromSnapshot(snapshotData)
+
+			case entry, ok := <-kvs.commitChan:
+				if !ok {
+					return
+				}
+				cmd, ok := entry.Command.(Command)
+				if !ok {
+					kvs.kvLogf("unknown command %v", entry.Command)
+					continue
+				}
+
+				switch cmd.Kind {
+				case CommandGet:
+					cmd.ResultValue, cmd.ResultFound = kvs.ds.Get(cmd.Key)
+				case CommandPut:
+					cmd.ResultValue, cmd.ResultFound = kvs.ds.Put(cmd.Key, cmd.Value)
+				case CommandCAS:
+					cmd.ResultValue, cmd.ResultFound = kvs.ds.CAS(cmd.Key, cmd.CompareValue, cmd.Value)
+				default:
+					kvs.kvLogf("unknown command %v", cmd)
+					continue
+				}
+
+				// Передать команду подписчику, ожидающему фиксации записи
+				// с данным индексом журнала, после чего закрыть подписку,
+				// поскольку она является одноразовой.
+				if sub := kvs.popCommitSubscription(entry.Index); sub != nil {
+					select {
+					case sub <- cmd:
+					default:
+					}
+					close(sub)
+				}
 			}
 		}
 	}()
