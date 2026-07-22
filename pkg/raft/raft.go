@@ -20,9 +20,13 @@ const (
 	DebugCM = 1
 	Quantum = 2
 
-	HeartbeatTimeoutMs  = 50 * Quantum
-	ReelectionTimeoutMs = 150 * Quantum
-	TickerTimeoutMs     = 10 * Quantum
+	HeartbeatTimeoutMs  = 5 * 13 * Quantum
+	ReelectionTimeoutMs = 17 * 13 * Quantum
+	TickerTimeoutMs     = 17 * Quantum
+
+	// HeartbeatTimeoutMs  = 50 * Quantum
+	// ReelectionTimeoutMs = 150 * Quantum
+	// TickerTimeoutMs     = 10 * Quantum
 )
 
 // CommitEntry — это данные, которые Raft отправляет в канал фиксации.
@@ -150,6 +154,11 @@ type ConsensusModule struct {
 	lastIncludedIndex int
 	lastIncludedTerm  int
 	snapshotData      []byte
+
+	// Параметры политики снепшотов
+	snapshotThreshold int
+	snapshotInterval  int
+	snapshotDataFn    func() []byte
 }
 
 // NewConsensusModule создаёт новый экземпляр CM с указанными
@@ -268,10 +277,30 @@ func (cm *ConsensusModule) TakeSnapshot(stateMachineData []byte) {
 		cm.log = append([]LogEntry{}, cm.log[keepFrom:]...)
 	}
 
-	cm.dLogf("snapshot taken: lastIncludedIndex=%d, lastIncludedTerm=%d, log truncated to %d entries",
-		snapIndex, snapTerm, len(cm.log))
+	cm.dLogf(
+		"snapshot taken: lastIncludedIndex=%d, lastIncludedTerm=%d, log truncated to %d entries",
+		snapIndex, snapTerm, len(cm.log),
+	)
 
 	cm.persistToStorage()
+}
+
+// SetSnapshotPolicy устанавливает параметры политики автоматических снепшотов.
+// threshold > 0 включает автоматические снепшоты; dataFn вызывается для получения
+// данных машины состояний при создании снепшота.
+func (cm *ConsensusModule) SetSnapshotPolicy(threshold, interval int) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.snapshotThreshold = threshold
+	cm.snapshotInterval = interval
+}
+
+// SetSnapshotDataFn устанавливает функцию, вызываемую для получения данных
+// машины состояний при создании снепшота.
+func (cm *ConsensusModule) SetSnapshotDataFn(dataFn func() []byte) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.snapshotDataFn = dataFn
 }
 
 // Stop останавливает этот CM, очищая его состояние. Этот метод быстро возвращает результат,
@@ -413,7 +442,7 @@ func (cm *ConsensusModule) logOffset() int {
 // Для пустого журнала возвращает lastIncludedIndex.
 func (cm *ConsensusModule) getLogLength() int {
 	if cm.lastIncludedIndex > 0 {
-		return cm.lastIncludedIndex + len(cm.log)
+		return cm.lastIncludedIndex + 1 + len(cm.log)
 	}
 	return len(cm.log)
 }
@@ -1074,8 +1103,10 @@ func (cm *ConsensusModule) sendInstallSnapshot(peerID, savedCurrentTerm int) {
 	}
 	cm.mu.Unlock()
 
-	cm.dLogf("sending InstallSnapshot to %d: lastIncludedIndex=%d, lastIncludedTerm=%d, dataLen=%d",
-		peerID, args.LastIncludedIndex, args.LastIncludedTerm, len(args.Data))
+	cm.dLogf(
+		"sending InstallSnapshot to %d: lastIncludedIndex=%d, lastIncludedTerm=%d, dataLen=%d",
+		peerID, args.LastIncludedIndex, args.LastIncludedTerm, len(args.Data),
+	)
 
 	var reply InstallSnapshotReply
 	if err := cm.server.Call(peerID, "ConsensusModule.InstallSnapshot", args, &reply); err != nil {
@@ -1153,19 +1184,7 @@ func (cm *ConsensusModule) commitChanSender() {
 		var entries []LogEntry
 
 		if cm.commitIndex > cm.lastApplied {
-			offset := cm.logOffset()
-			from := cm.lastApplied + 1 - offset
-			to := cm.commitIndex + 1 - offset
-			if from < 0 {
-				from = 0
-			}
-			if to > len(cm.log) {
-				to = len(cm.log)
-			}
-			if to > from {
-				entries = append([]LogEntry{}, cm.log[from:to]...)
-			}
-			cm.lastApplied = cm.commitIndex
+			entries = cm.pendingCommittedEntries()
 		}
 		cm.mu.Unlock()
 		cm.dLogf("commitChanSender entries=%v, savedLastApplied=%d", entries, savedLastApplied)
@@ -1186,5 +1205,50 @@ func (cm *ConsensusModule) commitChanSender() {
 				return
 			}
 		}
+
+		// Проверить, не пора ли создать снепшот (только на лидере).
+		cm.mu.Lock()
+		if cm.shouldTakeSnapshot() {
+			cm.dLogf("triggering snapshot: logLen=%d, threshold=%d, gap=%d",
+				len(cm.log), cm.snapshotThreshold, cm.lastApplied-cm.lastIncludedIndex)
+			data := cm.snapshotDataFn()
+			cm.TakeSnapshot(data)
+			cm.mu.Unlock()
+		} else {
+			cm.mu.Unlock()
+		}
 	}
+}
+
+func (cm *ConsensusModule) shouldTakeSnapshot() bool {
+	return cm.state == Leader &&
+		cm.snapshotThreshold > 0 &&
+		len(cm.log) >= cm.snapshotThreshold &&
+		cm.lastApplied-cm.lastIncludedIndex >= cm.snapshotInterval &&
+		cm.snapshotDataFn != nil
+}
+
+// pendingCommittedEntries возвращает срез записей журнала, которые были
+// зафиксированы, но ещё не применены к машине состояний.
+//
+// Метод вычисляет диапазон [lastApplied+1, commitIndex] с учётом смещения
+// logOffset, обрезает границы по длине журнала и обновляет lastApplied
+// до commitIndex. entries пуст, если новых зафиксированных записей нет.
+//
+// Предполагается, что cm.mu захвачен вызывающим.
+func (cm *ConsensusModule) pendingCommittedEntries() (entries []LogEntry) {
+	offset := cm.logOffset()
+	from := cm.lastApplied + 1 - offset
+	to := cm.commitIndex + 1 - offset
+	if from < 0 {
+		from = 0
+	}
+	if to > len(cm.log) {
+		to = len(cm.log)
+	}
+	if to > from {
+		entries = append([]LogEntry{}, cm.log[from:to]...)
+	}
+	cm.lastApplied = cm.commitIndex
+	return entries
 }

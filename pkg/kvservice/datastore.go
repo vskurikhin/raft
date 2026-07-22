@@ -1,6 +1,11 @@
 package kvservice
 
-import "sync"
+import (
+	"bytes"
+	"encoding/gob"
+	"fmt"
+	"sync"
+)
 
 // DataStore — простое потокобезопасное хранилище «ключ-значение»,
 // используемое в качестве внутреннего хранилища данных для kvservice.
@@ -53,4 +58,33 @@ func (ds *DataStore) CAS(key, compare, value string) (string, bool) {
 		ds.data[key] = value
 	}
 	return prevValue, ok
+}
+
+// Snapshot сериализует полное содержимое data в []byte.
+// Результат может быть десериализован RestoreFromSnapshot.
+func (ds *DataStore) Snapshot() []byte {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	if err := enc.Encode(ds.data); err != nil {
+		panic(fmt.Sprintf("gob.Encode(data) failed: %v", err))
+	}
+	return buf.Bytes()
+}
+
+// RestoreFromSnapshot заменяет всё содержимое data данными из снепшота.
+// data должен быть результатом вызова Snapshot().
+func (ds *DataStore) RestoreFromSnapshot(data []byte) {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+
+	var newData map[string]string
+	buf := bytes.NewBuffer(data)
+	dec := gob.NewDecoder(buf)
+	if err := dec.Decode(&newData); err != nil {
+		panic(fmt.Sprintf("gob.Decode(data) failed: %v", err))
+	}
+	ds.data = newData
 }

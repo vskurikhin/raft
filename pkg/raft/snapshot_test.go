@@ -53,7 +53,7 @@ func TestSnapshotBasic(t *testing.T) {
 
 	// Проверить хелперы
 	logLen := cm.getLogLength()
-	if logLen != 9 {
+	if logLen != 10 {
 		t.Fatalf("expected getLogLength()=9, got %d", logLen)
 	}
 	lastIdx := cm.getLastLogIndex()

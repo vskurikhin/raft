@@ -39,6 +39,10 @@ type Server struct {
 	ready <-chan any
 	quit  chan any
 	wg    sync.WaitGroup
+
+	// Параметры политики снепшотов
+	snapshotThreshold int
+	snapshotInterval  int
 }
 
 // Config — конфигурация для создания нового сервера Raft.
@@ -49,6 +53,16 @@ type Config struct {
 	PeerIds       []int
 	RPCAddress    string
 	ServerID      int
+
+	// SnapshotThreshold — количество записей в журнале после последнего
+	// снепшота, при превышении которого создаётся новый снепшот.
+	// 0 или отрицательное значение отключает автоматические снепшоты.
+	SnapshotThreshold int
+
+	// SnapshotInterval — минимальное количество зафиксированных записей
+	// между двумя снепшотами. Предотвращает создание снепшота после
+	// каждой команды, когда журнал только что обрезан.
+	SnapshotInterval int
 }
 
 // New создаёт новый сервер Raft с заданной конфигурацией cfg, хранилищем storage,
@@ -94,6 +108,8 @@ func newWithSnapshot(
 	s.ready = ready
 	s.commitChan = commitChan
 	s.snapshotChan = snapshotChan
+	s.snapshotThreshold = cfg.SnapshotThreshold
+	s.snapshotInterval = cfg.SnapshotInterval
 	s.quit = make(chan any)
 	return s
 }
@@ -128,6 +144,11 @@ func NewServerWithSnapshot(
 func (s *Server) Serve(address string) {
 	s.mu.Lock()
 	s.cm = NewConsensusModule(s.serverID, s.peerIds, s, s.storage, s.ready, s.commitChan, s.snapshotChan)
+
+	// Установить политику снепшотов из конфигурации
+	if s.snapshotThreshold > 0 {
+		s.cm.SetSnapshotPolicy(s.snapshotThreshold, s.snapshotInterval)
+	}
 
 	// Создаём новый RPC-сервер и регистрируем RPCProxy,
 	// который перенаправляет все методы в n.cm (ConsensusModule)
@@ -302,6 +323,12 @@ func (s *Server) ClosePeerClient(id int) {
 func (s *Server) IsLeader() bool {
 	_, _, isLeader := s.cm.Report()
 	return isLeader
+}
+
+// SetSnapshotDataFn устанавливает функцию, вызываемую для получения данных
+// машины состояний при создании снепшота.
+func (s *Server) SetSnapshotDataFn(fn func() []byte) {
+	s.cm.SetSnapshotDataFn(fn)
 }
 
 // Proxy предоставляет доступ к RPC-прокси, используемому данным сервером.
