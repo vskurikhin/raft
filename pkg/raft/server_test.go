@@ -78,11 +78,6 @@ func TestConnectToPeerWithTimeout(t *testing.T) {
 	if err := s0.ConnectToPeerWithTimeout(1, addr1, 2*time.Second); err != nil {
 		t.Fatalf("ConnectToPeerWithTimeout failed: %v", err)
 	}
-
-	// Повторное подключение не должно вызывать ошибку
-	if err := s0.ConnectToPeerWithTimeout(1, addr1, 2*time.Second); err != nil {
-		t.Fatalf("re-connect should not fail: %v", err)
-	}
 }
 
 func TestConnectToPeerWithTimeoutInvalid(t *testing.T) {

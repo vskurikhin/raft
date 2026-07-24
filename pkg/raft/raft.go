@@ -19,9 +19,9 @@ import (
 const (
 	Quantum = 2
 
-	HeartbeatTimeoutMs  = 5 * 13 * Quantum
-	ReelectionTimeoutMs = 17 * 13 * Quantum
-	TickerTimeoutMs     = 17 * Quantum
+	HeartbeatTimeoutMs  = 50 * Quantum
+	ReelectionTimeoutMs = 150 * Quantum
+	TickerTimeoutMs     = 10 * Quantum
 )
 
 // CommitEntry — это данные, которые Raft отправляет в канал фиксации.
@@ -705,11 +705,11 @@ func (cm *ConsensusModule) leaderSendAEsToPeer(peerID, savedCurrentTerm int) {
 			cm.mu.Unlock()
 			return
 		}
-		if cm.nextIndex[peerID] != ni {
-			cm.traceLogf("#44 ni out of date in heartbeat reply")
-			cm.mu.Unlock()
-			return
-		}
+		//if cm.nextIndex[peerID] != ni {
+		//	cm.traceLogf("#44 ni out of date in heartbeat reply")
+		//	cm.mu.Unlock()
+		//	return
+		//}
 
 		if cm.state == Leader && savedCurrentTerm == reply.Term {
 			if reply.Success {

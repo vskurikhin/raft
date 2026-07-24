@@ -5,7 +5,7 @@ import "sync"
 // DataStore — простое потокобезопасное хранилище «ключ-значение»,
 // используемое в качестве внутреннего хранилища данных для kvservice.
 type DataStore struct {
-	mu   sync.Mutex
+	mu   sync.RWMutex
 	data map[string]string
 }
 
@@ -18,8 +18,8 @@ func NewDataStore() *DataStore {
 // Get получает значение по ключу из хранилища.
 // Возвращает (v, true), если ключ найден, либо ("", false) в противном случае.
 func (ds *DataStore) Get(key string) (string, bool) {
-	ds.mu.Lock()
-	defer ds.mu.Unlock()
+	ds.mu.RLock()
+	defer ds.mu.RUnlock()
 
 	value, ok := ds.data[key]
 	return value, ok

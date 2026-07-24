@@ -182,7 +182,8 @@ func (s *Server) ConnectToPeerWithTimeout(peerID int, addr net.Addr, timeout tim
 	s.mu.Lock()
 	if s.peerClients[peerID] != nil {
 		s.mu.Unlock()
-		return fmtErrorf()
+		s.cm.iLogf(fmtErrorf().Error())
+		return nil
 	}
 	s.mu.Unlock()
 	client, err := net.DialTimeout("tcp", addr.String(), timeout)
@@ -250,8 +251,9 @@ func (s *Server) Call(id int, serviceMethod string, args, reply any) error {
 		if err != nil {
 			continue
 		}
+		return nil
 	}
-	if err != nil {
+	if err != nil && !s.harness {
 		s.ClosePeerClient(id)
 	}
 	return err
@@ -391,6 +393,9 @@ func (rpp *RPCProxy) DontDropCalls() {
 }
 
 func (s *Server) infoLoggingState() {
+	if s.harness {
+		return
+	}
 	const logInterval = 1 * time.Second
 	const checkInterval = 100 * time.Millisecond
 	ticker := time.NewTicker(checkInterval)

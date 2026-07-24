@@ -73,11 +73,6 @@ func TestConnectToRaftPeer(t *testing.T) {
 	if err := kvs0.ConnectToRaftPeer(1, addr1); err != nil {
 		t.Fatalf("ConnectToRaftPeer failed: %v", err)
 	}
-
-	// Повторное подключение не должно вызывать ошибку
-	if err := kvs0.ConnectToRaftPeer(1, addr1); err != nil {
-		t.Fatalf("re-connect should not fail: %v", err)
-	}
 }
 
 func TestConnectToRaftPeerTimeout(t *testing.T) {

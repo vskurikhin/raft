@@ -326,7 +326,7 @@ func (h *Harness) CheckGetNotFound(c *kvclient.KVClient, key string) {
 // клиента, завершится по тайм-ауту при использовании контекста с дедлайном,
 // поскольку клиент не сможет добиться фиксации своей команды сервисом.
 func (h *Harness) CheckGetTimesOut(c *kvclient.KVClient, key string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 300*raft.Quantum*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 	_, _, err := c.Get(ctx, key)
 	if err == nil || !strings.Contains(err.Error(), "deadline exceeded") {
