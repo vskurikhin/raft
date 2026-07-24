@@ -16,7 +16,7 @@ func TestSnapshotBasic(t *testing.T) {
 	ready := make(chan any)
 	close(ready)
 
-	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan)
+	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan, nil)
 
 	// Добавить 10 записей (логические индексы 0..9 при offset=0).
 	cm.mu.Lock()
@@ -118,7 +118,7 @@ func TestSnapshotPersistence(t *testing.T) {
 	ready := make(chan any)
 	close(ready)
 
-	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan)
+	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan, nil)
 
 	// Добавить записи и сделать снепшот
 	cm.mu.Lock()
@@ -139,7 +139,7 @@ func TestSnapshotPersistence(t *testing.T) {
 
 	// Создать новый CM с тем же storage
 	snapshotChan2 := make(chan []byte, 1)
-	cm2 := NewConsensusModule(1, []int{2, 3}, nil, storage, make(chan any), commitChan, snapshotChan2)
+	cm2 := NewConsensusModule(1, []int{2, 3}, nil, storage, make(chan any), commitChan, snapshotChan2, nil)
 
 	// Проверить восстановленное состояние
 	if cm2.lastIncludedIndex != 9 {
@@ -186,7 +186,7 @@ func TestSnapshotPersistenceEmptyStorage(t *testing.T) {
 		storage.Set("log", logBuf.Bytes())
 	}()
 
-	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan)
+	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan, nil)
 
 	if cm.lastIncludedIndex != 0 {
 		t.Fatalf("expected lastIncludedIndex=0, got %d", cm.lastIncludedIndex)
@@ -214,7 +214,7 @@ func TestCommitChanSenderAfterSnapshot(t *testing.T) {
 	ready := make(chan any)
 	close(ready)
 
-	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan)
+	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan, nil)
 
 	// Добавить 10 записей (логические индексы 0..9 при offset=0)
 	cm.mu.Lock()
@@ -284,7 +284,7 @@ func TestCommitChanSenderAfterInstallSnapshot(t *testing.T) {
 	ready := make(chan any)
 	close(ready)
 
-	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan)
+	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan, nil)
 
 	// Имитация получения InstallSnapshot
 	args := InstallSnapshotArgs{
@@ -390,7 +390,7 @@ func TestSnapshotInstall(t *testing.T) {
 	ready := make(chan any)
 	close(ready)
 
-	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan)
+	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan, nil)
 
 	// Подготовить состояние лидера со снепшотом
 	cm.mu.Lock()
@@ -419,7 +419,7 @@ func TestSnapshotInstall(t *testing.T) {
 	followerReady := make(chan any)
 	close(followerReady)
 
-	follower := NewConsensusModule(2, []int{1, 3}, nil, followerStorage, followerReady, followerCommitChan, followerSnapshotChan)
+	follower := NewConsensusModule(2, []int{1, 3}, nil, followerStorage, followerReady, followerCommitChan, followerSnapshotChan, nil)
 
 	// Лидер отправляет InstallSnapshot follower'у
 	cm.mu.Lock()
@@ -509,7 +509,7 @@ func TestInstallSnapshotTerm(t *testing.T) {
 	ready := make(chan any)
 	close(ready)
 
-	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan)
+	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan, nil)
 
 	// Случай 1: args.Term < cm.currentTerm — отклоняем
 	cm.mu.Lock()
@@ -563,7 +563,7 @@ func TestSnapshotIgnoreWhenCovered(t *testing.T) {
 	ready := make(chan any)
 	close(ready)
 
-	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan)
+	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan, nil)
 
 	// Установить lastApplied=5, lastIncludedIndex=5
 	cm.mu.Lock()
@@ -589,7 +589,7 @@ func TestTakeSnapshotNilData(t *testing.T) {
 	ready := make(chan any)
 	close(ready)
 
-	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan)
+	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan, nil)
 
 	defer func() {
 		if r := recover(); r == nil {

@@ -17,7 +17,7 @@ func TestCommitChanSenderTrigger(t *testing.T) {
 	ready := make(chan any)
 	close(ready)
 
-	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan)
+	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan, nil)
 	cm.state = Leader
 	cm.currentTerm = 1
 	cm.snapshotThreshold = 5
@@ -75,7 +75,7 @@ func TestCommitChanSenderTriggerWithoutDataFn(t *testing.T) {
 	ready := make(chan any)
 	close(ready)
 
-	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan)
+	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan, nil)
 	cm.state = Leader
 	cm.currentTerm = 1
 	cm.snapshotThreshold = 5
@@ -138,7 +138,7 @@ func TestCommitChanSenderTriggerDoesNotFireOnFollower(t *testing.T) {
 	ready := make(chan any)
 	close(ready)
 
-	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan)
+	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan, nil)
 	cm.state = Follower // не лидер
 	cm.currentTerm = 1
 	cm.snapshotThreshold = 5

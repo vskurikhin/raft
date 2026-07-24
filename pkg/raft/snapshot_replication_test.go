@@ -15,7 +15,7 @@ func TestGetLogLengthAfterSnapshot(t *testing.T) {
 	ready := make(chan any)
 	close(ready)
 
-	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan)
+	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan, nil)
 
 	// Добавить 8 записей (логические индексы 0..7)
 	cm.mu.Lock()
@@ -75,7 +75,7 @@ func TestLogOffsetAfterSnapshot(t *testing.T) {
 	ready := make(chan any)
 	close(ready)
 
-	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan)
+	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan, nil)
 
 	// Случай 1: до снапшота (lastIncludedIndex = 0) → offset = 0
 	if cm.logOffset() != 0 {
@@ -120,7 +120,7 @@ func TestSnapshotThenReplication(t *testing.T) {
 	ready := make(chan any)
 	close(ready)
 
-	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan)
+	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan, nil)
 
 	// Добавить 8 записей (логические индексы 0..7)
 	cm.mu.Lock()
@@ -189,7 +189,7 @@ func TestSnapshotThenCommit(t *testing.T) {
 	ready := make(chan any)
 	close(ready)
 
-	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan)
+	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan, nil)
 
 	// Добавить 8 записей (логические индексы 0..7)
 	cm.mu.Lock()
@@ -257,7 +257,7 @@ func TestGetLogLengthAfterSnapshotWithEntries(t *testing.T) {
 	ready := make(chan any)
 	close(ready)
 
-	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan)
+	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan, nil)
 
 	// Добавить 8 записей (логические индексы 0..7)
 	cm.mu.Lock()

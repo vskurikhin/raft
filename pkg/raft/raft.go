@@ -18,7 +18,7 @@ import (
 
 const (
 	DebugCM = 0
-	Quantum = 2
+	Quantum = 1
 
 	HeartbeatTimeoutMs  = 50 * Quantum
 	ReelectionTimeoutMs = 150 * Quantum
@@ -37,6 +37,13 @@ type CommitEntry struct {
 
 	// Term — это терм Raft, в котором была зафиксирована команда клиента.
 	Term int
+
+	// Sync — маркер синхронизации. Если true, эта запись не содержит команды,
+	// а является сигналом для runUpdater подтвердить, что DataStore догнал
+	// индекс snapIndex (Index). Используется для синхронизации commitChanSender
+	// с runUpdater перед созданием снапшота, чтобы гарантировать, что
+	// DataStore находится в состоянии, соответствующем snapIndex.
+	Sync bool
 }
 
 type CMState int
@@ -118,6 +125,12 @@ type ConsensusModule struct {
 	// машине состояний. Создаётся клиентом и передаётся в конструктор.
 	snapshotChan chan<- []byte
 
+	// syncDataStoreDone — канал синхронизации с runUpdater.
+	// commitChanSender ожидает на нём подтверждения, что DataStore
+	// применил все записи до snapIndex, прежде чем вызвать
+	// snapshotDataFn() для создания снапшота вне cm.mu.
+	syncDataStoreDone <-chan struct{}
+
 	// newCommitReadyChan — внутренний канал уведомлений, используемый
 	// горутинами, которые фиксируют новые записи журнала, чтобы сообщить,
 	// что эти записи могут быть отправлены в канал фиксации commitChan.
@@ -180,6 +193,7 @@ func NewConsensusModule(
 	ready <-chan any,
 	commitChan chan<- CommitEntry,
 	snapshotChan chan<- []byte,
+	syncDataStoreDone <-chan struct{},
 ) *ConsensusModule {
 	cm := new(ConsensusModule)
 	cm.id = id
@@ -188,6 +202,7 @@ func NewConsensusModule(
 	cm.storage = storage
 	cm.commitChan = commitChan
 	cm.snapshotChan = snapshotChan
+	cm.syncDataStoreDone = syncDataStoreDone
 	cm.newCommitReadyChan = make(chan struct{}, 16)
 	cm.triggerAEChan = make(chan struct{}, 1)
 	cm.state = Follower
@@ -1299,15 +1314,37 @@ func (cm *ConsensusModule) commitChanSender() {
 			}
 		}
 
-		// Проверить, не пора ли создать снепшот (только на лидере).
+		// [Раунд 1] Принять решение о создании снапшота (быстро, под cm.mu).
 		cm.mu.Lock()
-		if cm.shouldTakeSnapshot() {
-			cm.dLogf("triggering snapshot: logLen=%d, threshold=%d, gap=%d",
-				len(cm.log), cm.snapshotThreshold, cm.lastApplied-cm.lastIncludedIndex)
+		needSnapshot := cm.shouldTakeSnapshot()
+		snapIndex := cm.lastApplied
+		cm.mu.Unlock()
+
+		if needSnapshot {
+			// [Раунд 2] Отправить SyncMarker через commitChan и дождаться,
+			// пока runUpdater подтвердит, что DataStore синхронизирован
+			// до snapIndex.
+			cm.dLogf("triggering snapshot: logLen=%d, threshold=%d, gap=%d, snapIndex=%d",
+				len(cm.log), cm.snapshotThreshold, cm.lastApplied-cm.lastIncludedIndex, snapIndex)
+			ce := CommitEntry{Sync: true, Index: snapIndex}
+			select {
+			case cm.commitChan <- ce:
+			case <-cm.newCommitReadyChan:
+				cm.dLogf("commitChanSender done")
+				return
+			}
+			if cm.syncDataStoreDone != nil {
+				<-cm.syncDataStoreDone
+			}
+			// Сериализовать DataStore вне cm.mu —
+			// snapshotDataFn не блокирует Raft-операции.
 			data := cm.snapshotDataFn()
-			cm.TakeSnapshot(data)
-			cm.mu.Unlock()
-		} else {
+
+			// [Раунд 3] Применить снапшот (под cm.mu, быстро).
+			cm.mu.Lock()
+			if cm.lastApplied >= snapIndex {
+				cm.TakeSnapshot(data)
+			}
 			cm.mu.Unlock()
 		}
 	}

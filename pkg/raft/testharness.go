@@ -266,7 +266,7 @@ func (h *Harness) CheckCommitted(cmd int) (nc int, index int) {
 			if commitsLen >= 0 {
 				// If this was set already, expect the new length to be the same.
 				if len(h.commits[i]) != commitsLen {
-					h.t.Fatalf("commits[%d] = %d, commitsLen = %d", i, h.commits[i], commitsLen)
+					h.t.Fatalf("commits[%d] = %v, commitsLen = %d", i, h.commits[i], commitsLen)
 				}
 			} else {
 				commitsLen = len(h.commits[i])

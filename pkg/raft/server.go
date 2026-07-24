@@ -33,10 +33,11 @@ type Server struct {
 	rpcServer *rpc.Server
 	listener  net.Listener
 
-	commitChan    chan<- CommitEntry
-	snapshotChan  chan<- []byte
-	peerAddresses map[int]net.Addr
-	peerClients   map[int]*rpc.Client
+	commitChan        chan<- CommitEntry
+	snapshotChan      chan<- []byte
+	syncDataStoreDone <-chan struct{}
+	peerAddresses     map[int]net.Addr
+	peerClients       map[int]*rpc.Client
 
 	ready <-chan any
 	quit  chan any
@@ -65,6 +66,12 @@ type Config struct {
 	// между двумя снепшотами. Предотвращает создание снепшота после
 	// каждой команды, когда журнал только что обрезан.
 	SnapshotInterval int
+
+	// SyncDataStoreDone — канал синхронизации между commitChanSender (raft)
+	// и runUpdater (kvservice). commitChanSender ожидает на нём подтверждения,
+	// что DataStore применил все записи до snapIndex, перед вызовом
+	// snapshotDataFn() вне cm.mu. Если nil, синхронизация не выполняется.
+	SyncDataStoreDone <-chan struct{}
 }
 
 // New создаёт новый сервер Raft с заданной конфигурацией cfg, хранилищем storage,
@@ -110,6 +117,7 @@ func newWithSnapshot(
 	s.ready = ready
 	s.commitChan = commitChan
 	s.snapshotChan = snapshotChan
+	s.syncDataStoreDone = cfg.SyncDataStoreDone
 	s.snapshotThreshold = cfg.SnapshotThreshold
 	s.snapshotInterval = cfg.SnapshotInterval
 	s.quit = make(chan any)
@@ -145,7 +153,7 @@ func NewServerWithSnapshot(
 
 func (s *Server) Serve(address string) {
 	s.mu.Lock()
-	s.cm = NewConsensusModule(s.serverID, s.peerIds, s, s.storage, s.ready, s.commitChan, s.snapshotChan)
+	s.cm = NewConsensusModule(s.serverID, s.peerIds, s, s.storage, s.ready, s.commitChan, s.snapshotChan, s.syncDataStoreDone)
 
 	// Установить политику снепшотов из конфигурации
 	if s.snapshotThreshold > 0 {

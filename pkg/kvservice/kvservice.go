@@ -37,6 +37,11 @@ type KVService struct {
 	// для полной замены состояния машины состояний.
 	snapshotChan chan []byte
 
+	// syncDataStoreDone — канал синхронизации с commitChanSender (raft).
+	// runUpdater сигнализирует в него после обработки SyncMarker,
+	// подтверждая, что DataStore синхронизирован до snapIndex.
+	syncDataStoreDone chan<- struct{}
+
 	// commitSubs — активные подписки на события фиксации команд в данном
 	// сервисе. Подробнее см. метод createCommitSubscription.
 	commitSubs map[int]chan Command
@@ -71,6 +76,12 @@ func New(cfg Config, storage raft.Storage, readyChan <-chan any) *KVService {
 	snapshotChan := make(chan []byte, 1)
 	ds := NewDataStore()
 
+	// syncDataStoreDone — канал синхронизации между commitChanSender (raft)
+	// и runUpdater. Передаётся в raft.Config, откуда raft сохраняет его
+	// для ожидания перед созданием снапшота.
+	syncDataStoreDone := make(chan struct{}, 1)
+	cfg.Config.SyncDataStoreDone = syncDataStoreDone
+
 	// raft.Server обрабатывает RPC-вызовы протокола Raft в кластере.
 	// После вызова Serve сервер готов принимать RPC-соединения
 	// от остальных узлов.
@@ -83,6 +94,7 @@ func New(cfg Config, storage raft.Storage, readyChan <-chan any) *KVService {
 		rs:                   rs,
 		commitChan:           commitChan,
 		snapshotChan:         snapshotChan,
+		syncDataStoreDone:    syncDataStoreDone,
 		ds:                   ds,
 		commitSubs:           make(map[int]chan Command),
 		httpResponsesEnabled: true,
@@ -328,6 +340,14 @@ func (kvs *KVService) runUpdater() {
 			case entry, ok := <-kvs.commitChan:
 				if !ok {
 					return
+				}
+				if entry.Sync {
+					// SyncMarker: DataStore уже синхронизирован до snapIndex
+					// (все предыдущие записи из commitChan обработаны, так
+					// как канал последовательный FIFO). Сигнализируем
+					// commitChanSender, что можно вызывать snapshotDataFn.
+					kvs.syncDataStoreDone <- struct{}{}
+					continue
 				}
 				cmd, ok := entry.Command.(Command)
 				if !ok {

@@ -98,7 +98,8 @@ func TestConnectToRaftPeerWithTimeoutValue(t *testing.T) {
 	// Проверяем, что ConnectToRaftPeer использует ConnectToPeerWithTimeout
 	// с ожидаемым таймаутом 2*Quantum секунд
 	expectedTimeout := 2 * raft.Quantum * time.Second
-	if expectedTimeout != 4*time.Second {
-		t.Fatalf("expected timeout 4s, got %v", expectedTimeout)
+	expectedForQuantum := time.Duration(2*raft.Quantum) * time.Second
+	if expectedTimeout != expectedForQuantum {
+		t.Fatalf("expected timeout %v, got %v", expectedForQuantum, expectedTimeout)
 	}
 }

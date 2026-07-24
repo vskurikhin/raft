@@ -12,7 +12,7 @@ func TestSetSnapshotPolicy(t *testing.T) {
 	ready := make(chan any)
 	close(ready)
 
-	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan)
+	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan, nil)
 	defer cm.Stop()
 
 	cm.SetSnapshotPolicy(64, 16)
@@ -32,7 +32,7 @@ func TestSetSnapshotDataFn(t *testing.T) {
 	ready := make(chan any)
 	close(ready)
 
-	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan)
+	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan, nil)
 	defer cm.Stop()
 
 	called := false
@@ -64,7 +64,7 @@ func TestSnapshotThresholdCondition(t *testing.T) {
 	ready := make(chan any)
 	close(ready)
 
-	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan)
+	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan, nil)
 	defer cm.Stop()
 
 	cm.mu.Lock()
@@ -111,7 +111,7 @@ func TestSnapshotThresholdNotMet(t *testing.T) {
 	ready := make(chan any)
 	close(ready)
 
-	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan)
+	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan, nil)
 	defer cm.Stop()
 
 	cm.mu.Lock()
@@ -145,7 +145,7 @@ func TestSnapshotIntervalNotMet(t *testing.T) {
 	ready := make(chan any)
 	close(ready)
 
-	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan)
+	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan, nil)
 	defer cm.Stop()
 
 	cm.mu.Lock()
@@ -179,7 +179,7 @@ func TestSnapshotDisabled(t *testing.T) {
 	ready := make(chan any)
 	close(ready)
 
-	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan)
+	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan, nil)
 	defer cm.Stop()
 
 	cm.mu.Lock()
@@ -212,7 +212,7 @@ func TestSnapshotOnlyOnLeader(t *testing.T) {
 	ready := make(chan any)
 	close(ready)
 
-	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan)
+	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan, nil)
 	defer cm.Stop()
 
 	cm.mu.Lock()
@@ -246,7 +246,7 @@ func TestSnapshotAfterTakeSnapshotResetsGap(t *testing.T) {
 	ready := make(chan any)
 	close(ready)
 
-	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan)
+	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan, nil)
 	defer cm.Stop()
 
 	cm.mu.Lock()
@@ -312,7 +312,7 @@ func TestSnapshotPolicyWithDataFn(t *testing.T) {
 	ready := make(chan any)
 	close(ready)
 
-	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan)
+	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan, nil)
 	defer cm.Stop()
 
 	cm.mu.Lock()
