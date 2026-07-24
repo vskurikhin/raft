@@ -361,7 +361,13 @@ func (s *Server) reConnect(id int) error {
 	if s.harness {
 		return fmtErrorf()
 	}
-	err := s.ConnectToPeerWithTimeout(id, s.peerAddresses[id], ReelectionTimeoutMs/2*time.Millisecond)
+	s.mu.Lock()
+	addr := s.peerAddresses[id]
+	s.mu.Unlock()
+	if addr == nil {
+		return fmtErrorf()
+	}
+	err := s.ConnectToPeerWithTimeout(id, addr, ReelectionTimeoutMs/2*time.Millisecond)
 	if err != nil {
 		return fmtErrorf()
 	}

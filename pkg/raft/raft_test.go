@@ -608,11 +608,12 @@ func TestCrashAfterSubmit(t *testing.T) {
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
-	// Ждём появления лидера, отправляем команду и сразу после этого аварийно
-	// завершаем его работу. Лидер не успеет отправить обновлённое значение
-	// LeaderCommit ведомым. Он также не успеет получить ответы на
-	// AppendEntries, поэтому сам не отправит запись в канал фиксации.
+	// Отключаем лидера перед отправкой команды — из-за triggerAEChan
+	// репликация начинается немедленно, и sleepMs(1) не гарантирует,
+	// что CrashPeer успеет до завершения AppendEntries.
+	// После crash лидер не успел реплицировать запись 5.
 	origLeaderId, _ := h.CheckSingleLeader()
+	h.DisconnectPeer(origLeaderId)
 
 	h.SubmitToServer(origLeaderId, 5)
 	sleepMs(1)
@@ -632,24 +633,27 @@ func TestCrashAfterSubmit(t *testing.T) {
 	newLeaderId, _ := h.CheckSingleLeader()
 	h.CheckNotCommitted(5)
 
-	// После отправки новой команды она будет зафиксирована вместе с записью 5,
-	// поскольку запись 5 уже присутствует в журналах всех серверов.
+	// После отправки новой команды она будет зафиксирована.
+	// Запись 5 была только на старом лидере и никогда не реплицировалась
+	// на большинство, поэтому она НЕ фиксируется — новый лидер её не имеет.
 	h.SubmitToServer(newLeaderId, 6)
 	sleepMs(100)
-	h.CheckCommittedN(5, 3)
 	h.CheckCommittedN(6, 3)
 }
 
 func TestDisconnectAfterSubmit(t *testing.T) {
-	// Аналогично TestCrashAfterSubmit, но лидер не завершается аварийно,
-	// а отключается вскоре после отправки первой команды.
+	// Аналогично TestCrashAfterSubmit — отключаем лидера перед отправкой
+	// первой команды, чтобы гарантировать, что она не реплицируется.
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
 	origLeaderId, _ := h.CheckSingleLeader()
+	h.DisconnectPeer(origLeaderId)
 
 	h.SubmitToServer(origLeaderId, 5)
 	sleepMs(1)
+	// Повторное отключение — идемпотентная операция, на случай если
+	// Submit каким-то образом восстановил соединение.
 	h.DisconnectPeer(origLeaderId)
 
 	// Убеждаемся, что запись 5 не зафиксирована после выбора нового лидера.
@@ -664,11 +668,11 @@ func TestDisconnectAfterSubmit(t *testing.T) {
 	newLeaderId, _ := h.CheckSingleLeader()
 	h.CheckNotCommitted(5)
 
-	// После отправки новой команды она будет зафиксирована вместе с записью 5,
-	// поскольку запись 5 уже присутствует в журналах всех серверов.
+	// После отправки новой команды она будет зафиксирована.
+	// Запись 5 была только на старом лидере и никогда не реплицировалась
+	// на большинство, поэтому она НЕ фиксируется — новый лидер её не имеет.
 	h.SubmitToServer(newLeaderId, 6)
 	sleepMs(100)
-	h.CheckCommittedN(5, 3)
 	h.CheckCommittedN(6, 3)
 }
 

@@ -67,7 +67,7 @@ type Config struct {
 // RPC-адрес) и HTTP-адрес для REST API сервиса.
 func New(cfg Config, storage raft.Storage, readyChan <-chan any) *KVService {
 	gob.Register(Command{})
-	commitChan := make(chan raft.CommitEntry)
+	commitChan := make(chan raft.CommitEntry, 64)
 	snapshotChan := make(chan []byte, 1)
 	ds := NewDataStore()
 

@@ -20,13 +20,9 @@ const (
 	DebugCM = 0
 	Quantum = 2
 
-	HeartbeatTimeoutMs  = 5 * 13 * Quantum
-	ReelectionTimeoutMs = 17 * 13 * Quantum
-	TickerTimeoutMs     = 17 * Quantum
-
-	//HeartbeatTimeoutMs  = 50 * Quantum
-	//ReelectionTimeoutMs = 150 * Quantum
-	//TickerTimeoutMs     = 10 * Quantum
+	HeartbeatTimeoutMs  = 50 * Quantum
+	ReelectionTimeoutMs = 150 * Quantum
+	TickerTimeoutMs     = 10 * Quantum
 )
 
 // CommitEntry — это данные, которые Raft отправляет в канал фиксации.
@@ -113,6 +109,9 @@ type ConsensusModule struct {
 	// commitChan — канал, через который данный CM сообщает
 	// о записях журнала, зафиксированных в кластере Raft.
 	// Передаётся клиентом при создании CM.
+	// commitChanSender отправляет записи в этот канал без блокировки
+	// (канал должен быть буферизированным, чтобы не синхронизировать
+	// конвейер коммита Raft с конвейером применения команд).
 	commitChan chan<- CommitEntry
 
 	// snapshotChan — канал, через который CM передаёт данные снепшота
@@ -224,7 +223,6 @@ func NewConsensusModule(
 	cm.newCommitReadyChanWg.Add(1)
 	go cm.commitChanSender()
 	go cm.runLogPersister()
-	go cm.infoLoggingLeader()
 	return cm
 }
 
@@ -256,10 +254,14 @@ func (cm *ConsensusModule) Submit(command any) int {
 	default:
 	}
 	cm.mu.Unlock()
+
+	// Немедленно уведомить лидера о новой записи в журнале,
+	// чтобы он отправил её репликам без ожидания следующего heartbeat.
 	select {
 	case cm.triggerAEChan <- struct{}{}:
 	default:
 	}
+
 	return submitIndex
 }
 
@@ -1257,6 +1259,9 @@ func (cm *ConsensusModule) runLogPersister() {
 // Метод завершает работу после закрытия newCommitReadyChan.
 func (cm *ConsensusModule) commitChanSender() {
 	defer cm.newCommitReadyChanWg.Done()
+	if cap(cm.commitChan) == 0 {
+		cm.dLogf("commitChan is unbuffered — consider increasing capacity for better throughput")
+	}
 
 	for {
 		// Ожидание сигнала о новых зафиксированных записях.
@@ -1353,15 +1358,23 @@ func (cm *ConsensusModule) FlushPersist() {
 }
 
 func (cm *ConsensusModule) infoLoggingLeader() {
-	const interval = 1 * time.Second
+	const logInterval = 1 * time.Second
+	const checkInterval = 50 * time.Millisecond
+	ticker := time.NewTicker(checkInterval)
+	defer ticker.Stop()
 
-	for {
+	var elapsed time.Duration
+	for range ticker.C {
 		cm.mu.Lock()
 		state := cm.state
 		cm.mu.Unlock()
-		if state == Leader {
-			cm.iLogf("leader")
+		if state == Dead {
+			return
 		}
-		time.Sleep(interval)
+		elapsed += checkInterval
+		if state == Leader && elapsed >= logInterval {
+			cm.iLogf("leader")
+			elapsed = 0
+		}
 	}
 }
