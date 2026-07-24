@@ -42,29 +42,38 @@ func runWith(values config.Values) error {
 			PeerIds:           nums,
 			RPCAddress:        values.RPCAddress.String(),
 			ServerID:          values.Number,
-			SnapshotThreshold: 512,
-			SnapshotInterval:  256,
+			SnapshotThreshold: 256,
+			SnapshotInterval:  128,
 		},
 	}
 	storage := raft.NewMapStorage()
 	kvs := kvservice.New(cfg, storage, ready)
-	wg.Add(len(nums) / 2)
+	wg.Add(len(nums))
 	for _, num := range nums {
-		go connect(num, kvs, values, nums)
+		go connect(num, kvs, values)
 	}
-	wg.Wait()
-	close(ready)
+	waitReady(ready, 30*time.Second)
 	kvs.ServeHTTP(values.HTTPAddress.String())
 	<-done
 	return nil
 }
 
-var (
-	count int
-	mu    sync.Mutex
-)
+func waitReady(ready chan any, timeout time.Duration) {
+	c := make(chan any)
+	go func() {
+		wg.Wait()
+		close(c)
+	}()
+	select {
+	case <-c:
+	case <-time.After(timeout):
+		log.Printf("startup timeout reached, starting with partial connectivity")
+	}
+	close(ready)
+}
 
-func connect(n int, kvs *kvservice.KVService, values config.Values, nums []int) {
+func connect(n int, kvs *kvservice.KVService, values config.Values) {
+	defer wg.Done()
 	log.Printf("connect to peer %d", n)
 	err := kvs.ConnectToRaftPeer(n, values.Peers[n])
 	for i := 0; i < Try && err != nil; i++ {
@@ -75,10 +84,5 @@ func connect(n int, kvs *kvservice.KVService, values config.Values, nums []int) 
 	}
 	if err != nil {
 		log.Printf("warning connect to peer %d: error: %v", n, err)
-	} else if count < len(nums)/2 {
-		mu.Lock()
-		count++
-		wg.Done()
-		mu.Unlock()
 	}
 }

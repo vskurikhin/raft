@@ -17,12 +17,12 @@ import (
 )
 
 const (
-	DebugCM = 0
+	DebugCM = 1
 	Quantum = 1
 
-	HeartbeatTimeoutMs  = 50 * Quantum
-	ReelectionTimeoutMs = 150 * Quantum
-	TickerTimeoutMs     = 10 * Quantum
+	HeartbeatTimeoutMs  = 100 * Quantum
+	ReelectionTimeoutMs = 300 * Quantum
+	TickerTimeoutMs     = 20 * Quantum
 )
 
 // CommitEntry — это данные, которые Raft отправляет в канал фиксации.
@@ -1256,11 +1256,47 @@ func (cm *ConsensusModule) runLogPersister() {
 		case <-timer.C:
 			cm.mu.Lock()
 			if cm.logDirty {
-				cm.dLogf("logPersister: persisting log (%d entries)", len(cm.log))
-				cm.persistAllState()
 				cm.logDirty = false
+				logCopy := make([]LogEntry, len(cm.log))
+				copy(logCopy, cm.log)
+
+				var termData bytes.Buffer
+				if err := gob.NewEncoder(&termData).Encode(cm.currentTerm); err != nil {
+					log.Fatal(err)
+				}
+				var votedData bytes.Buffer
+				if err := gob.NewEncoder(&votedData).Encode(cm.votedFor); err != nil {
+					log.Fatal(err)
+				}
+				var snapIdxBuf bytes.Buffer
+				if err := gob.NewEncoder(&snapIdxBuf).Encode(cm.lastIncludedIndex); err != nil {
+					log.Fatal(err)
+				}
+				var snapTermBuf bytes.Buffer
+				if err := gob.NewEncoder(&snapTermBuf).Encode(cm.lastIncludedTerm); err != nil {
+					log.Fatal(err)
+				}
+				snapCopy := make([]byte, len(cm.snapshotData))
+				copy(snapCopy, cm.snapshotData)
+				cm.mu.Unlock()
+
+				cm.dLogf("logPersister: persisting log (%d entries)", len(logCopy))
+				var logData bytes.Buffer
+				if err := gob.NewEncoder(&logData).Encode(logCopy); err != nil {
+					log.Fatal(err)
+				}
+
+				cm.mu.Lock()
+				cm.storage.Set("currentTerm", termData.Bytes())
+				cm.storage.Set("votedFor", votedData.Bytes())
+				cm.storage.Set("log", logData.Bytes())
+				cm.storage.Set("lastIncludedIndex", snapIdxBuf.Bytes())
+				cm.storage.Set("lastIncludedTerm", snapTermBuf.Bytes())
+				cm.storage.Set("snapshot", snapCopy)
+				cm.mu.Unlock()
+			} else {
+				cm.mu.Unlock()
 			}
-			cm.mu.Unlock()
 		}
 	}
 }
