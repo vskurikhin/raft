@@ -13,6 +13,8 @@ import (
 
 	"github.com/vskurikhin/raft/pkg/api"
 	"github.com/vskurikhin/raft/pkg/raft"
+
+	_ "net/http/pprof"
 )
 
 const DebugKV = 1
@@ -249,35 +251,16 @@ func (kvs *KVService) handleGet(w http.ResponseWriter, req *http.Request) {
 	}
 	kvs.kvLogf("HTTP GET %v", gr)
 
-	cmd := Command{
-		Kind: CommandGet,
-		Key:  gr.Key,
-		ID:   kvs.id,
-	}
-	logIndex := kvs.rs.Submit(cmd)
-	if logIndex < 0 {
-		kvs.sendHTTPResponse(w, api.GetResponse{RespStatus: api.StatusNotLeader})
-		return
-	}
-
-	sub := kvs.createCommitSubscription(logIndex)
-
 	select {
-	case commitCmd := <-sub:
-		if commitCmd.ID == kvs.id {
-			kvs.sendHTTPResponse(w, api.GetResponse{
-				RespStatus: api.StatusOK,
-				KeyFound:   commitCmd.ResultFound,
-				Value:      commitCmd.ResultValue,
-			})
-		} else {
-			kvs.sendHTTPResponse(w, api.GetResponse{RespStatus: api.StatusFailedCommit})
-		}
 	case <-req.Context().Done():
-		kvs.mu.Lock()
-		delete(kvs.commitSubs, logIndex)
-		kvs.mu.Unlock()
 		return
+	default:
+		value, ok := kvs.ds.Get(gr.Key)
+		kvs.sendHTTPResponse(w, api.GetResponse{
+			RespStatus: api.StatusOK,
+			KeyFound:   ok,
+			Value:      value,
+		})
 	}
 }
 
@@ -372,6 +355,8 @@ func (kvs *KVService) runUpdater() {
 					default:
 					}
 					close(sub)
+				} else {
+					log.Printf("NO SUBSCRIPTION FOR %d", entry.Index)
 				}
 			}
 		}

@@ -17,7 +17,7 @@ import (
 )
 
 // DebugClient включает вывод отладочной информации.
-const DebugClient = 1
+const DebugClient = 0
 
 type KVClient struct {
 	addrs []string
@@ -135,6 +135,7 @@ FindLeader:
 			c.clientLogf("not leader: will try next address")
 			c.assumedLeader = (c.assumedLeader + 1) % len(c.addrs)
 			retryCtxCancel()
+			time.Sleep(50 * time.Millisecond)
 			continue FindLeader
 		case api.StatusOK:
 			retryCtxCancel()

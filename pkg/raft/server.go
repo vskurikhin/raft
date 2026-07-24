@@ -11,6 +11,8 @@ import (
 	"time"
 )
 
+const EnableRPCProxy = true
+
 // Server инкапсулирует raft.ConsensusModule вместе с rpc.Server, который предоставляет
 // свои методы в качестве RPC-конечных точек. Он также управляет узлами Raft-сервера.
 // Основная цель этого типа — упростить код raft.Server для целей представления.
@@ -387,18 +389,20 @@ func NewProxy(cm *ConsensusModule) *RPCProxy {
 }
 
 func (rpp *RPCProxy) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
-	if os.Getenv("RAFT_UNRELIABLE_RPC") != "" {
-		dice := rand.Intn(10)
-		switch dice {
-		case 9:
-			rpp.cm.dLogf("drop RequestVote")
-			return fmt.Errorf("RPC failed")
-		case 8:
-			rpp.cm.dLogf("delay RequestVote")
-			time.Sleep(75 * time.Millisecond)
+	if EnableRPCProxy {
+		if os.Getenv("RAFT_UNRELIABLE_RPC") != "" {
+			dice := rand.Intn(10)
+			switch dice {
+			case 9:
+				rpp.cm.dLogf("drop RequestVote")
+				return fmt.Errorf("RPC failed")
+			case 8:
+				rpp.cm.dLogf("delay RequestVote")
+				time.Sleep(75 * time.Millisecond)
+			}
+		} else {
+			time.Sleep(time.Duration(1+rand.Intn(5)) * time.Millisecond)
 		}
-	} else {
-		time.Sleep(time.Duration(1+rand.Intn(5)) * time.Millisecond)
 	}
 	return rpp.cm.RequestVote(args, reply)
 }
@@ -407,50 +411,56 @@ func (rpp *RPCProxy) InstallSnapshot(
 	args InstallSnapshotArgs,
 	reply *InstallSnapshotReply,
 ) error {
-	if os.Getenv("RAFT_UNRELIABLE_RPC") != "" {
-		dice := rand.Intn(10)
-		switch dice {
-		case 9:
-			rpp.cm.dLogf("drop InstallSnapshot")
-			return fmt.Errorf("RPC failed")
-		case 8:
-			rpp.cm.dLogf("delay InstallSnapshot")
-			time.Sleep(75 * time.Millisecond)
+	if EnableRPCProxy {
+		if os.Getenv("RAFT_UNRELIABLE_RPC") != "" {
+			dice := rand.Intn(10)
+			switch dice {
+			case 9:
+				rpp.cm.dLogf("drop InstallSnapshot")
+				return fmt.Errorf("RPC failed")
+			case 8:
+				rpp.cm.dLogf("delay InstallSnapshot")
+				time.Sleep(75 * time.Millisecond)
+			}
+		} else {
+			time.Sleep(time.Duration(1+rand.Intn(5)) * time.Millisecond)
 		}
-	} else {
-		time.Sleep(time.Duration(1+rand.Intn(5)) * time.Millisecond)
 	}
 	return rpp.cm.InstallSnapshot(args, reply)
 }
 
 func (rpp *RPCProxy) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
-	if os.Getenv("RAFT_UNRELIABLE_RPC") != "" {
-		dice := rand.Intn(10)
-		switch dice {
-		case 9:
-			rpp.cm.dLogf("drop AppendEntries")
-			return fmt.Errorf("RPC failed")
-		case 8:
-			rpp.cm.dLogf("delay AppendEntries")
-			time.Sleep(75 * time.Millisecond)
+	if EnableRPCProxy {
+		if os.Getenv("RAFT_UNRELIABLE_RPC") != "" {
+			dice := rand.Intn(10)
+			switch dice {
+			case 9:
+				rpp.cm.dLogf("drop AppendEntries")
+				return fmt.Errorf("RPC failed")
+			case 8:
+				rpp.cm.dLogf("delay AppendEntries")
+				time.Sleep(75 * time.Millisecond)
+			}
+		} else {
+			time.Sleep(time.Duration(1+rand.Intn(5)) * time.Millisecond)
 		}
-	} else {
-		time.Sleep(time.Duration(1+rand.Intn(5)) * time.Millisecond)
 	}
 	return rpp.cm.AppendEntries(args, reply)
 }
 
 func (rpp *RPCProxy) Call(peer *rpc.Client, method string, args, reply any) error {
-	rpp.mu.Lock()
-	if rpp.numCallsBeforeDrop == 0 {
+	if EnableRPCProxy {
+		rpp.mu.Lock()
+		if rpp.numCallsBeforeDrop == 0 {
+			rpp.mu.Unlock()
+			rpp.cm.dLogf("drop Call %s: %v", method, args)
+			return fmt.Errorf("RPC failed")
+		}
+		if rpp.numCallsBeforeDrop > 0 {
+			rpp.numCallsBeforeDrop--
+		}
 		rpp.mu.Unlock()
-		rpp.cm.dLogf("drop Call %s: %v", method, args)
-		return fmt.Errorf("RPC failed")
 	}
-	if rpp.numCallsBeforeDrop > 0 {
-		rpp.numCallsBeforeDrop--
-	}
-	rpp.mu.Unlock()
 	return peer.Call(method, args, reply)
 }
 

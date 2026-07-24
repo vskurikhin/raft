@@ -42,8 +42,8 @@ func runWith(values config.Values) error {
 			PeerIds:           nums,
 			RPCAddress:        values.RPCAddress.String(),
 			ServerID:          values.Number,
-			SnapshotThreshold: 8,
-			SnapshotInterval:  4,
+			SnapshotThreshold: 512,
+			SnapshotInterval:  256,
 		},
 	}
 	storage := raft.NewMapStorage()

@@ -17,16 +17,16 @@ import (
 )
 
 const (
-	DebugCM = 1
+	DebugCM = 0
 	Quantum = 2
 
 	HeartbeatTimeoutMs  = 5 * 13 * Quantum
 	ReelectionTimeoutMs = 17 * 13 * Quantum
 	TickerTimeoutMs     = 17 * Quantum
 
-	// HeartbeatTimeoutMs  = 50 * Quantum
-	// ReelectionTimeoutMs = 150 * Quantum
-	// TickerTimeoutMs     = 10 * Quantum
+	//HeartbeatTimeoutMs  = 50 * Quantum
+	//ReelectionTimeoutMs = 150 * Quantum
+	//TickerTimeoutMs     = 10 * Quantum
 )
 
 // CommitEntry — это данные, которые Raft отправляет в канал фиксации.
