@@ -17,7 +17,6 @@ import (
 )
 
 const (
-	DebugCM = 1
 	Quantum = 2
 
 	HeartbeatTimeoutMs  = 5 * 13 * Quantum
@@ -123,6 +122,12 @@ type ConsensusModule struct {
 	matchIndex map[int]int
 }
 
+var traceCM = 1
+
+func TraceCM(trace int) {
+	traceCM = trace
+}
+
 // NewConsensusModule создаёт новый экземпляр CM с указанными
 // идентификатором, списком идентификаторов соседей и сервером.
 // Канал ready уведомляет CM о том, что все соседи подключены
@@ -190,11 +195,11 @@ func (cm *ConsensusModule) Submit(command any) int {
 		cm.mu.Unlock()
 		return -1
 	}
-	cm.dLogf("Submit received by %v: %v", cm.state, command)
+	cm.traceLogf("Submit received by %v: %v", cm.state, command)
 	submitIndex := len(cm.log)
 	cm.log = append(cm.log, LogEntry{Command: command, Term: cm.currentTerm})
 	cm.persistToStorage()
-	cm.dLogf("... log=%v", cm.log)
+	cm.traceLogf("... log=%v", cm.log)
 	cm.mu.Unlock()
 	select {
 	case cm.triggerAEChan <- struct{}{}:
@@ -206,11 +211,11 @@ func (cm *ConsensusModule) Submit(command any) int {
 // Stop останавливает этот CM, очищая его состояние. Этот метод быстро возвращает результат,
 // но для завершения работы всех горутин может потребоваться некоторое время (до ~таймаута выборов).
 func (cm *ConsensusModule) Stop() {
-	cm.dLogf("CM.Stop called")
+	cm.traceLogf("CM.Stop called")
 	cm.mu.Lock()
 	cm.state = Dead
 	cm.mu.Unlock()
-	cm.dLogf("becomes Dead")
+	cm.traceLogf("becomes Dead")
 
 	// Close the commit notification channel, and wait for the goroutine that
 	// monitors it to exit.
@@ -270,12 +275,17 @@ func (cm *ConsensusModule) persistToStorage() {
 	cm.storage.Set("log", logData.Bytes())
 }
 
-// dLogf выводит отладочное сообщение, если DebugCM > 0.
-func (cm *ConsensusModule) dLogf(format string, args ...any) {
-	if DebugCM > 0 {
+// traceLogf выводит отладочное сообщение, если traceCM > 0.
+func (cm *ConsensusModule) traceLogf(format string, args ...any) {
+	if traceCM > 0 {
 		format = fmt.Sprintf("[%d] ", cm.id) + format
 		log.Printf(format, args...)
 	}
+}
+
+func (cm *ConsensusModule) iLogf(format string, args ...any) {
+	format = fmt.Sprintf("[kv %d] ", cm.id) + format
+	slog.Info(fmt.Sprintf(format, args...))
 }
 
 // RequestVoteArgs См. рисунок 2 в статье.
@@ -299,13 +309,13 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 		return nil
 	}
 	lastLogIndex, lastLogTerm := cm.lastLogIndexAndTerm()
-	cm.dLogf(
+	cm.traceLogf(
 		"RequestVote: %+v [currentTerm=%d, votedFor=%d, log index/term=(%d, %d)]",
 		args, cm.currentTerm, cm.votedFor, lastLogIndex, lastLogTerm,
 	)
 
 	if args.Term > cm.currentTerm {
-		cm.dLogf("... term out of date in RequestVote")
+		cm.traceLogf("... term out of date in RequestVote")
 		cm.becomeFollower(args.Term)
 	}
 
@@ -321,7 +331,7 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 	}
 	reply.Term = cm.currentTerm
 	cm.persistToStorage()
-	cm.dLogf("... RequestVote reply: %+v", reply)
+	cm.traceLogf("... RequestVote reply: %+v", reply)
 	return nil
 }
 
@@ -352,10 +362,10 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 	if cm.state == Dead {
 		return nil
 	}
-	cm.dLogf("AppendEntries: %+v", args)
+	cm.traceLogf("AppendEntries: %+v", args)
 
 	if args.Term > cm.currentTerm {
-		cm.dLogf("... term out of date in AppendEntries")
+		cm.traceLogf("... term out of date in AppendEntries")
 		cm.becomeFollower(args.Term)
 	}
 
@@ -393,15 +403,15 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 			// - newEntriesIndex указывает на конец массива Entries
 			//   или на индекс, где терм записи отличается от соответствующей записи журнала.
 			if newEntriesIndex < len(args.Entries) {
-				cm.dLogf("... inserting entries %v from index %d", args.Entries[newEntriesIndex:], logInsertIndex)
+				cm.traceLogf("... inserting entries %v from index %d", args.Entries[newEntriesIndex:], logInsertIndex)
 				cm.log = append(cm.log[:logInsertIndex], args.Entries[newEntriesIndex:]...)
-				cm.dLogf("... log is now: %v", cm.log)
+				cm.traceLogf("... log is now: %v", cm.log)
 			}
 
 			// Устанавливает индекс фиксации.
 			if args.LeaderCommit > cm.commitIndex {
 				cm.commitIndex = min(args.LeaderCommit, len(cm.log)-1)
-				cm.dLogf("... setting commitIndex=%d", cm.commitIndex)
+				cm.traceLogf("... setting commitIndex=%d", cm.commitIndex)
 				select {
 				case cm.newCommitReadyChan <- struct{}{}:
 				default:
@@ -433,7 +443,7 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 
 	reply.Term = cm.currentTerm
 	cm.persistToStorage()
-	cm.dLogf("AppendEntries reply: %+v", *reply)
+	cm.traceLogf("AppendEntries reply: %+v", *reply)
 	return nil
 }
 
@@ -460,7 +470,7 @@ func (cm *ConsensusModule) runElectionTimer() {
 	termStarted := cm.currentTerm
 	electionTimerDone := cm.electionTimerDone
 	cm.mu.Unlock()
-	cm.dLogf("election timer started (%v), term=%d", timeoutDuration, termStarted)
+	cm.traceLogf("election timer started (%v), term=%d", timeoutDuration, termStarted)
 
 	// Этот цикл выполняется до тех пор, пока не произойдёт одно из двух:
 	// - мы не обнаружим, что таймер выборов больше не нужен, или
@@ -474,13 +484,13 @@ func (cm *ConsensusModule) runElectionTimer() {
 		case <-ticker.C:
 			cm.mu.Lock()
 			if cm.state != Candidate && cm.state != Follower {
-				cm.dLogf("in election timer state=%s, bailing out", cm.state)
+				cm.traceLogf("in election timer state=%s, bailing out", cm.state)
 				cm.mu.Unlock()
 				return
 			}
 
 			if termStarted != cm.currentTerm {
-				cm.dLogf("in election timer term changed from %d to %d, bailing out", termStarted, cm.currentTerm)
+				cm.traceLogf("in election timer term changed from %d to %d, bailing out", termStarted, cm.currentTerm)
 				cm.mu.Unlock()
 				return
 			}
@@ -509,7 +519,7 @@ func (cm *ConsensusModule) startElection() {
 	cm.electionResetEvent = time.Now()
 	cm.votedFor = cm.id
 	cm.persistToStorage()
-	cm.dLogf("becomes Candidate (currentTerm=%d); log=%v", savedCurrentTerm, cm.log)
+	cm.traceLogf("becomes Candidate (currentTerm=%d); log=%v", savedCurrentTerm, cm.log)
 
 	var votesReceived atomic.Int32
 	votesReceived.Store(1)
@@ -528,20 +538,20 @@ func (cm *ConsensusModule) startElection() {
 				LastLogTerm:  savedLastLogTerm,
 			}
 
-			cm.dLogf("sending RequestVote to %d: %+v", peerID, args)
+			cm.traceLogf("sending RequestVote to %d: %+v", peerID, args)
 			var reply RequestVoteReply
 			if err := cm.server.Call(peerID, "ConsensusModule.RequestVote", args, &reply); err == nil {
 				cm.mu.Lock()
 				defer cm.mu.Unlock()
-				cm.dLogf("received RequestVoteReply %+v", reply)
+				cm.traceLogf("received RequestVoteReply %+v", reply)
 
 				if cm.state != Candidate {
-					cm.dLogf("while waiting for reply, state = %v", cm.state)
+					cm.traceLogf("while waiting for reply, state = %v", cm.state)
 					return
 				}
 
 				if reply.Term > cm.currentTerm {
-					cm.dLogf("term out of date in RequestVoteReply")
+					cm.traceLogf("term out of date in RequestVoteReply")
 					cm.becomeFollower(reply.Term)
 					return
 				} else if reply.Term == cm.currentTerm {
@@ -549,7 +559,7 @@ func (cm *ConsensusModule) startElection() {
 						votesReceived.Add(1)
 						if int(votesReceived.Load())*2 > len(cm.peerIds)+1 {
 							// Выиграл выборы!
-							cm.dLogf("wins election with %d votes", votesReceived.Load())
+							cm.traceLogf("wins election with %d votes", votesReceived.Load())
 							cm.startLeader()
 							slog.Info("wins election", slog.Int("votes", int(votesReceived.Load())))
 							return
@@ -567,7 +577,7 @@ func (cm *ConsensusModule) startElection() {
 // becomeFollower делает cm последователем и сбрасывает его состояние.
 // Ожидается, что cm.mu будет заблокирован.
 func (cm *ConsensusModule) becomeFollower(term int) {
-	cm.dLogf("becomes Follower with term=%d; log=%v", term, cm.log)
+	cm.traceLogf("becomes Follower with term=%d; log=%v", term, cm.log)
 	cm.state = Follower
 	if term > cm.currentTerm {
 		cm.currentTerm = term
@@ -594,7 +604,7 @@ func (cm *ConsensusModule) startLeader() {
 		cm.nextIndex[peerID] = len(cm.log)
 		cm.matchIndex[peerID] = -1
 	}
-	cm.dLogf(
+	cm.traceLogf(
 		"becomes Leader; term=%d, nextIndex=%v, matchIndex=%v; log=%v",
 		cm.currentTerm, cm.nextIndex, cm.matchIndex, cm.log,
 	)
@@ -680,7 +690,7 @@ func (cm *ConsensusModule) nextIndexArgsEntries(peerID, savedCurrentTerm int) (i
 // savedCurrentTerm - терм.
 func (cm *ConsensusModule) leaderSendAEsToPeer(peerID, savedCurrentTerm int) {
 	ni, args, entries := cm.nextIndexArgsEntries(peerID, savedCurrentTerm)
-	cm.dLogf("sending AppendEntries to %v: ni=%d, args=%+v", peerID, ni, args)
+	cm.traceLogf("sending AppendEntries to %v: ni=%d, args=%+v", peerID, ni, args)
 	var reply AppendEntriesReply
 	if err := cm.server.Call(peerID, "ConsensusModule.AppendEntries", args, &reply); err == nil {
 		cm.mu.Lock()
@@ -690,13 +700,13 @@ func (cm *ConsensusModule) leaderSendAEsToPeer(peerID, savedCurrentTerm int) {
 		// Поэтому необходимо явно вызывать cm.mu.Unlock()
 		// во всех путях выхода, начиная с этого места.
 		if reply.Term > cm.currentTerm {
-			cm.dLogf("term out of date in heartbeat reply")
+			cm.traceLogf("term out of date in heartbeat reply")
 			cm.becomeFollower(reply.Term)
 			cm.mu.Unlock()
 			return
 		}
 		if cm.nextIndex[peerID] != ni {
-			cm.dLogf("#44 ni out of date in heartbeat reply")
+			cm.traceLogf("#44 ni out of date in heartbeat reply")
 			cm.mu.Unlock()
 			return
 		}
@@ -720,12 +730,12 @@ func (cm *ConsensusModule) leaderSendAEsToPeer(peerID, savedCurrentTerm int) {
 						}
 					}
 				}
-				cm.dLogf(
+				cm.traceLogf(
 					"AppendEntries reply from %d success: nextIndex := %v, matchIndex := %v; commitIndex := %d",
 					peerID, cm.nextIndex, cm.matchIndex, cm.commitIndex,
 				)
 				if cm.commitIndex != savedCommitIndex {
-					cm.dLogf("leader sets commitIndex := %d", cm.commitIndex)
+					cm.traceLogf("leader sets commitIndex := %d", cm.commitIndex)
 					// Индекс фиксации изменился: лидер считает новые
 					// записи журнала зафиксированными. Отправить новые
 					// записи в канал фиксации клиентам этого лидера
@@ -760,7 +770,7 @@ func (cm *ConsensusModule) leaderSendAEsToPeer(peerID, savedCurrentTerm int) {
 				} else {
 					cm.nextIndex[peerID] = reply.ConflictIndex
 				}
-				cm.dLogf("AppendEntries reply from %d !success: nextIndex := %d", peerID, ni-1)
+				cm.traceLogf("AppendEntries reply from %d !success: nextIndex := %d", peerID, ni-1)
 				cm.mu.Unlock()
 			}
 		} else {
@@ -811,7 +821,7 @@ func (cm *ConsensusModule) commitChanSender() {
 		// Ожидание сигнала о новых зафиксированных записях.
 		_, ok := <-cm.newCommitReadyChan
 		if !ok {
-			cm.dLogf("commitChanSender done")
+			cm.traceLogf("commitChanSender done")
 			return
 		}
 
@@ -824,10 +834,10 @@ func (cm *ConsensusModule) commitChanSender() {
 			cm.lastApplied = cm.commitIndex
 		}
 		cm.mu.Unlock()
-		cm.dLogf("commitChanSender entries=%v, savedLastApplied=%d", entries, savedLastApplied)
+		cm.traceLogf("commitChanSender entries=%v, savedLastApplied=%d", entries, savedLastApplied)
 
 		for i, entry := range entries {
-			cm.dLogf("send on commitchan i=%v, entry=%v", i, entry)
+			cm.traceLogf("send on commitchan i=%v, entry=%v", i, entry)
 			ce := CommitEntry{
 				Command: entry.Command,
 				Index:   savedLastApplied + i + 1,
@@ -838,7 +848,7 @@ func (cm *ConsensusModule) commitChanSender() {
 			select {
 			case cm.commitChan <- ce:
 			case <-cm.newCommitReadyChan:
-				cm.dLogf("commitChanSender done")
+				cm.traceLogf("commitChanSender done")
 				return
 			}
 		}

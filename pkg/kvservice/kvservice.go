@@ -15,8 +15,6 @@ import (
 	"github.com/vskurikhin/raft/pkg/raft"
 )
 
-const DebugKV = 1
-
 type KVService struct {
 	mu sync.Mutex
 
@@ -52,6 +50,12 @@ type Config struct {
 	raft.Config
 
 	HTTPAddress string
+}
+
+var traceKV = 1
+
+func TraceKV(trace int) {
+	traceKV = trace
 }
 
 // New создаёт новый экземпляр KVService с заданной конфигурацией cfg,
@@ -127,7 +131,7 @@ func (kvs *KVService) ServeHTTP(address string) {
 	}
 
 	go func() {
-		kvs.kvLogf("serving HTTP on %s", kvs.srv.Addr)
+		kvs.traceKVLogf("serving HTTP on %s", kvs.srv.Addr)
 		if err := kvs.srv.ListenAndServe(); err != http.ErrServerClosed {
 			log.Fatal(err)
 		}
@@ -142,17 +146,17 @@ func (kvs *KVService) ServeHTTP(address string) {
 // Примечание: перед вызовом Shutdown необходимо вызвать
 // DisconnectFromRaftPeers для всех узлов кластера.
 func (kvs *KVService) Shutdown() error {
-	kvs.kvLogf("shutting down Raft server")
+	kvs.traceKVLogf("shutting down Raft server")
 	kvs.rs.Shutdown()
-	kvs.kvLogf("closing commitChan")
+	kvs.traceKVLogf("closing commitChan")
 	close(kvs.commitChan)
 
 	if kvs.srv != nil {
-		kvs.kvLogf("shutting down HTTP server")
+		kvs.traceKVLogf("shutting down HTTP server")
 		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 		defer cancel()
 		_ = kvs.srv.Shutdown(ctx)
-		kvs.kvLogf("HTTP shutdown complete")
+		kvs.traceKVLogf("HTTP shutdown complete")
 		return nil
 	}
 
@@ -180,7 +184,7 @@ func (kvs *KVService) handlePut(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	kvs.kvLogf("HTTP PUT %v", pr)
+	kvs.traceKVLogf("HTTP PUT %v", pr)
 
 	// Отправить команду серверу Raft. Это изменение состояния реплицируемой
 	// машины состояний, построенной поверх журнала Raft.
@@ -236,37 +240,18 @@ func (kvs *KVService) handleGet(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	kvs.kvLogf("HTTP GET %v", gr)
-
-	cmd := Command{
-		Kind: CommandGet,
-		Key:  gr.Key,
-		ID:   kvs.id,
-	}
-	logIndex := kvs.rs.Submit(cmd)
-	if logIndex < 0 {
-		kvs.sendHTTPResponse(w, api.GetResponse{RespStatus: api.StatusNotLeader})
-		return
-	}
-
-	sub := kvs.createCommitSubscription(logIndex)
+	kvs.traceKVLogf("HTTP GET %v", gr)
 
 	select {
-	case commitCmd := <-sub:
-		if commitCmd.ID == kvs.id {
-			kvs.sendHTTPResponse(w, api.GetResponse{
-				RespStatus: api.StatusOK,
-				KeyFound:   commitCmd.ResultFound,
-				Value:      commitCmd.ResultValue,
-			})
-		} else {
-			kvs.sendHTTPResponse(w, api.GetResponse{RespStatus: api.StatusFailedCommit})
-		}
 	case <-req.Context().Done():
-		kvs.mu.Lock()
-		delete(kvs.commitSubs, logIndex)
-		kvs.mu.Unlock()
 		return
+	default:
+		value, ok := kvs.ds.Get(gr.Key)
+		kvs.sendHTTPResponse(w, api.GetResponse{
+			RespStatus: api.StatusOK,
+			KeyFound:   ok,
+			Value:      value,
+		})
 	}
 }
 
@@ -276,7 +261,7 @@ func (kvs *KVService) handleCAS(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	kvs.kvLogf("HTTP CAS %v", cr)
+	kvs.traceKVLogf("HTTP CAS %v", cr)
 
 	cmd := Command{
 		Kind:         CommandCAS,
@@ -324,7 +309,7 @@ func (kvs *KVService) runUpdater() {
 		for entry := range kvs.commitChan {
 			cmd, ok := entry.Command.(Command)
 			if !ok {
-				kvs.kvLogf("unknown command %v", entry.Command)
+				kvs.traceKVLogf("unknown command %v", entry.Command)
 				continue
 			}
 
@@ -336,7 +321,7 @@ func (kvs *KVService) runUpdater() {
 			case CommandCAS:
 				cmd.ResultValue, cmd.ResultFound = kvs.ds.CAS(cmd.Key, cmd.CompareValue, cmd.Value)
 			default:
-				kvs.kvLogf("unknown command %v", cmd)
+				kvs.traceKVLogf("unknown command %v", cmd)
 				continue
 			}
 
@@ -385,9 +370,9 @@ func (kvs *KVService) popCommitSubscription(logIndex int) chan Command {
 	return ch
 }
 
-// kvLogf выводит отладочное сообщение, если DebugKV > 0.
-func (kvs *KVService) kvLogf(format string, args ...any) {
-	if DebugKV > 0 {
+// traceKVLogf выводит отладочное сообщение, если traceKV > 0.
+func (kvs *KVService) traceKVLogf(format string, args ...any) {
+	if traceKV > 0 {
 		format = fmt.Sprintf("[kv %d] ", kvs.id) + format
 		log.Printf(format, args...)
 	}

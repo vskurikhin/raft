@@ -1,15 +1,20 @@
 package raft
 
 import (
+	"bytes"
 	"fmt"
 	"log"
+	"maps"
 	"math/rand"
 	"net"
 	"net/rpc"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 )
+
+var enableRPCProxy = true
 
 // Server инкапсулирует raft.ConsensusModule вместе с rpc.Server, который предоставляет
 // свои методы в качестве RPC-конечных точек. Он также управляет узлами Raft-сервера.
@@ -48,6 +53,10 @@ type Config struct {
 	PeerIds       []int
 	RPCAddress    string
 	ServerID      int
+}
+
+func DisableRPCProxy(disable bool) {
+	enableRPCProxy = !disable
 }
 
 // New создаёт новый сервер Raft с заданной конфигурацией cfg, хранилищем storage,
@@ -100,6 +109,7 @@ func (s *Server) Serve(address string) {
 	}
 	log.Printf("[%v] listening at %s", s.serverID, s.listener.Addr())
 	s.mu.Unlock()
+	go s.infoLoggingState()
 
 	s.wg.Go(func() {
 		for {
@@ -168,23 +178,25 @@ func (s *Server) ConnectToPeer(peerID int, addr net.Addr) error {
 // по адресу addr с заданным таймаутом timeout. Если соединение уже существует,
 // метод завершается без ошибки. При недоступности узла возвращает ошибку.
 func (s *Server) ConnectToPeerWithTimeout(peerID int, addr net.Addr, timeout time.Duration) error {
+	fmtErrorf := func() error { return fmt.Errorf("peer %v already connected", peerID) }
+	s.mu.Lock()
+	if s.peerClients[peerID] != nil {
+		s.mu.Unlock()
+		return fmtErrorf()
+	}
+	s.mu.Unlock()
+	client, err := net.DialTimeout("tcp", addr.String(), timeout)
+	if err != nil {
+		return err
+	}
 	s.mu.Lock()
 	if s.peerClients[peerID] == nil {
+		rpcClient := rpc.NewClient(client)
+		s.peerClients[peerID] = rpcClient
+		s.peerAddresses[peerID] = addr
+	} else {
 		s.mu.Unlock()
-		client, err := net.DialTimeout("tcp", addr.String(), timeout)
-		if err != nil {
-			return err
-		}
-		s.mu.Lock()
-		if s.peerClients[peerID] == nil {
-			rpcClient := rpc.NewClient(client)
-			s.peerClients[peerID] = rpcClient
-			s.peerAddresses[peerID] = addr
-		} else {
-			_ = client.Close()
-		}
-		s.mu.Unlock()
-		return nil
+		return fmtErrorf()
 	}
 	s.mu.Unlock()
 	return nil
@@ -207,30 +219,40 @@ func (s *Server) DisconnectPeer(peerID int) error {
 // повторное подключение. В тестовом режиме (harness) повторное
 // подключение не выполняется.
 func (s *Server) Call(id int, serviceMethod string, args, reply any) error {
-	peer := s.PeerClient(id)
-
-	// Если этот метод вызывается после завершения работы (когда вызывается client.Close),
-	// он вернет ошибку.
-	if peer == nil {
-		err := s.reConnect(id)
+	var err error
+	fmtErrorf := func() error { return fmt.Errorf("call client %d after it's closed", id) }
+	const onlyTwo = 2
+	for i := 0; i < onlyTwo; i++ {
+		peer := s.PeerClient(id)
+		// Если этот метод вызывается после завершения работы (когда вызывается client.Close),
+		// он вернет ошибку.
+		if peer == nil {
+			if s.harness {
+				return fmtErrorf()
+			}
+			s.mu.Lock()
+			addr := s.peerAddresses[id]
+			if addr == nil {
+				s.mu.Unlock()
+				return fmtErrorf()
+			}
+			client, err := net.DialTimeout("tcp", addr.String(), HeartbeatTimeoutMs/onlyTwo*time.Millisecond)
+			if err != nil {
+				s.mu.Unlock()
+				continue
+			}
+			peer = rpc.NewClient(client)
+			s.peerClients[id] = peer
+			s.mu.Unlock()
+			s.cm.iLogf("reconnected to peer %v", id)
+		}
+		err = s.rpcProxy.Call(peer, serviceMethod, args, reply)
 		if err != nil {
-			return err
+			continue
 		}
 	}
-	err := s.rpcProxy.Call(s.PeerClient(id), serviceMethod, args, reply)
 	if err != nil {
-		if s.harness {
-			return err
-		}
 		s.ClosePeerClient(id)
-		err = s.reConnect(id)
-		if err != nil {
-			if !s.harness {
-				go s.tryReconnect(id)
-			}
-			return err
-		}
-		return s.rpcProxy.Call(s.PeerClient(id), serviceMethod, args, reply)
 	}
 	return err
 }
@@ -268,25 +290,6 @@ func (s *Server) Proxy() *RPCProxy {
 	return s.rpcProxy
 }
 
-func (s *Server) tryReconnect(id int) {
-	s.mu.Lock()
-	s.peerClients[id] = nil
-	s.mu.Unlock()
-	_ = s.ConnectToPeerWithTimeout(id, s.peerAddresses[id], 2*ReelectionTimeoutMs*time.Millisecond)
-}
-
-func (s *Server) reConnect(id int) error {
-	fmtErrorf := func() error { return fmt.Errorf("call client %d after it's closed", id) }
-	if s.harness {
-		return fmtErrorf()
-	}
-	err := s.ConnectToPeerWithTimeout(id, s.peerAddresses[id], ReelectionTimeoutMs/2*time.Millisecond)
-	if err != nil {
-		return fmtErrorf()
-	}
-	return nil
-}
-
 // RPCProxy — прокси-сервер, прозрачно перенаправляющий RPC-вызовы
 // ConsensusModule. Он принимает RPC-запросы, адресованные CM, при
 // необходимости модифицирует их и затем передаёт самому CM.
@@ -318,50 +321,56 @@ func NewProxy(cm *ConsensusModule) *RPCProxy {
 }
 
 func (rpp *RPCProxy) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
-	if os.Getenv("RAFT_UNRELIABLE_RPC") != "" {
-		dice := rand.Intn(10)
-		switch dice {
-		case 9:
-			rpp.cm.dLogf("drop RequestVote")
-			return fmt.Errorf("RPC failed")
-		case 8:
-			rpp.cm.dLogf("delay RequestVote")
-			time.Sleep(75 * time.Millisecond)
+	if enableRPCProxy {
+		if os.Getenv("RAFT_UNRELIABLE_RPC") != "" {
+			dice := rand.Intn(10)
+			switch dice {
+			case 9:
+				rpp.cm.traceLogf("drop RequestVote")
+				return fmt.Errorf("RPC failed")
+			case 8:
+				rpp.cm.traceLogf("delay RequestVote")
+				time.Sleep(75 * time.Millisecond)
+			}
+		} else {
+			time.Sleep(time.Duration(1+rand.Intn(5)) * time.Millisecond)
 		}
-	} else {
-		time.Sleep(time.Duration(1+rand.Intn(5)) * time.Millisecond)
 	}
 	return rpp.cm.RequestVote(args, reply)
 }
 
 func (rpp *RPCProxy) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
-	if os.Getenv("RAFT_UNRELIABLE_RPC") != "" {
-		dice := rand.Intn(10)
-		switch dice {
-		case 9:
-			rpp.cm.dLogf("drop AppendEntries")
-			return fmt.Errorf("RPC failed")
-		case 8:
-			rpp.cm.dLogf("delay AppendEntries")
-			time.Sleep(75 * time.Millisecond)
+	if enableRPCProxy {
+		if os.Getenv("RAFT_UNRELIABLE_RPC") != "" {
+			dice := rand.Intn(10)
+			switch dice {
+			case 9:
+				rpp.cm.traceLogf("drop AppendEntries")
+				return fmt.Errorf("RPC failed")
+			case 8:
+				rpp.cm.traceLogf("delay AppendEntries")
+				time.Sleep(75 * time.Millisecond)
+			}
+		} else {
+			time.Sleep(time.Duration(1+rand.Intn(5)) * time.Millisecond)
 		}
-	} else {
-		time.Sleep(time.Duration(1+rand.Intn(5)) * time.Millisecond)
 	}
 	return rpp.cm.AppendEntries(args, reply)
 }
 
 func (rpp *RPCProxy) Call(peer *rpc.Client, method string, args, reply any) error {
-	rpp.mu.Lock()
-	if rpp.numCallsBeforeDrop == 0 {
+	if enableRPCProxy {
+		rpp.mu.Lock()
+		if rpp.numCallsBeforeDrop == 0 {
+			rpp.mu.Unlock()
+			rpp.cm.traceLogf("drop Call %s: %v", method, args)
+			return fmt.Errorf("RPC failed")
+		}
+		if rpp.numCallsBeforeDrop > 0 {
+			rpp.numCallsBeforeDrop--
+		}
 		rpp.mu.Unlock()
-		rpp.cm.dLogf("drop Call %s: %v", method, args)
-		return fmt.Errorf("RPC failed")
 	}
-	if rpp.numCallsBeforeDrop > 0 {
-		rpp.numCallsBeforeDrop--
-	}
-	rpp.mu.Unlock()
 	return peer.Call(method, args, reply)
 }
 
@@ -379,4 +388,57 @@ func (rpp *RPCProxy) DontDropCalls() {
 	defer rpp.mu.Unlock()
 
 	rpp.numCallsBeforeDrop = -1
+}
+
+func (s *Server) infoLoggingState() {
+	const logInterval = 1 * time.Second
+	const checkInterval = 100 * time.Millisecond
+	ticker := time.NewTicker(checkInterval)
+	defer ticker.Stop()
+
+	var elapsed time.Duration
+	for range ticker.C {
+		elapsed += checkInterval
+		s.cm.mu.Lock()
+		state := s.cm.state
+		s.cm.mu.Unlock()
+		if state != Leader && state != Follower {
+			continue
+		}
+		if elapsed >= logInterval {
+			s.cm.mu.Lock()
+			state = s.cm.state
+			var buffer bytes.Buffer
+			switch state {
+			case Follower:
+				buffer.WriteString("state: Follower")
+				break
+			case Leader:
+				buffer.WriteString("state: Leader")
+			default:
+				s.cm.mu.Unlock()
+				continue
+			}
+			logSize := len(s.cm.log)
+			s.cm.mu.Unlock()
+			s.mu.Lock()
+			clients := maps.All(s.peerClients)
+			s.mu.Unlock()
+			for peerID, client := range clients {
+				buffer.WriteString(" client to peer: ")
+				buffer.WriteString(strconv.Itoa(peerID))
+				buffer.WriteString(" => ")
+				if client != nil {
+					buffer.WriteString("connected ")
+				} else {
+					buffer.WriteString("disconnected ")
+				}
+			}
+			buffer.WriteString("log size: ")
+			buffer.WriteString(strconv.Itoa(logSize))
+			buffer.WriteString("\n")
+			s.cm.iLogf(buffer.String())
+			elapsed = 0
+		}
+	}
 }

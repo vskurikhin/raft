@@ -1,7 +1,9 @@
 package main
 
 import (
+	"fmt"
 	"log"
+	"log/slog"
 	"maps"
 	"slices"
 	"sync"
@@ -31,6 +33,9 @@ func run() error {
 var wg sync.WaitGroup
 
 func runWith(values config.Values) error {
+	raft.DisableRPCProxy(true)
+	raft.TraceCM(1)
+	kvservice.TraceKV(0)
 	nums := slices.Collect(maps.Keys(values.Peers))
 	done := make(chan any)
 	ready := make(chan any)
@@ -46,6 +51,7 @@ func runWith(values config.Values) error {
 	}
 	storage := raft.NewMapStorage()
 	kvs := kvservice.New(cfg, storage, ready)
+	// Для готовности достаточно N/2 + 1 серверов
 	wg.Add(len(nums) / 2)
 	for _, num := range nums {
 		go connect(num, kvs, values, nums)
@@ -63,20 +69,21 @@ var (
 )
 
 func connect(n int, kvs *kvservice.KVService, values config.Values, nums []int) {
-	log.Printf("connect to peer %d", n)
 	err := kvs.ConnectToRaftPeer(n, values.Peers[n])
 	for i := 0; i < Try && err != nil; i++ {
 		duration := (i * MinimalDuration) % DurationModulus
 		time.Sleep(time.Duration(duration+MinimalDuration) * time.Millisecond)
-		log.Printf("try connect to peer %d", n)
 		err = kvs.ConnectToRaftPeer(n, values.Peers[n])
 	}
 	if err != nil {
-		log.Printf("warning connect to peer %d: error: %v", n, err)
-	} else if count < len(nums)/2 {
-		mu.Lock()
-		count++
-		wg.Done()
-		mu.Unlock()
+		slog.Warn(fmt.Sprintf("warning connect to peer %d: error: %v", n, err))
+	} else {
+		slog.Info(fmt.Sprintf("connected to peer %d", n))
+		if count < len(nums)/2 {
+			mu.Lock()
+			count++
+			wg.Done()
+			mu.Unlock()
+		}
 	}
 }
