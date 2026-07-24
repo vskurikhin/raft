@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	DebugCM = 1
+	DebugCM = 0
 	Quantum = 1
 
 	HeartbeatTimeoutMs  = 100 * Quantum
@@ -314,7 +314,7 @@ func (cm *ConsensusModule) TakeSnapshot(stateMachineData []byte) {
 		cm.log = append([]LogEntry{}, cm.log[keepFrom:]...)
 	}
 
-	cm.dLogf(
+	cm.iLogf(
 		"snapshot taken: lastIncludedIndex=%d, lastIncludedTerm=%d, log truncated to %d entries",
 		snapIndex, snapTerm, len(cm.log),
 	)
@@ -722,8 +722,10 @@ func (cm *ConsensusModule) InstallSnapshot(
 		return nil
 	}
 
-	cm.dLogf("InstallSnapshot: %+v [currentTerm=%d, lastIncludedIndex=%d]",
-		args, cm.currentTerm, cm.lastIncludedIndex)
+	cm.iLogf(
+		"InstallSnapshot: %+v [currentTerm=%d, lastIncludedIndex=%d]",
+		args, cm.currentTerm, cm.lastIncludedIndex,
+	)
 
 	// Шаг 1: проверка терма
 	if args.Term < cm.currentTerm {
@@ -1255,11 +1257,24 @@ func (cm *ConsensusModule) runLogPersister() {
 
 		case <-timer.C:
 			cm.mu.Lock()
-			if cm.logDirty {
-				cm.logDirty = false
-				logCopy := make([]LogEntry, len(cm.log))
-				copy(logCopy, cm.log)
+			if !cm.logDirty {
+				cm.mu.Unlock()
+				continue
+			}
+			cm.logDirty = false
+			logCopy := make([]LogEntry, len(cm.log))
+			copy(logCopy, cm.log)
+			savedLogLen := len(cm.log)
+			cm.mu.Unlock()
 
+			cm.dLogf("logPersister: persisting log (%d entries)", len(logCopy))
+			var logData bytes.Buffer
+			if err := gob.NewEncoder(&logData).Encode(logCopy); err != nil {
+				log.Fatal(err)
+			}
+
+			cm.mu.Lock()
+			if !cm.logDirty && len(cm.log) == savedLogLen {
 				var termData bytes.Buffer
 				if err := gob.NewEncoder(&termData).Encode(cm.currentTerm); err != nil {
 					log.Fatal(err)
@@ -1278,25 +1293,15 @@ func (cm *ConsensusModule) runLogPersister() {
 				}
 				snapCopy := make([]byte, len(cm.snapshotData))
 				copy(snapCopy, cm.snapshotData)
-				cm.mu.Unlock()
 
-				cm.dLogf("logPersister: persisting log (%d entries)", len(logCopy))
-				var logData bytes.Buffer
-				if err := gob.NewEncoder(&logData).Encode(logCopy); err != nil {
-					log.Fatal(err)
-				}
-
-				cm.mu.Lock()
 				cm.storage.Set("currentTerm", termData.Bytes())
 				cm.storage.Set("votedFor", votedData.Bytes())
 				cm.storage.Set("log", logData.Bytes())
 				cm.storage.Set("lastIncludedIndex", snapIdxBuf.Bytes())
 				cm.storage.Set("lastIncludedTerm", snapTermBuf.Bytes())
 				cm.storage.Set("snapshot", snapCopy)
-				cm.mu.Unlock()
-			} else {
-				cm.mu.Unlock()
 			}
+			cm.mu.Unlock()
 		}
 	}
 }
@@ -1360,8 +1365,10 @@ func (cm *ConsensusModule) commitChanSender() {
 			// [Раунд 2] Отправить SyncMarker через commitChan и дождаться,
 			// пока runUpdater подтвердит, что DataStore синхронизирован
 			// до snapIndex.
-			cm.dLogf("triggering snapshot: logLen=%d, threshold=%d, gap=%d, snapIndex=%d",
-				len(cm.log), cm.snapshotThreshold, cm.lastApplied-cm.lastIncludedIndex, snapIndex)
+			cm.iLogf(
+				"triggering snapshot: logLen=%d, threshold=%d, gap=%d, snapIndex=%d",
+				len(cm.log), cm.snapshotThreshold, cm.lastApplied-cm.lastIncludedIndex, snapIndex,
+			)
 			ce := CommitEntry{Sync: true, Index: snapIndex}
 			select {
 			case cm.commitChan <- ce:

@@ -307,6 +307,9 @@ func (s *Server) Call(id int, serviceMethod string, args, reply any) error {
 		}
 		s.ClosePeerClient(id)
 		err = s.reConnect(id)
+		if err != nil {
+			return err
+		}
 		return s.rpcProxy.Call(s.PeerClient(id), serviceMethod, args, reply)
 	}
 	return err
