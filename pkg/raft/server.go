@@ -425,10 +425,13 @@ func (s *Server) infoLoggingState() {
 				continue
 			}
 			logSize := len(s.cm.log)
+			term := s.cm.currentTerm
 			s.cm.mu.Unlock()
 			s.mu.Lock()
 			clients := maps.All(s.peerClients)
 			s.mu.Unlock()
+			buffer.WriteString(" term: ")
+			buffer.WriteString(strconv.Itoa(term))
 			for peerID, client := range clients {
 				buffer.WriteString(" client to peer: ")
 				buffer.WriteString(strconv.Itoa(peerID))

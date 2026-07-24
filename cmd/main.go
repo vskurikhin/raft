@@ -7,6 +7,7 @@ import (
 	"maps"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/vskurikhin/raft/internal/config"
@@ -64,7 +65,7 @@ func runWith(values config.Values) error {
 }
 
 var (
-	count int
+	count atomic.Int64
 	mu    sync.Mutex
 )
 
@@ -79,9 +80,9 @@ func connect(n int, kvs *kvservice.KVService, values config.Values, nums []int) 
 		slog.Warn(fmt.Sprintf("warning connect to peer %d: error: %v", n, err))
 	} else {
 		slog.Info(fmt.Sprintf("connected to peer %d", n))
-		if count < len(nums)/2 {
+		if int(count.Load()) < len(nums)/2 {
 			mu.Lock()
-			count++
+			count.Add(1)
 			wg.Done()
 			mu.Unlock()
 		}
