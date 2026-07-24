@@ -114,17 +114,14 @@ FindLeader:
 				c.clientLogf("parent context done; bailing out")
 				retryCtxCancel()
 				return err
-			} else if contextDeadlineExceeded(retryCtx) {
-				// Если родительский контекст ещё активен, а истёк только
-				// дочерний контекст повторной попытки, необходимо обратиться
-				// к следующему сервису.
-				c.clientLogf("timed out: will try next address")
-				c.assumedLeader = (c.assumedLeader + 1) % len(c.addrs)
-				retryCtxCancel()
-				continue FindLeader
 			}
+			// Если родительский контекст ещё активен, а истёк только
+			// дочерний контекст повторной попытки, необходимо обратиться
+			// к следующему сервису.
+			c.clientLogf("timed out: will try next address")
+			c.assumedLeader = (c.assumedLeader + 1) % len(c.addrs)
 			retryCtxCancel()
-			return err
+			continue FindLeader
 		}
 		c.clientLogf("received response %#v", resp)
 

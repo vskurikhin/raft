@@ -266,8 +266,6 @@ func (s *Server) ConnectToPeerWithTimeout(peerID int, addr net.Addr, timeout tim
 		rpcClient := rpc.NewClient(client)
 		s.peerClients[peerID] = rpcClient
 		s.peerAddresses[peerID] = addr
-	} else {
-		_ = client.Close()
 	}
 	s.mu.Unlock()
 	return nil
@@ -290,30 +288,50 @@ func (s *Server) DisconnectPeer(peerID int) error {
 // повторное подключение. В тестовом режиме (harness) повторное
 // подключение не выполняется.
 func (s *Server) Call(id int, serviceMethod string, args, reply any) error {
+	fmtErrorf := func() error { return fmt.Errorf("call client %d after it's closed", id) }
 	peer := s.PeerClient(id)
 
-	// Если этот метод вызывается после завершения работы (когда вызывается client.Close),
-	// он вернет ошибку.
 	if peer == nil {
-		err := s.reConnect(id)
-		if err != nil {
-			return err
-		}
-	}
-	err := s.rpcProxy.Call(s.PeerClient(id), serviceMethod, args, reply)
-	if err != nil {
 		if s.harness {
-			return err
+			return fmtErrorf()
 		}
-		s.ClosePeerClient(id)
-		err = s.reConnect(id)
+		s.mu.Lock()
+		addr := s.peerAddresses[id]
+		if addr == nil {
+			s.mu.Unlock()
+			return fmtErrorf()
+		}
+		client, err := net.DialTimeout("tcp", addr.String(), 2*HeartbeatTimeoutMs/3*time.Millisecond)
 		if err != nil {
+			s.mu.Unlock()
 			return err
 		}
-		return s.rpcProxy.Call(s.PeerClient(id), serviceMethod, args, reply)
+		peer = rpc.NewClient(client)
+		s.peerClients[id] = peer
+		s.mu.Unlock()
+		s.cm.iLogf("reconnected to peer %v", id)
 	}
-	return err
+	return s.rpcProxy.Call(s.PeerClient(id), serviceMethod, args, reply)
 }
+
+/*
+	fmtErrorf := func() error { return fmt.Errorf("call client %d after it's closed", id) }
+	if s.harness {
+		return fmtErrorf()
+	}
+	s.mu.Lock()
+	addr := s.peerAddresses[id]
+	s.mu.Unlock()
+	if addr == nil {
+		return fmtErrorf()
+	}
+	err := s.ConnectToPeerWithTimeout(id, addr, ReelectionTimeoutMs/2*time.Millisecond)
+	if err != nil {
+		return fmtErrorf()
+	}
+	return nil
+
+*/
 
 // PeerClient возвращает RPC-клиент для узла с идентификатором id.
 // Потокобезопасна. Возвращает nil, если клиент не подключён.
@@ -448,6 +466,25 @@ func (rpp *RPCProxy) InstallSnapshot(
 		}
 	}
 	return rpp.cm.InstallSnapshot(args, reply)
+}
+
+func (rpp *RPCProxy) PreVote(args PreVoteArgs, reply *PreVoteReply) error {
+	if EnableRPCProxy {
+		if os.Getenv("RAFT_UNRELIABLE_RPC") != "" {
+			dice := rand.Intn(10)
+			switch dice {
+			case 9:
+				rpp.cm.dLogf("drop PreVote")
+				return fmt.Errorf("RPC failed")
+			case 8:
+				rpp.cm.dLogf("delay PreVote")
+				time.Sleep(75 * time.Millisecond)
+			}
+		} else {
+			time.Sleep(time.Duration(1+rand.Intn(5)) * time.Millisecond)
+		}
+	}
+	return rpp.cm.PreVote(args, reply)
 }
 
 func (rpp *RPCProxy) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {

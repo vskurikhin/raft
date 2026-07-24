@@ -79,8 +79,10 @@ func connect(n int, kvs *kvservice.KVService, values config.Values) {
 	for i := 0; i < Try && err != nil; i++ {
 		duration := (i * MinimalDuration) % DurationModulus
 		time.Sleep(time.Duration(duration+MinimalDuration) * time.Millisecond)
-		log.Printf("try connect to peer %d", n)
 		err = kvs.ConnectToRaftPeer(n, values.Peers[n])
+		if err == nil {
+			log.Printf("connected to peer %d", n)
+		}
 	}
 	if err != nil {
 		log.Printf("warning connect to peer %d: error: %v", n, err)

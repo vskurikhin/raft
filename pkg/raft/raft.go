@@ -161,6 +161,7 @@ type ConsensusModule struct {
 	// Непостоянное состояние Raft на лидерах
 	nextIndex  map[int]int
 	matchIndex map[int]int
+	leaderDone chan struct{}
 
 	// Состояние снепшота
 	lastIncludedIndex int
@@ -212,6 +213,7 @@ func NewConsensusModule(
 	cm.nextIndex = make(map[int]int)
 	cm.matchIndex = make(map[int]int)
 	cm.electionTimerDone = make(chan struct{})
+	cm.leaderDone = make(chan struct{})
 
 	if cm.storage.HasData() {
 		cm.restoreFromStorage()
@@ -540,6 +542,22 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
+// PreVoteArgs — аргументы PreVote RPC.
+// PreVote — это «пробные» выборы: узел проверяет, сможет ли он получить
+// голоса, НЕ изменяя currentTerm и НЕ вызывая becomeFollower() на
+// получателях. Это предотвращает disruptive server livelock.
+type PreVoteArgs struct {
+	Term         int
+	CandidateID  int
+	LastLogIndex int
+	LastLogTerm  int
+}
+
+type PreVoteReply struct {
+	Term        int
+	VoteGranted bool
+}
+
 // RequestVote RPC.
 func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
 	cm.mu.Lock()
@@ -571,6 +589,36 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 	reply.Term = cm.currentTerm
 	cm.persistState()
 	cm.dLogf("... RequestVote reply: %+v", reply)
+	return nil
+}
+
+// PreVote обработчик PreVote RPC.
+// ВАЖНО: Не изменяет состояние получателя — не вызывает becomeFollower(),
+// не меняет currentTerm, votedFor, не сбрасывает electionResetEvent.
+func (cm *ConsensusModule) PreVote(args PreVoteArgs, reply *PreVoteReply) error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	if cm.state == Dead {
+		return nil
+	}
+	lastLogIndex, lastLogTerm := cm.lastLogIndexAndTerm()
+	cm.dLogf(
+		"PreVote: %+v [currentTerm=%d, log index/term=(%d, %d)]",
+		args, cm.currentTerm, lastLogIndex, lastLogTerm,
+	)
+
+	if args.Term < cm.currentTerm {
+		reply.Term = cm.currentTerm
+		reply.VoteGranted = false
+		return nil
+	}
+
+	// Если пробный term >= currentTerm — проверяем актуальность лога
+	logOk := args.LastLogTerm > lastLogTerm ||
+		(args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)
+	reply.VoteGranted = logOk
+	reply.Term = cm.currentTerm
+	cm.dLogf("... PreVote reply: %+v", reply)
 	return nil
 }
 
@@ -722,9 +770,10 @@ func (cm *ConsensusModule) InstallSnapshot(
 		return nil
 	}
 
+	cm.dLogf("InstallSnapshot: %+v", args)
 	cm.iLogf(
-		"InstallSnapshot: %+v [currentTerm=%d, lastIncludedIndex=%d]",
-		args, cm.currentTerm, cm.lastIncludedIndex,
+		"InstallSnapshot: [currentTerm=%d, lastIncludedIndex=%d]",
+		cm.currentTerm, cm.lastIncludedIndex,
 	)
 
 	// Шаг 1: проверка терма
@@ -742,8 +791,10 @@ func (cm *ConsensusModule) InstallSnapshot(
 
 	// Шаг 2: если снепшот новее текущего
 	if args.LastIncludedIndex <= cm.lastIncludedIndex {
-		cm.dLogf("InstallSnapshot: ignoring, already have lastIncludedIndex=%d >= %d",
-			cm.lastIncludedIndex, args.LastIncludedIndex)
+		cm.iLogf(
+			"InstallSnapshot: ignoring, already have lastIncludedIndex=%d >= %d",
+			cm.lastIncludedIndex, args.LastIncludedIndex,
+		)
 		cm.mu.Unlock()
 		return nil
 	}
@@ -848,8 +899,24 @@ func (cm *ConsensusModule) runElectionTimer() {
 			// Начать выборы, если в течение времени ожидания мы не получили
 			// сообщение от лидера или не проголосовали за кого-либо.
 			if elapsed := time.Since(cm.electionResetEvent); elapsed >= timeoutDuration {
-				cm.startElection()
 				cm.mu.Unlock()
+				if cm.preVote() {
+					cm.mu.Lock()
+					// Проверяем, что наш таймер выборов всё ещё актуален
+					// (не был заменён через becomeFollower во время preVote).
+					if cm.electionTimerDone == electionTimerDone {
+						cm.startElection()
+					}
+					cm.mu.Unlock()
+				} else {
+					// preVote проигран — перезапускаем таймер,
+					// чтобы попробовать снова позже.
+					cm.mu.Lock()
+					if cm.electionTimerDone == electionTimerDone {
+						go cm.runElectionTimer()
+					}
+					cm.mu.Unlock()
+				}
 				return
 			}
 			cm.mu.Unlock()
@@ -927,6 +994,66 @@ func (cm *ConsensusModule) startElection() {
 	go cm.runElectionTimer()
 }
 
+// preVote отправляет PreVote запросы всем peer'ам и возвращает true,
+// если большинство (включая себя) готово голосовать за этот узел.
+// НЕ изменяет состояние CM — only probe.
+func (cm *ConsensusModule) preVote() bool {
+	cm.mu.Lock()
+	savedCurrentTerm := cm.currentTerm
+	savedLastLogIndex, savedLastLogTerm := cm.lastLogIndexAndTerm()
+	peerIds := make([]int, len(cm.peerIds))
+	copy(peerIds, cm.peerIds)
+	cm.mu.Unlock()
+
+	trialTerm := savedCurrentTerm + 1
+	cm.dLogf(
+		"preVote: trialTerm=%d, lastLogIndex=%d, lastLogTerm=%d",
+		trialTerm, savedLastLogIndex, savedLastLogTerm,
+	)
+
+	var votesReceived atomic.Int32
+	votesReceived.Store(1)
+
+	var wg sync.WaitGroup
+	for _, peerID := range peerIds {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			args := PreVoteArgs{
+				Term:         trialTerm,
+				CandidateID:  cm.id,
+				LastLogIndex: savedLastLogIndex,
+				LastLogTerm:  savedLastLogTerm,
+			}
+			var reply PreVoteReply
+			if cm.server == nil {
+				return
+			}
+			if err := cm.server.Call(id, "ConsensusModule.PreVote", args, &reply); err == nil {
+				cm.dLogf("preVote reply from %d: %+v", id, reply)
+				if reply.VoteGranted {
+					votesReceived.Add(1)
+				}
+			}
+		}(peerID)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(TickerTimeoutMs * time.Millisecond):
+	}
+
+	majority := int(votesReceived.Load())*2 > len(peerIds)+1
+	cm.dLogf("preVote: %d votes out of %d, majority=%v", votesReceived.Load(), len(peerIds)+1, majority)
+	return majority
+}
+
 // becomeFollower делает cm последователем и сбрасывает его состояние.
 // Ожидается, что cm.mu будет заблокирован.
 func (cm *ConsensusModule) becomeFollower(term int) {
@@ -945,6 +1072,17 @@ func (cm *ConsensusModule) becomeFollower(term int) {
 		close(cm.electionTimerDone)
 	}
 	cm.electionTimerDone = make(chan struct{})
+
+	// Останавливаем горутину пульсаций лидера, если она запущена.
+	if cm.leaderDone != nil {
+		select {
+		case <-cm.leaderDone:
+		default:
+			close(cm.leaderDone)
+		}
+	}
+	cm.leaderDone = make(chan struct{})
+
 	go cm.runElectionTimer()
 }
 
@@ -952,6 +1090,7 @@ func (cm *ConsensusModule) becomeFollower(term int) {
 // Ожидается, что cm.mu будет заблокирован.
 func (cm *ConsensusModule) startLeader() {
 	cm.state = Leader
+	cm.leaderDone = make(chan struct{})
 
 	logLen := cm.getLogLength()
 	for _, peerID := range cm.peerIds {
@@ -968,8 +1107,17 @@ func (cm *ConsensusModule) startLeader() {
 	// * каждый раз, когда в triggerAEChan поступает уведомление;
 	// * либо каждые HeartbeatTimeoutMs мс, если в triggerAEChan не происходит событий.
 	go func(heartbeatTimeout time.Duration) {
+		leaderDone := cm.leaderDone
+
 		// Немедленно отправить сообщения AppendEntries всем соседям.
 		cm.leaderSendAEs()
+
+		cm.mu.Lock()
+		if cm.state != Leader {
+			cm.mu.Unlock()
+			return
+		}
+		cm.mu.Unlock()
 
 		t := time.NewTimer(heartbeatTimeout)
 		defer t.Stop()
@@ -978,9 +1126,6 @@ func (cm *ConsensusModule) startLeader() {
 			select {
 			case <-t.C:
 				doSend = true
-
-				// Перезапустить таймер, чтобы он снова сработал через
-				// heartbeatTimeout.
 				t.Stop()
 				t.Reset(heartbeatTimeout)
 			case _, ok := <-cm.triggerAEChan:
@@ -989,17 +1134,15 @@ func (cm *ConsensusModule) startLeader() {
 				} else {
 					return
 				}
-
-				// Перезапустить таймер heartbeatTimeout.
 				if !t.Stop() {
 					<-t.C
 				}
 				t.Reset(heartbeatTimeout)
+			case <-leaderDone:
+				return
 			}
 
 			if doSend {
-				// Если этот узел больше не является лидером,
-				// остановить цикл отправки сообщений.
 				cm.mu.Lock()
 				if cm.state != Leader {
 					cm.mu.Unlock()

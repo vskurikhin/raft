@@ -959,3 +959,208 @@ func TestElectionSafetyStress(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	h.CheckSingleLeader()
 }
+
+// TestPreVoteStaleCandidate проверяет, что PreVote от кандидата
+// с устаревшим логом отклоняется.
+func TestPreVoteStaleCandidate(t *testing.T) {
+	cm := &ConsensusModule{
+		state:              Follower,
+		currentTerm:        5,
+		votedFor:           -1,
+		electionTimerDone:  make(chan struct{}),
+		leaderDone:         make(chan struct{}),
+		electionResetEvent: time.Now(),
+		storage:            NewMapStorage(),
+	}
+	cm.log = []LogEntry{{Command: 1, Term: 5}, {Command: 2, Term: 5}}
+	cm.lastIncludedIndex = 0
+
+	args := PreVoteArgs{
+		Term:         6,
+		CandidateID:  99,
+		LastLogIndex: 0,
+		LastLogTerm:  0,
+	}
+	var reply PreVoteReply
+	err := cm.PreVote(args, &reply)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reply.VoteGranted {
+		t.Errorf("expected VoteGranted=false for stale candidate, got true")
+	}
+	if reply.Term != 5 {
+		t.Errorf("expected reply.Term=5, got %d", reply.Term)
+	}
+}
+
+// TestPreVoteUpToDateCandidate проверяет, что PreVote от кандидата
+// с актуальным логом одобряется.
+func TestPreVoteUpToDateCandidate(t *testing.T) {
+	cm := &ConsensusModule{
+		state:              Follower,
+		currentTerm:        5,
+		votedFor:           -1,
+		electionTimerDone:  make(chan struct{}),
+		leaderDone:         make(chan struct{}),
+		electionResetEvent: time.Now(),
+		storage:            NewMapStorage(),
+	}
+	cm.log = []LogEntry{{Command: 1, Term: 5}, {Command: 2, Term: 5}}
+	cm.lastIncludedIndex = 0
+
+	args := PreVoteArgs{
+		Term:         6,
+		CandidateID:  99,
+		LastLogIndex: 2,
+		LastLogTerm:  5,
+	}
+	var reply PreVoteReply
+	err := cm.PreVote(args, &reply)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reply.VoteGranted {
+		t.Errorf("expected VoteGranted=true for up-to-date candidate, got false")
+	}
+}
+
+// TestPreVoteHigherTerm проверяет, что PreVote с более высоким term
+// одобряется, если лог кандидата не уступает получателю.
+func TestPreVoteHigherTerm(t *testing.T) {
+	cm := &ConsensusModule{
+		state:              Follower,
+		currentTerm:        3,
+		votedFor:           -1,
+		electionTimerDone:  make(chan struct{}),
+		leaderDone:         make(chan struct{}),
+		electionResetEvent: time.Now(),
+		storage:            NewMapStorage(),
+	}
+	cm.log = []LogEntry{{Command: 1, Term: 2}, {Command: 2, Term: 3}}
+	cm.lastIncludedIndex = 0
+
+	args := PreVoteArgs{
+		Term:         5,
+		CandidateID:  99,
+		LastLogIndex: 2,
+		LastLogTerm:  3,
+	}
+	var reply PreVoteReply
+	err := cm.PreVote(args, &reply)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reply.VoteGranted {
+		t.Errorf("expected VoteGranted=true for higher-term candidate with equal log, got false")
+	}
+}
+
+// TestPreVoteNoStateChange проверяет, что PreVote не изменяет
+// состояние получателя (currentTerm, votedFor, state).
+func TestPreVoteNoStateChange(t *testing.T) {
+	cm := &ConsensusModule{
+		state:              Follower,
+		currentTerm:        3,
+		votedFor:           1,
+		electionTimerDone:  make(chan struct{}),
+		leaderDone:         make(chan struct{}),
+		electionResetEvent: time.Now(),
+		storage:            NewMapStorage(),
+	}
+	cm.log = []LogEntry{{Command: 1, Term: 2}}
+	cm.lastIncludedIndex = 0
+
+	savedTerm := cm.currentTerm
+	savedVotedFor := cm.votedFor
+	savedState := cm.state
+
+	args := PreVoteArgs{
+		Term:         4,
+		CandidateID:  99,
+		LastLogIndex: 1,
+		LastLogTerm:  3,
+	}
+	var reply PreVoteReply
+	_ = cm.PreVote(args, &reply)
+
+	if cm.currentTerm != savedTerm {
+		t.Errorf("currentTerm changed from %d to %d", savedTerm, cm.currentTerm)
+	}
+	if cm.votedFor != savedVotedFor {
+		t.Errorf("votedFor changed from %d to %d", savedVotedFor, cm.votedFor)
+	}
+	if cm.state != savedState {
+		t.Errorf("state changed from %v to %v", savedState, cm.state)
+	}
+}
+
+// TestPreVoteLowerTerm проверяет, что PreVote с term < currentTerm
+// отклоняется и возвращает текущий term.
+func TestPreVoteLowerTerm(t *testing.T) {
+	cm := &ConsensusModule{
+		state:              Follower,
+		currentTerm:        5,
+		votedFor:           -1,
+		electionTimerDone:  make(chan struct{}),
+		leaderDone:         make(chan struct{}),
+		electionResetEvent: time.Now(),
+		storage:            NewMapStorage(),
+	}
+	cm.log = []LogEntry{{Command: 1, Term: 5}}
+
+	args := PreVoteArgs{
+		Term:         3,
+		CandidateID:  99,
+		LastLogIndex: 1,
+		LastLogTerm:  5,
+	}
+	var reply PreVoteReply
+	err := cm.PreVote(args, &reply)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reply.VoteGranted {
+		t.Errorf("expected VoteGranted=false for lower-term pre-vote")
+	}
+	if reply.Term != 5 {
+		t.Errorf("expected reply.Term=5, got %d", reply.Term)
+	}
+}
+
+// TestPreVoteAfterServerRestart проверяет, что перезапущенный узел
+// с пустым состоянием не нарушает работу кластера: он не вызывает
+// becomeFollower на других узлах через PreVote, а PreVote от него
+// отклоняется (пустой лог устарел).
+func TestPreVoteAfterServerRestart(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+
+	h := NewHarness(t, 3)
+	defer h.Shutdown()
+
+	// Дождаться стабильного лидера и зафиксировать команду.
+	leaderId, _ := h.CheckSingleLeader()
+	h.SubmitToServer(leaderId, 42)
+	sleepMs(250)
+
+	// Определить follower для перезапуска.
+	followerId := (leaderId + 1) % 3
+	for followerId == leaderId {
+		followerId = (followerId + 1) % 3
+	}
+
+	// "Аварийно завершить" и перезапустить follower.
+	h.CrashPeer(followerId)
+	sleepMs(100)
+	h.RestartPeer(followerId)
+
+	// Дать время на восстановление — PreVote + выборы.
+	sleepMs(2000)
+
+	// Лидер должен остаться в кластере, терм не должен бесконечно расти.
+	newLeaderId, newTerm := h.CheckSingleLeader()
+	if newTerm > 5 {
+		t.Errorf("term grew too high (%d) — possible livelock from PreVote disruption", newTerm)
+	}
+	_ = newLeaderId
+}
