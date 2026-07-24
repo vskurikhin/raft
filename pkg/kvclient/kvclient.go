@@ -144,7 +144,8 @@ FindLeader:
 			retryCtxCancel()
 			return fmt.Errorf("commit failed; please retry")
 		default:
-			panic("unreachable")
+			retryCtxCancel()
+			return fmt.Errorf("unreachable")
 		}
 	}
 }

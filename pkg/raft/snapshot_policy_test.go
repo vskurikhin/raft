@@ -13,6 +13,7 @@ func TestSetSnapshotPolicy(t *testing.T) {
 	close(ready)
 
 	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan)
+	defer cm.Stop()
 
 	cm.SetSnapshotPolicy(64, 16)
 	if cm.snapshotThreshold != 64 {
@@ -32,6 +33,7 @@ func TestSetSnapshotDataFn(t *testing.T) {
 	close(ready)
 
 	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan)
+	defer cm.Stop()
 
 	called := false
 	cm.SetSnapshotDataFn(func() []byte {
@@ -63,6 +65,9 @@ func TestSnapshotThresholdCondition(t *testing.T) {
 	close(ready)
 
 	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan)
+	defer cm.Stop()
+
+	cm.mu.Lock()
 	cm.state = Leader
 	cm.currentTerm = 1
 	cm.lastApplied = 99
@@ -77,11 +82,13 @@ func TestSnapshotThresholdCondition(t *testing.T) {
 
 	// Условие: len(cm.log)=60 >= 50 → true
 	if !(len(cm.log) >= cm.snapshotThreshold) {
+		cm.mu.Unlock()
 		t.Fatal("expected log length >= threshold")
 	}
 
 	// Условие: lastApplied - lastIncludedIndex = 99 - 0 >= 10 → true
 	if !(cm.lastApplied-cm.lastIncludedIndex >= cm.snapshotInterval) {
+		cm.mu.Unlock()
 		t.Fatal("expected gap >= interval")
 	}
 
@@ -90,6 +97,7 @@ func TestSnapshotThresholdCondition(t *testing.T) {
 		cm.snapshotThreshold > 0 &&
 		len(cm.log) >= cm.snapshotThreshold &&
 		cm.lastApplied-cm.lastIncludedIndex >= cm.snapshotInterval
+	cm.mu.Unlock()
 	if !triggered {
 		t.Fatal("expected snapshot trigger condition to be true")
 	}
@@ -104,6 +112,9 @@ func TestSnapshotThresholdNotMet(t *testing.T) {
 	close(ready)
 
 	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan)
+	defer cm.Stop()
+
+	cm.mu.Lock()
 	cm.state = Leader
 	cm.currentTerm = 1
 	cm.lastApplied = 29
@@ -120,6 +131,7 @@ func TestSnapshotThresholdNotMet(t *testing.T) {
 		cm.snapshotThreshold > 0 &&
 		len(cm.log) >= cm.snapshotThreshold &&
 		cm.lastApplied-cm.lastIncludedIndex >= cm.snapshotInterval
+	cm.mu.Unlock()
 	if triggered {
 		t.Fatal("expected snapshot trigger condition to be false (log too small)")
 	}
@@ -134,6 +146,9 @@ func TestSnapshotIntervalNotMet(t *testing.T) {
 	close(ready)
 
 	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan)
+	defer cm.Stop()
+
+	cm.mu.Lock()
 	cm.state = Leader
 	cm.currentTerm = 1
 	cm.lastApplied = 15
@@ -150,6 +165,7 @@ func TestSnapshotIntervalNotMet(t *testing.T) {
 		cm.snapshotThreshold > 0 &&
 		len(cm.log) >= cm.snapshotThreshold &&
 		cm.lastApplied-cm.lastIncludedIndex >= cm.snapshotInterval
+	cm.mu.Unlock()
 	if triggered {
 		t.Fatal("expected snapshot trigger condition to be false (interval not met)")
 	}
@@ -164,6 +180,9 @@ func TestSnapshotDisabled(t *testing.T) {
 	close(ready)
 
 	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan)
+	defer cm.Stop()
+
+	cm.mu.Lock()
 	cm.state = Leader
 	cm.currentTerm = 1
 	cm.lastApplied = 99
@@ -179,6 +198,7 @@ func TestSnapshotDisabled(t *testing.T) {
 		cm.snapshotThreshold > 0 &&
 		len(cm.log) >= cm.snapshotThreshold &&
 		cm.lastApplied-cm.lastIncludedIndex >= cm.snapshotInterval
+	cm.mu.Unlock()
 	if triggered {
 		t.Fatal("expected snapshot trigger condition to be false (disabled)")
 	}
@@ -193,6 +213,9 @@ func TestSnapshotOnlyOnLeader(t *testing.T) {
 	close(ready)
 
 	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan)
+	defer cm.Stop()
+
+	cm.mu.Lock()
 	cm.state = Follower // не лидер
 	cm.currentTerm = 1
 	cm.lastApplied = 99
@@ -208,6 +231,7 @@ func TestSnapshotOnlyOnLeader(t *testing.T) {
 		cm.snapshotThreshold > 0 &&
 		len(cm.log) >= cm.snapshotThreshold &&
 		cm.lastApplied-cm.lastIncludedIndex >= cm.snapshotInterval
+	cm.mu.Unlock()
 	if triggered {
 		t.Fatal("expected snapshot trigger condition to be false (follower)")
 	}
@@ -223,6 +247,9 @@ func TestSnapshotAfterTakeSnapshotResetsGap(t *testing.T) {
 	close(ready)
 
 	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan)
+	defer cm.Stop()
+
+	cm.mu.Lock()
 	cm.state = Leader
 	cm.currentTerm = 1
 
@@ -234,7 +261,6 @@ func TestSnapshotAfterTakeSnapshotResetsGap(t *testing.T) {
 	cm.lastApplied = 99
 
 	// Сделать снепшот
-	cm.mu.Lock()
 	cm.TakeSnapshot([]byte("data"))
 	cm.mu.Unlock()
 
@@ -267,6 +293,7 @@ func TestConfigSnapshotThresholdPropagation(t *testing.T) {
 	commitChan := make(chan CommitEntry, 100)
 
 	s := NewWithSnapshot(cfg, storage, ready, commitChan, make(chan []byte, 1))
+	defer s.Shutdown()
 
 	if s.snapshotThreshold != 128 {
 		t.Fatalf("expected snapshotThreshold=128 on server, got %d", s.snapshotThreshold)
@@ -286,6 +313,9 @@ func TestSnapshotPolicyWithDataFn(t *testing.T) {
 	close(ready)
 
 	cm := NewConsensusModule(1, []int{2, 3}, nil, storage, ready, commitChan, snapshotChan)
+	defer cm.Stop()
+
+	cm.mu.Lock()
 	cm.state = Leader
 	cm.currentTerm = 1
 
@@ -296,13 +326,12 @@ func TestSnapshotPolicyWithDataFn(t *testing.T) {
 	cm.commitIndex = 9
 	cm.lastApplied = 9
 
-	// Установить dataFn
-	cm.SetSnapshotDataFn(func() []byte {
+	// Установить dataFn напрямую (уже держим mu.Lock)
+	cm.snapshotDataFn = func() []byte {
 		return []byte("state-machine-data")
-	})
+	}
 
 	// Вызвать TakeSnapshot с данными от dataFn
-	cm.mu.Lock()
 	cm.TakeSnapshot(cm.snapshotDataFn())
 	cm.mu.Unlock()
 

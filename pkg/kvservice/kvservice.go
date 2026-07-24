@@ -6,6 +6,7 @@ import (
 	"encoding/gob"
 	"fmt"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"sync"
@@ -17,7 +18,7 @@ import (
 	_ "net/http/pprof"
 )
 
-const DebugKV = 1
+const TraceKV = 0
 
 type KVService struct {
 	mu sync.Mutex
@@ -138,7 +139,7 @@ func (kvs *KVService) ServeHTTP(address string) {
 	}
 
 	go func() {
-		kvs.kvLogf("serving HTTP on %s", kvs.srv.Addr)
+		kvs.traceKVLogf("serving HTTP on %s", kvs.srv.Addr)
 		if err := kvs.srv.ListenAndServe(); err != http.ErrServerClosed {
 			log.Fatal(err)
 		}
@@ -153,19 +154,19 @@ func (kvs *KVService) ServeHTTP(address string) {
 // Примечание: перед вызовом Shutdown необходимо вызвать
 // DisconnectFromRaftPeers для всех узлов кластера.
 func (kvs *KVService) Shutdown() error {
-	kvs.kvLogf("shutting down Raft server")
+	kvs.traceKVLogf("shutting down Raft server")
 	kvs.rs.Shutdown()
-	kvs.kvLogf("closing commitChan")
+	kvs.traceKVLogf("closing commitChan")
 	close(kvs.commitChan)
-	kvs.kvLogf("closing snapshotChan")
+	kvs.traceKVLogf("closing snapshotChan")
 	close(kvs.snapshotChan)
 
 	if kvs.srv != nil {
-		kvs.kvLogf("shutting down HTTP server")
+		kvs.traceKVLogf("shutting down HTTP server")
 		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 		defer cancel()
 		_ = kvs.srv.Shutdown(ctx)
-		kvs.kvLogf("HTTP shutdown complete")
+		kvs.traceKVLogf("HTTP shutdown complete")
 		return nil
 	}
 
@@ -193,7 +194,7 @@ func (kvs *KVService) handlePut(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	kvs.kvLogf("HTTP PUT %v", pr)
+	kvs.traceKVLogf("HTTP PUT %v", pr)
 
 	// Отправить команду серверу Raft. Это изменение состояния реплицируемой
 	// машины состояний, построенной поверх журнала Raft.
@@ -249,7 +250,7 @@ func (kvs *KVService) handleGet(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	kvs.kvLogf("HTTP GET %v", gr)
+	kvs.traceKVLogf("HTTP GET %v", gr)
 
 	select {
 	case <-req.Context().Done():
@@ -270,7 +271,7 @@ func (kvs *KVService) handleCAS(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	kvs.kvLogf("HTTP CAS %v", cr)
+	kvs.traceKVLogf("HTTP CAS %v", cr)
 
 	cmd := Command{
 		Kind:         CommandCAS,
@@ -321,7 +322,7 @@ func (kvs *KVService) runUpdater() {
 				if !ok {
 					return
 				}
-				kvs.kvLogf("applying snapshot, %d bytes", len(snapshotData))
+				kvs.infoKVLogf("applying snapshot, %d bytes", len(snapshotData))
 				kvs.ds.RestoreFromSnapshot(snapshotData)
 
 			case entry, ok := <-kvs.commitChan:
@@ -330,7 +331,7 @@ func (kvs *KVService) runUpdater() {
 				}
 				cmd, ok := entry.Command.(Command)
 				if !ok {
-					kvs.kvLogf("unknown command %v", entry.Command)
+					kvs.traceKVLogf("unknown command %v", entry.Command)
 					continue
 				}
 
@@ -342,7 +343,7 @@ func (kvs *KVService) runUpdater() {
 				case CommandCAS:
 					cmd.ResultValue, cmd.ResultFound = kvs.ds.CAS(cmd.Key, cmd.CompareValue, cmd.Value)
 				default:
-					kvs.kvLogf("unknown command %v", cmd)
+					kvs.traceKVLogf("unknown command %v", cmd)
 					continue
 				}
 
@@ -355,8 +356,6 @@ func (kvs *KVService) runUpdater() {
 					default:
 					}
 					close(sub)
-				} else {
-					log.Printf("NO SUBSCRIPTION FOR %d", entry.Index)
 				}
 			}
 		}
@@ -394,9 +393,14 @@ func (kvs *KVService) popCommitSubscription(logIndex int) chan Command {
 	return ch
 }
 
-// kvLogf выводит отладочное сообщение, если DebugKV > 0.
-func (kvs *KVService) kvLogf(format string, args ...any) {
-	if DebugKV > 0 {
+func (kvs *KVService) infoKVLogf(format string, args ...any) {
+	format = fmt.Sprintf("[kv %d] ", kvs.id) + format
+	slog.Info(fmt.Sprintf(format, args...))
+}
+
+// traceKVLogf выводит отладочное сообщение, если TraceKV > 0.
+func (kvs *KVService) traceKVLogf(format string, args ...any) {
+	if TraceKV > 0 {
 		format = fmt.Sprintf("[kv %d] ", kvs.id) + format
 		log.Printf(format, args...)
 	}

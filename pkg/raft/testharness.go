@@ -154,6 +154,7 @@ func (h *Harness) CrashPeer(id int) {
 	tlog("Crash %d", id)
 	h.DisconnectPeer(id)
 	h.alive[id] = false
+	h.cluster[id].FlushPersist()
 	h.cluster[id].Shutdown()
 
 	// Очищаем список зафиксированных записей для аварийно завершившего работу

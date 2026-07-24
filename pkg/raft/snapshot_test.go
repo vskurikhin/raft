@@ -132,9 +132,9 @@ func TestSnapshotPersistence(t *testing.T) {
 	cm.TakeSnapshot([]byte("persistence-test-data"))
 	cm.mu.Unlock()
 
-	// Сохранить состояние через persistToStorage
+	// Сохранить состояние через persistAllState
 	cm.mu.Lock()
-	cm.persistToStorage()
+	cm.persistAllState()
 	cm.mu.Unlock()
 
 	// Создать новый CM с тем же storage

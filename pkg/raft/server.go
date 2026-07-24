@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-const EnableRPCProxy = true
+const EnableRPCProxy = false
 
 // Server инкапсулирует raft.ConsensusModule вместе с rpc.Server, который предоставляет
 // свои методы в качестве RPC-конечных точек. Он также управляет узлами Raft-сервера.
@@ -190,6 +190,12 @@ func (s *Server) Submit(cmd any) int {
 	return s.cm.Submit(cmd)
 }
 
+// FlushPersist принудительно выполняет персистенцию всего состояния.
+// Используется только в тестах для синхронного ожидания персистенции.
+func (s *Server) FlushPersist() {
+	s.cm.FlushPersist()
+}
+
 // DisconnectAll закрывает все клиентские соединения с другими узлами для этого сервера.
 func (s *Server) DisconnectAll() {
 	s.mu.Lock()
@@ -204,9 +210,13 @@ func (s *Server) DisconnectAll() {
 
 // Shutdown закрывает сервер и ожидает его корректного завершения работы.
 func (s *Server) Shutdown() {
-	s.cm.Stop()
+	if s.cm != nil {
+		s.cm.Stop()
+	}
 	close(s.quit)
-	_ = s.listener.Close()
+	if s.listener != nil {
+		_ = s.listener.Close()
+	}
 	s.wg.Wait()
 }
 
@@ -234,22 +244,22 @@ func (s *Server) ConnectToPeer(peerID int, addr net.Addr) error {
 // метод завершается без ошибки. При недоступности узла возвращает ошибку.
 func (s *Server) ConnectToPeerWithTimeout(peerID int, addr net.Addr, timeout time.Duration) error {
 	s.mu.Lock()
-	if s.peerClients[peerID] == nil {
-		s.mu.Unlock()
-		client, err := net.DialTimeout("tcp", addr.String(), timeout)
-		if err != nil {
-			return err
-		}
-		s.mu.Lock()
-		if s.peerClients[peerID] == nil {
-			rpcClient := rpc.NewClient(client)
-			s.peerClients[peerID] = rpcClient
-			s.peerAddresses[peerID] = addr
-		} else {
-			_ = client.Close()
-		}
+	if s.peerClients[peerID] != nil {
 		s.mu.Unlock()
 		return nil
+	}
+	s.mu.Unlock()
+	client, err := net.DialTimeout("tcp", addr.String(), timeout)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	if s.peerClients[peerID] == nil {
+		rpcClient := rpc.NewClient(client)
+		s.peerClients[peerID] = rpcClient
+		s.peerAddresses[peerID] = addr
+	} else {
+		_ = client.Close()
 	}
 	s.mu.Unlock()
 	return nil

@@ -159,6 +159,12 @@ type ConsensusModule struct {
 	snapshotThreshold int
 	snapshotInterval  int
 	snapshotDataFn    func() []byte
+
+	// logDirty — флаг, указывающий, что лог изменился и требуется персистенция.
+	logDirty bool
+
+	// persistReq — канал для сигнала фоновому персистору.
+	persistReq chan struct{}
 }
 
 // NewConsensusModule создаёт новый экземпляр CM с указанными
@@ -195,6 +201,11 @@ func NewConsensusModule(
 
 	if cm.storage.HasData() {
 		cm.restoreFromStorage()
+	} else {
+		// Инициализируем storage всеми ключами, чтобы restoreFromStorage
+		// не упал с "log not found in storage" после персистенции только
+		// currentTerm/votedFor через persistState().
+		cm.persistAllState()
 	}
 
 	go func() {
@@ -207,8 +218,13 @@ func NewConsensusModule(
 		cm.runElectionTimer()
 	}()
 
+	cm.logDirty = false
+	cm.persistReq = make(chan struct{}, 1)
+
 	cm.newCommitReadyChanWg.Add(1)
 	go cm.commitChanSender()
+	go cm.runLogPersister()
+	go cm.infoLoggingLeader()
 	return cm
 }
 
@@ -233,8 +249,12 @@ func (cm *ConsensusModule) Submit(command any) int {
 	cm.dLogf("Submit received by %v: %v", cm.state, command)
 	submitIndex := cm.getLogLength()
 	cm.log = append(cm.log, LogEntry{Command: command, Term: cm.currentTerm})
-	cm.persistToStorage()
 	cm.dLogf("... log=%v", cm.log)
+	cm.logDirty = true
+	select {
+	case cm.persistReq <- struct{}{}:
+	default:
+	}
 	cm.mu.Unlock()
 	select {
 	case cm.triggerAEChan <- struct{}{}:
@@ -282,7 +302,7 @@ func (cm *ConsensusModule) TakeSnapshot(stateMachineData []byte) {
 		snapIndex, snapTerm, len(cm.log),
 	)
 
-	cm.persistToStorage()
+	cm.persistAllState()
 }
 
 // SetSnapshotPolicy устанавливает параметры политики автоматических снепшотов.
@@ -316,6 +336,10 @@ func (cm *ConsensusModule) Stop() {
 	// monitors it to exit.
 	close(cm.newCommitReadyChan)
 	cm.newCommitReadyChanWg.Wait()
+
+	if cm.persistReq != nil {
+		close(cm.persistReq)
+	}
 }
 
 // restoreFromStorage восстанавливает постоянное состояние данного CM
@@ -369,9 +393,25 @@ func (cm *ConsensusModule) restoreFromStorage() {
 	}
 }
 
-// persistToStorage сохраняет всё постоянное состояние CM в cm.storage.
+// persistState сохраняет только currentTerm и votedFor.
 // Предполагается, что cm.mu уже заблокирован.
-func (cm *ConsensusModule) persistToStorage() {
+func (cm *ConsensusModule) persistState() {
+	var termData bytes.Buffer
+	if err := gob.NewEncoder(&termData).Encode(cm.currentTerm); err != nil {
+		log.Fatal(err)
+	}
+	cm.storage.Set("currentTerm", termData.Bytes())
+
+	var votedData bytes.Buffer
+	if err := gob.NewEncoder(&votedData).Encode(cm.votedFor); err != nil {
+		log.Fatal(err)
+	}
+	cm.storage.Set("votedFor", votedData.Bytes())
+}
+
+// persistAllState сохраняет всё постоянное состояние CM в cm.storage.
+// Предполагается, что cm.mu уже заблокирован.
+func (cm *ConsensusModule) persistAllState() {
 	var termData bytes.Buffer
 	if err := gob.NewEncoder(&termData).Encode(cm.currentTerm); err != nil {
 		log.Fatal(err)
@@ -412,6 +452,11 @@ func (cm *ConsensusModule) dLogf(format string, args ...any) {
 		format = fmt.Sprintf("[%d] ", cm.id) + format
 		log.Printf(format, args...)
 	}
+}
+
+func (cm *ConsensusModule) iLogf(format string, args ...any) {
+	format = fmt.Sprintf("[kv %d] ", cm.id) + format
+	slog.Info(fmt.Sprintf(format, args...))
 }
 
 // getLogEntry возвращает запись журнала по логическому индексу i.
@@ -507,7 +552,7 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 		reply.VoteGranted = false
 	}
 	reply.Term = cm.currentTerm
-	cm.persistToStorage()
+	cm.persistState()
 	cm.dLogf("... RequestVote reply: %+v", reply)
 	return nil
 }
@@ -547,6 +592,7 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 	}
 
 	reply.Success = false
+	logChanged := false
 	if args.Term == cm.currentTerm {
 		if cm.state != Follower {
 			cm.becomeFollower(args.Term)
@@ -588,6 +634,7 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 			// - newEntriesIndex указывает на конец массива Entries
 			//   или на индекс, где терм записи отличается от соответствующей записи журнала.
 			if newEntriesIndex < len(args.Entries) {
+				logChanged = true
 				cm.dLogf("... inserting entries %v from index %d", args.Entries[newEntriesIndex:], logInsertIndex)
 				// Обрезаем журнал до logInsertIndex (физический индекс)
 				physIndex := logInsertIndex - offset
@@ -633,7 +680,15 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 	}
 
 	reply.Term = cm.currentTerm
-	cm.persistToStorage()
+
+	if logChanged {
+		cm.logDirty = true
+		select {
+		case cm.persistReq <- struct{}{}:
+		default:
+		}
+	}
+
 	cm.dLogf("AppendEntries reply: %+v", *reply)
 	return nil
 }
@@ -705,7 +760,7 @@ func (cm *ConsensusModule) InstallSnapshot(
 		len(cm.log), cm.lastIncludedIndex)
 
 	// Шаг 5: персистенция
-	cm.persistToStorage()
+	cm.persistAllState()
 	cm.mu.Unlock()
 
 	// Шаг 6: уведомить snapshotChan и commitChanSender
@@ -794,7 +849,7 @@ func (cm *ConsensusModule) startElection() {
 	savedCurrentTerm := cm.currentTerm
 	cm.electionResetEvent = time.Now()
 	cm.votedFor = cm.id
-	cm.persistToStorage()
+	cm.persistState()
 	cm.dLogf("becomes Candidate (currentTerm=%d); log=%v", savedCurrentTerm, cm.log)
 
 	var votesReceived atomic.Int32
@@ -816,6 +871,9 @@ func (cm *ConsensusModule) startElection() {
 
 			cm.dLogf("sending RequestVote to %d: %+v", peerID, args)
 			var reply RequestVoteReply
+			if cm.server == nil {
+				return
+			}
 			if err := cm.server.Call(peerID, "ConsensusModule.RequestVote", args, &reply); err == nil {
 				cm.mu.Lock()
 				defer cm.mu.Unlock()
@@ -858,7 +916,7 @@ func (cm *ConsensusModule) becomeFollower(term int) {
 	if term > cm.currentTerm {
 		cm.currentTerm = term
 		cm.votedFor = -1
-		cm.persistToStorage()
+		cm.persistState()
 	}
 	cm.electionResetEvent = time.Now()
 
@@ -1160,6 +1218,36 @@ func (cm *ConsensusModule) lastLogIndexAndTerm() (int, int) {
 	return cm.lastIncludedIndex, cm.lastIncludedTerm
 }
 
+// runLogPersister — фоновая горутина, которая асинхронно персистит лог
+// в storage. Получает сигналы через cm.persistReq, использует дебаунсинг
+// persistInterval, чтобы не персистить слишком часто.
+// Завершает работу после закрытия cm.persistReq.
+func (cm *ConsensusModule) runLogPersister() {
+	const persistInterval = 50 * time.Millisecond
+	timer := time.NewTimer(persistInterval)
+	timer.Stop()
+	defer timer.Stop()
+
+	for {
+		select {
+		case _, ok := <-cm.persistReq:
+			if !ok {
+				return
+			}
+			timer.Reset(persistInterval)
+
+		case <-timer.C:
+			cm.mu.Lock()
+			if cm.logDirty {
+				cm.dLogf("logPersister: persisting log (%d entries)", len(cm.log))
+				cm.persistAllState()
+				cm.logDirty = false
+			}
+			cm.mu.Unlock()
+		}
+	}
+}
+
 // commitChanSender отвечает за отправку зафиксированных записей журнала
 // в cm.commitChan. Он отслеживает уведомления, поступающие через
 // newCommitReadyChan, и определяет, какие новые записи журнала готовы
@@ -1251,4 +1339,29 @@ func (cm *ConsensusModule) pendingCommittedEntries() (entries []LogEntry) {
 	}
 	cm.lastApplied = cm.commitIndex
 	return entries
+}
+
+// FlushPersist принудительно выполняет персистенцию всего состояния сейчас.
+// Используется только в тестах для синхронного ожидания персистенции.
+func (cm *ConsensusModule) FlushPersist() {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	if cm.logDirty {
+		cm.persistAllState()
+		cm.logDirty = false
+	}
+}
+
+func (cm *ConsensusModule) infoLoggingLeader() {
+	const interval = 1 * time.Second
+
+	for {
+		cm.mu.Lock()
+		state := cm.state
+		cm.mu.Unlock()
+		if state == Leader {
+			cm.iLogf("leader")
+		}
+		time.Sleep(interval)
+	}
 }
