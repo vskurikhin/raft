@@ -65,7 +65,7 @@ func New(cfg Config, storage raft.Storage, readyChan <-chan any) *KVService {
 	// raft.Server обрабатывает RPC-вызовы протокола Raft в кластере.
 	// После вызова Serve сервер готов принимать RPC-соединения
 	// от остальных узлов.
-	rs := raft.New(cfg.Config, storage, readyChan, commitChan)
+	rs := raft.New(cfg.Config, storage, readyChan, raft.NewCommitChannelFSM(commitChan))
 	rs.Serve(cfg.RPCAddress)
 	kvs := &KVService{
 		id:                   cfg.ServerID,

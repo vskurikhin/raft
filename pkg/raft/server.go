@@ -26,12 +26,12 @@ type Server struct {
 
 	cm       *ConsensusModule
 	storage  Storage
+	fsm      FSM
 	rpcProxy *RPCProxy
 
 	rpcServer *rpc.Server
 	listener  net.Listener
 
-	commitChan    chan<- CommitEntry
 	peerAddresses map[int]net.Addr
 	peerClients   map[int]*rpc.Client
 
@@ -51,9 +51,8 @@ type Config struct {
 }
 
 // New создаёт новый сервер Raft с заданной конфигурацией cfg, хранилищем storage,
-// каналом уведомления ready (закрывается, когда кластер готов к работе) и
-// каналом фиксации commitChan, в который сервер отправляет зафиксированные записи журнала.
-func New(cfg Config, storage Storage, ready <-chan any, commitChan chan<- CommitEntry) *Server {
+// каналом уведомления ready и FSM для применения зафиксированных записей журнала.
+func New(cfg Config, storage Storage, ready <-chan any, fsm FSM) *Server {
 	s := new(Server)
 	s.serverID = cfg.ServerID
 	s.peerIds = cfg.PeerIds
@@ -67,25 +66,24 @@ func New(cfg Config, storage Storage, ready <-chan any, commitChan chan<- Commit
 	}
 	s.storage = storage
 	s.ready = ready
-	s.commitChan = commitChan
+	s.fsm = fsm
 	s.quit = make(chan any)
 	return s
 }
 
 // NewServer создаёт новый сервер Raft с указанными идентификатором serverID,
 // списком идентификаторов узлов-соседей peerIds, хранилищем storage, каналом
-// уведомления ready и каналом фиксации commitChan.
-// Является обёрткой над New для обратной совместимости.
-func NewServer(serverID int, peerIds []int, storage Storage, ready <-chan any, commitChan chan<- CommitEntry) *Server {
+// уведомления ready и FSM для применения зафиксированных записей журнала.
+func NewServer(serverID int, peerIds []int, storage Storage, ready <-chan any, fsm FSM) *Server {
 	return New(Config{
 		ServerID: serverID,
 		PeerIds:  peerIds,
-	}, storage, ready, commitChan)
+	}, storage, ready, fsm)
 }
 
 func (s *Server) Serve(address string) {
 	s.mu.Lock()
-	s.cm = NewConsensusModule(s.serverID, s.peerIds, s, s.storage, s.ready, s.commitChan)
+	s.cm = NewConsensusModule(s.serverID, s.peerIds, s, s.storage, s.fsm, s.ready)
 
 	// Создаём новый RPC-сервер и регистрируем RPCProxy,
 	// который перенаправляет все методы в n.cm (ConsensusModule)

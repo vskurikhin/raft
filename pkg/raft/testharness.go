@@ -69,7 +69,7 @@ func NewHarness(t *testing.T, n int) *Harness {
 
 		storage[i] = NewMapStorage()
 		commitChans[i] = make(chan CommitEntry)
-		ns[i] = NewServer(i, peerIds, storage[i], ready, commitChans[i])
+		ns[i] = NewServer(i, peerIds, storage[i], ready, NewCommitChannelFSM(commitChans[i]))
 		ns[i].Serve(":0")
 		alive[i] = true
 	}
@@ -182,7 +182,7 @@ func (h *Harness) RestartPeer(id int) {
 	}
 
 	ready := make(chan any)
-	h.cluster[id] = NewServer(id, peerIds, h.storage[id], ready, h.commitChans[id])
+	h.cluster[id] = NewServer(id, peerIds, h.storage[id], ready, NewCommitChannelFSM(h.commitChans[id]))
 	h.cluster[id].Serve(":0")
 	h.ReconnectPeer(id)
 	close(ready)
