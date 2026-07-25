@@ -121,7 +121,7 @@ func (kvs *KVService) ServeHTTP(address string) {
 		panic("ServeHTTP called with existing server")
 	}
 	mux := http.NewServeMux()
-	// mux.HandleFunc("GET /{key}", kvs.handleDirtyGet)
+	mux.HandleFunc("GET /{key}", kvs.handleDirtyGet)
 	mux.HandleFunc("POST /get/", kvs.handleGet)
 	mux.HandleFunc("POST /put/", kvs.handlePut)
 	mux.HandleFunc("POST /cas/", kvs.handleCAS)

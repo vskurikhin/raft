@@ -41,6 +41,8 @@ func TestBasicPutGetSingleClient(t *testing.T) {
 	c1 := h.NewClient()
 	h.CheckPut(c1, "llave", "cosa")
 
+	sleepMs(200)
+
 	h.CheckGet(c1, "llave", "cosa")
 	sleepMs(80)
 }

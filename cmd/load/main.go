@@ -47,55 +47,39 @@ func init() {
 }
 
 func main() {
-
 	client := kvclient.New([]string{
 		"192.168.22.221:8880",
 		"192.168.22.222:8880",
 		"192.168.22.223:8880",
 	})
-
 	ctx, cancel := signal.NotifyContext(
 		context.Background(),
 		os.Interrupt,
 		syscall.SIGTERM,
 	)
 	defer cancel()
-
 	interval := time.Second / RequestRate
-
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-
 	var wg sync.WaitGroup
 
 	for i := 0; i < Workers; i++ {
-
 		wg.Add(1)
-
 		go func(id int) {
-
 			defer wg.Done()
-
 			r := rand.New(rand.NewSource(time.Now().UnixNano() + int64(id)))
-
 			for {
-
 				select {
-
 				case <-ctx.Done():
 					return
-
 				case <-ticker.C:
 
 					run(client, r)
 				}
 			}
-
 		}(i)
 	}
-
 	go stats(ctx)
-
 	wg.Wait()
 }
 
@@ -111,9 +95,7 @@ func run(client *kvclient.KVClient, rnd *rand.Rand) {
 	defer cancel()
 
 	if rnd.Intn(100) < GetPercent {
-
-		_, _, err := client.Get(ctx, key)
-
+		_, _, err := client.DirtyGet(ctx, key)
 		if err != nil {
 			getFail.Add(1)
 			fmt.Printf("GET: %v\n", err)
@@ -121,16 +103,13 @@ func run(client *kvclient.KVClient, rnd *rand.Rand) {
 		} else {
 			getOK.Add(1)
 		}
-
 		reqCount.Add(1)
 
 		return
 	}
-
 	value := fmt.Sprintf("value-%d", time.Now().UnixNano())
 
 	_, _, err := client.Put(ctx, key, value)
-
 	if err != nil {
 		putFail.Add(1)
 		reqCount.Add(1)
@@ -139,21 +118,14 @@ func run(client *kvclient.KVClient, rnd *rand.Rand) {
 	}
 
 	putOK.Add(1)
-
 	if rnd.Intn(100) < VerifyPercent {
-
 		got, ok, err := client.Get(ctx, key)
-
 		if err != nil || !ok || got != value {
-
 			verifyBad.Add(1)
-
 		} else {
-
 			verifyOK.Add(1)
 		}
 	}
-
 	reqCount.Add(1)
 }
 

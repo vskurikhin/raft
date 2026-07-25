@@ -18,7 +18,7 @@ import (
 
 // DebugClient включает вывод отладочной информации.
 const (
-	DebugClient = 1
+	DebugClient = 0
 
 	CAS = "cas"
 	Get = "get"
@@ -166,9 +166,7 @@ FindLeader:
 
 func (c *KVClient) sendRequest(ctx context.Context, route string, reqData, respData any) error {
 	switch route {
-	case CAS:
-	case Get:
-	case Put:
+	case CAS, Get, Put:
 		path := fmt.Sprintf("http://%s/%s/", c.addrs[c.assumedLeader], route)
 		c.clientLogf("sending %#v to %v", reqData, path)
 		return sendJSONRequest(ctx, path, reqData, respData)
@@ -177,7 +175,6 @@ func (c *KVClient) sendRequest(ctx context.Context, route string, reqData, respD
 		c.clientLogf("sending %#v to %v", reqData, path)
 		return sendGetRequest(ctx, path, reqData, respData)
 	}
-	return nil
 }
 
 // clientLogf выводит отладочное сообщение, если DebugClient > 0.
@@ -244,10 +241,8 @@ func sendJSONRequest(ctx context.Context, path string, reqData, respData any) er
 
 	dec := json.NewDecoder(resp.Body)
 	if err := dec.Decode(respData); err != nil {
-		log.Printf("JSON-decoding response data: %v", respData)
-		return fmt.Errorf("FAIL JSON-decoding response data: %w", err)
+		return fmt.Errorf("JSON-decoding response data: %w", err)
 	}
-	log.Printf("JSON-decoding response data: %v", respData)
 	return nil
 }
 
