@@ -17,7 +17,13 @@ import (
 )
 
 // DebugClient включает вывод отладочной информации.
-const DebugClient = 1
+const (
+	DebugClient = 1
+
+	CAS = "cas"
+	Get = "get"
+	Put = "put"
+)
 
 type KVClient struct {
 	addrs []string
@@ -57,8 +63,21 @@ func (c *KVClient) Put(ctx context.Context, key, value string) (string, bool, er
 		Value: value,
 	}
 	var putResp api.PutResponse
-	err := c.send(ctx, "put", putReq, &putResp)
+
+	err := c.send(ctx, Put, putReq, &putResp)
 	return putResp.PrevValue, putResp.KeyFound, err
+}
+
+// DirtyGet получает значение по ключу напрямую из DataStore.
+// Возвращает ошибку либо (value, found, nil), где found показывает,
+// существует ли указанный ключ в хранилище.
+func (c *KVClient) DirtyGet(ctx context.Context, key string) (string, bool, error) {
+	getReq := api.GetRequest{
+		Key: key,
+	}
+	var getResp api.GetResponse
+	err := c.send(ctx, key, getReq, &getResp)
+	return getResp.Value, getResp.KeyFound, err
 }
 
 // Get получает значение по ключу.
@@ -69,7 +88,7 @@ func (c *KVClient) Get(ctx context.Context, key string) (string, bool, error) {
 		Key: key,
 	}
 	var getResp api.GetResponse
-	err := c.send(ctx, "get", getReq, &getResp)
+	err := c.send(ctx, Get, getReq, &getResp)
 	return getResp.Value, getResp.KeyFound, err
 }
 
@@ -85,7 +104,8 @@ func (c *KVClient) CAS(ctx context.Context, key, compare, value string) (string,
 		Value:        value,
 	}
 	var casResp api.CASResponse
-	err := c.send(ctx, "cas", casReq, &casResp)
+
+	err := c.send(ctx, CAS, casReq, &casResp)
 	return casResp.PrevValue, casResp.KeyFound, err
 }
 
@@ -103,10 +123,8 @@ FindLeader:
 		// контекст: если он будет отменён (по тайм-ауту, явной отмене и т.п.),
 		// выполнение немедленно прекращается.
 		retryCtx, retryCtxCancel := context.WithTimeout(ctx, 50*time.Millisecond)
-		path := fmt.Sprintf("http://%s/%s/", c.addrs[c.assumedLeader], route)
 
-		c.clientLogf("sending %#v to %v", req, path)
-		if err := sendJSONRequest(retryCtx, path, req, resp); err != nil {
+		if err := c.sendRequest(retryCtx, route, req, resp); err != nil {
 			// Поскольку контексты вложены друг в друга, порядок проверок имеет
 			// значение. Сначала необходимо проверить родительский контекст —
 			// если он завершён, нужно немедленно вернуть управление.
@@ -114,17 +132,14 @@ FindLeader:
 				c.clientLogf("parent context done; bailing out")
 				retryCtxCancel()
 				return err
-			} else if contextDeadlineExceeded(retryCtx) {
-				// Если родительский контекст ещё активен, а истёк только
-				// дочерний контекст повторной попытки, необходимо обратиться
-				// к следующему сервису.
-				c.clientLogf("timed out: will try next address")
-				c.assumedLeader = (c.assumedLeader + 1) % len(c.addrs)
-				retryCtxCancel()
-				continue FindLeader
 			}
+			// Если родительский контекст ещё активен, а истёк только
+			// дочерний контекст повторной попытки, необходимо обратиться
+			// к следующему сервису.
+			c.clientLogf("timed out: will try next address")
+			c.assumedLeader = (c.assumedLeader + 1) % len(c.addrs)
 			retryCtxCancel()
-			return err
+			continue FindLeader
 		}
 		c.clientLogf("received response %#v", resp)
 
@@ -143,9 +158,26 @@ FindLeader:
 			retryCtxCancel()
 			return fmt.Errorf("commit failed; please retry")
 		default:
+			log.Printf("unexpected response %#v\n", resp)
 			panic("unreachable")
 		}
 	}
+}
+
+func (c *KVClient) sendRequest(ctx context.Context, route string, reqData, respData any) error {
+	switch route {
+	case CAS:
+	case Get:
+	case Put:
+		path := fmt.Sprintf("http://%s/%s/", c.addrs[c.assumedLeader], route)
+		c.clientLogf("sending %#v to %v", reqData, path)
+		return sendJSONRequest(ctx, path, reqData, respData)
+	default:
+		path := fmt.Sprintf("http://%s/%s", c.addrs[c.assumedLeader], route)
+		c.clientLogf("sending %#v to %v", reqData, path)
+		return sendGetRequest(ctx, path, reqData, respData)
+	}
+	return nil
 }
 
 // clientLogf выводит отладочное сообщение, если DebugClient > 0.
@@ -155,6 +187,36 @@ func (c *KVClient) clientLogf(format string, args ...any) {
 		format = clientName + " " + format
 		log.Printf(format, args...)
 	}
+}
+
+func sendGetRequest(ctx context.Context, path string, reqData, respData any) error {
+	body := new(bytes.Buffer)
+	enc := json.NewEncoder(body)
+	if err := enc.Encode(reqData); err != nil {
+		return fmt.Errorf("JSON-encoding request data: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, path, body)
+	if err != nil {
+		return fmt.Errorf("creating HTTP request: %w", err)
+	}
+	req.Header.Add("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+	}()
+
+	dec := json.NewDecoder(resp.Body)
+	if err := dec.Decode(respData); err != nil {
+		return fmt.Errorf("JSON-decoding response data: %w", err)
+	}
+	return nil
 }
 
 func sendJSONRequest(ctx context.Context, path string, reqData, respData any) error {
@@ -182,8 +244,10 @@ func sendJSONRequest(ctx context.Context, path string, reqData, respData any) er
 
 	dec := json.NewDecoder(resp.Body)
 	if err := dec.Decode(respData); err != nil {
-		return fmt.Errorf("JSON-decoding response data: %w", err)
+		log.Printf("JSON-decoding response data: %v", respData)
+		return fmt.Errorf("FAIL JSON-decoding response data: %w", err)
 	}
+	log.Printf("JSON-decoding response data: %v", respData)
 	return nil
 }
 

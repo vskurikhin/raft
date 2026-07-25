@@ -121,6 +121,7 @@ func (kvs *KVService) ServeHTTP(address string) {
 		panic("ServeHTTP called with existing server")
 	}
 	mux := http.NewServeMux()
+	// mux.HandleFunc("GET /{key}", kvs.handleDirtyGet)
 	mux.HandleFunc("POST /get/", kvs.handleGet)
 	mux.HandleFunc("POST /put/", kvs.handlePut)
 	mux.HandleFunc("POST /cas/", kvs.handleCAS)
@@ -242,11 +243,46 @@ func (kvs *KVService) handleGet(w http.ResponseWriter, req *http.Request) {
 	}
 	kvs.traceKVLogf("HTTP GET %v", gr)
 
+	cmd := Command{
+		Kind: CommandGet,
+		Key:  gr.Key,
+		ID:   kvs.id,
+	}
+	logIndex := kvs.rs.Submit(cmd)
+	if logIndex < 0 {
+		kvs.sendHTTPResponse(w, api.GetResponse{RespStatus: api.StatusNotLeader})
+		return
+	}
+
+	sub := kvs.createCommitSubscription(logIndex)
+
+	select {
+	case commitCmd := <-sub:
+		if commitCmd.ID == kvs.id {
+			kvs.sendHTTPResponse(w, api.GetResponse{
+				RespStatus: api.StatusOK,
+				KeyFound:   commitCmd.ResultFound,
+				Value:      commitCmd.ResultValue,
+			})
+		} else {
+			kvs.sendHTTPResponse(w, api.GetResponse{RespStatus: api.StatusFailedCommit})
+		}
+	case <-req.Context().Done():
+		return
+	}
+}
+
+// handleDirtyGet получить запись напрямую из DataStore.
+func (kvs *KVService) handleDirtyGet(w http.ResponseWriter, req *http.Request) {
+	// Extract the "id" value from the path
+	key := req.PathValue("key")
+	kvs.traceKVLogf("HTTP GET %v", key)
+
 	select {
 	case <-req.Context().Done():
 		return
 	default:
-		value, ok := kvs.ds.Get(gr.Key)
+		value, ok := kvs.ds.Get(key)
 		kvs.sendHTTPResponse(w, api.GetResponse{
 			RespStatus: api.StatusOK,
 			KeyFound:   ok,
