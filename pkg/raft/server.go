@@ -166,23 +166,26 @@ func (s *Server) ConnectToPeer(peerID int, addr net.Addr) error {
 // по адресу addr с заданным таймаутом timeout. Если соединение уже существует,
 // метод завершается без ошибки. При недоступности узла возвращает ошибку.
 func (s *Server) ConnectToPeerWithTimeout(peerID int, addr net.Addr, timeout time.Duration) error {
+	fmtErrorf := func() error { return fmt.Errorf("peer %v already connected", peerID) }
+	s.mu.Lock()
+	if s.peerClients[peerID] != nil {
+		s.mu.Unlock()
+		s.cm.dLogf(fmtErrorf().Error())
+		return nil
+	}
+	s.mu.Unlock()
+	client, err := net.DialTimeout("tcp", addr.String(), timeout)
+	if err != nil {
+		return err
+	}
 	s.mu.Lock()
 	if s.peerClients[peerID] == nil {
+		rpcClient := rpc.NewClient(client)
+		s.peerClients[peerID] = rpcClient
+		s.peerAddresses[peerID] = addr
+	} else {
 		s.mu.Unlock()
-		client, err := net.DialTimeout("tcp", addr.String(), timeout)
-		if err != nil {
-			return err
-		}
-		s.mu.Lock()
-		if s.peerClients[peerID] == nil {
-			rpcClient := rpc.NewClient(client)
-			s.peerClients[peerID] = rpcClient
-			s.peerAddresses[peerID] = addr
-		} else {
-			_ = client.Close()
-		}
-		s.mu.Unlock()
-		return nil
+		return fmtErrorf()
 	}
 	s.mu.Unlock()
 	return nil
@@ -204,31 +207,42 @@ func (s *Server) DisconnectPeer(peerID int) error {
 // При отсутствии соединения или его разрыве автоматически выполняет
 // повторное подключение. В тестовом режиме (harness) повторное
 // подключение не выполняется.
-func (s *Server) Call(id int, serviceMethod string, args, reply any) error {
-	peer := s.PeerClient(id)
-
-	// Если этот метод вызывается после завершения работы (когда вызывается client.Close),
-	// он вернет ошибку.
-	if peer == nil {
-		err := s.reConnect(id)
-		if err != nil {
-			return err
-		}
-	}
-	err := s.rpcProxy.Call(s.PeerClient(id), serviceMethod, args, reply)
-	if err != nil {
-		if s.harness {
-			return err
-		}
-		s.ClosePeerClient(id)
-		err = s.reConnect(id)
-		if err != nil {
-			if !s.harness {
-				go s.tryReconnect(id)
+func (s *Server) Call(id int, serviceMethod string, args, reply any) (err error) {
+	fmtErrorf := func() error { return fmt.Errorf("call client %d after it's closed", id) }
+	const onlyTwo = 2
+	for i := 0; i < onlyTwo; i++ {
+		peer := s.PeerClient(id)
+		// Если этот метод вызывается после завершения работы (когда вызывается client.Close),
+		// он вернет ошибку.
+		if peer == nil {
+			if s.harness {
+				return fmtErrorf()
 			}
-			return err
+			s.mu.Lock()
+			addr := s.peerAddresses[id]
+			if addr == nil {
+				s.mu.Unlock()
+				return fmtErrorf()
+			}
+			client, err := net.DialTimeout("tcp", addr.String(), HeartbeatTimeoutMs/onlyTwo*time.Millisecond)
+			if err != nil {
+				s.mu.Unlock()
+				s.cm.dLogf("[%v] failed to connect to peer %v: %v", s.serverID, id, err)
+				continue
+			}
+			peer = rpc.NewClient(client)
+			s.peerClients[id] = peer
+			s.mu.Unlock()
+			s.cm.dLogf("reconnected to peer %v", id)
 		}
-		return s.rpcProxy.Call(s.PeerClient(id), serviceMethod, args, reply)
+		err = s.rpcProxy.Call(peer, serviceMethod, args, reply)
+		if err != nil {
+			continue
+		}
+		return nil
+	}
+	if err != nil && !s.harness {
+		s.ClosePeerClient(id)
 	}
 	return err
 }
@@ -264,25 +278,6 @@ func (s *Server) IsLeader() bool {
 // Используется только в тестах для моделирования отказов.
 func (s *Server) Proxy() *RPCProxy {
 	return s.rpcProxy
-}
-
-func (s *Server) tryReconnect(id int) {
-	s.mu.Lock()
-	s.peerClients[id] = nil
-	s.mu.Unlock()
-	_ = s.ConnectToPeerWithTimeout(id, s.peerAddresses[id], 2*ReelectionTimeoutMs*time.Millisecond)
-}
-
-func (s *Server) reConnect(id int) error {
-	fmtErrorf := func() error { return fmt.Errorf("call client %d after it's closed", id) }
-	if s.harness {
-		return fmtErrorf()
-	}
-	err := s.ConnectToPeerWithTimeout(id, s.peerAddresses[id], ReelectionTimeoutMs/2*time.Millisecond)
-	if err != nil {
-		return fmtErrorf()
-	}
-	return nil
 }
 
 // RPCProxy — прокси-сервер, прозрачно перенаправляющий RPC-вызовы
