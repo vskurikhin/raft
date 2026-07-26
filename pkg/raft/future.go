@@ -3,6 +3,7 @@ package raft
 
 import (
 	"errors"
+	"sync"
 	"time"
 )
 
@@ -34,26 +35,24 @@ type ApplyFuture interface {
 type deferError struct {
 	err        error
 	errCh      chan error
+	once       sync.Once
 	responded  bool
 	shutdownCh chan struct{}
 }
 
-func (d *deferError) init() {
+func (d *deferError) init(shutdownCh chan struct{}) {
 	d.errCh = make(chan error, 1)
+	d.shutdownCh = shutdownCh
 }
 
 func (d *deferError) Error() error {
-	if d.err != nil {
-		return d.err
-	}
-	if d.errCh == nil {
-		panic("waiting for response on nil channel")
-	}
-	select {
-	case d.err = <-d.errCh:
-	case <-d.shutdownCh:
-		d.err = ErrRaftShutdown
-	}
+	d.once.Do(func() {
+		select {
+		case d.err = <-d.errCh:
+		case <-d.shutdownCh:
+			d.err = ErrRaftShutdown
+		}
+	})
 	return d.err
 }
 

@@ -462,6 +462,12 @@ func (cm *ConsensusModule) startElection() {
 	cm.persistToStorage()
 	cm.dLogf("becomes Candidate (currentTerm=%d); log=%v", savedCurrentTerm, cm.log)
 
+	// Одиночный узел: побеждает на выборах немедленно.
+	if len(cm.peerIds) == 0 {
+		cm.startLeader()
+		return
+	}
+
 	var votesReceived atomic.Int32
 	votesReceived.Store(1)
 
@@ -549,6 +555,19 @@ func (cm *ConsensusModule) startLeader() {
 		"becomes Leader; term=%d, nextIndex=%v, matchIndex=%v; log=%v",
 		cm.currentTerm, cm.nextIndex, cm.matchIndex, cm.log,
 	)
+
+	// Noop entry при утверждении лидерства (§5.4.2).
+	// Лидер должен закоммитить noop запись своего терма, чтобы
+	// зафиксировать любые незакоммиченные записи из предыдущих термов.
+	noop := &logFuture{
+		log: LogEntry{
+			Type: LogNoop,
+		},
+	}
+	noop.init(cm.shutdownCh)
+	cm.dispatchLogsUnsafe([]*logFuture{noop})
+
+	go cm.runLeaderLoop()
 
 	// Эта горутина выполняется в фоновом режиме и отправляет сообщения
 	// AppendEntries соседям:
@@ -754,8 +773,7 @@ func (cm *ConsensusModule) Apply(command any, timeout time.Duration) ApplyFuture
 			Command: command,
 		},
 	}
-	future.shutdownCh = cm.shutdownCh
-	future.init()
+	future.init(cm.shutdownCh)
 
 	cm.mu.Lock()
 	if cm.state != Leader {
@@ -853,6 +871,9 @@ func (cm *ConsensusModule) processLogs(commitIndex int) {
 				break
 			}
 		}
+		if idx >= len(cm.log) {
+			continue
+		}
 		log := &cm.log[idx]
 		batch = append(batch, &commitTuple{log: log, future: future})
 	}
@@ -871,8 +892,35 @@ func (cm *ConsensusModule) processLogs(commitIndex int) {
 // после коммита в processLogs, либо при потере лидерства в runLeaderLoop.
 func (cm *ConsensusModule) dispatchLogs(applyLogs []*logFuture) {
 	cm.mu.Lock()
-	defer cm.mu.Unlock()
+	cm.dispatchLogsUnsafe(applyLogs)
 
+	// Попытка сразу продвинуть commitIndex (необходимо для одиночного узла
+	// и ускоряет коммит в многопоточном кластере после dispatchLogs).
+	savedCommitIndex := cm.commitIndex
+	for i := cm.commitIndex + 1; i < len(cm.log); i++ {
+		if cm.log[i].Term == cm.currentTerm {
+			matchCount := 1
+			for _, peerID := range cm.peerIds {
+				if cm.matchIndex[peerID] >= i {
+					matchCount++
+				}
+			}
+			if matchCount*2 > len(cm.peerIds)+1 {
+				cm.commitIndex = i
+			}
+		}
+	}
+	cm.mu.Unlock()
+
+	if cm.commitIndex != savedCommitIndex {
+		cm.dLogf("leader sets commitIndex := %d", cm.commitIndex)
+		cm.processLogs(cm.commitIndex)
+	}
+}
+
+// dispatchLogsUnsafe — внутренняя версия dispatchLogs без захвата блокировки.
+// Вызывающий должен удерживать cm.mu.
+func (cm *ConsensusModule) dispatchLogsUnsafe(applyLogs []*logFuture) {
 	term := cm.currentTerm
 	lastIndex := len(cm.log) - 1
 	now := time.Now()
@@ -916,6 +964,9 @@ func (cm *ConsensusModule) runLeaderLoop() {
 		cm.mu.Unlock()
 	}()
 
+	checkLeaderTicker := time.NewTicker(TickerTimeoutMs * time.Millisecond)
+	defer checkLeaderTicker.Stop()
+
 	for {
 		select {
 		case future := <-cm.applyCh:
@@ -938,6 +989,14 @@ func (cm *ConsensusModule) runLeaderLoop() {
 				}
 			}
 			cm.dispatchLogs(ready)
+
+		case <-checkLeaderTicker.C:
+			cm.mu.Lock()
+			if cm.state != Leader {
+				cm.mu.Unlock()
+				return
+			}
+			cm.mu.Unlock()
 
 		case <-cm.shutdownCh:
 			return

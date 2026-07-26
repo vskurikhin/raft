@@ -117,10 +117,12 @@ func (s *Server) Serve(address string) {
 	})
 }
 
-// Submit вызывает метод Submit базового экземпляра CM; описание см.
-// в документации к этому методу.
-func (s *Server) Submit(cmd any) int {
-	return s.cm.Submit(cmd)
+// Apply отправляет команду в Raft-кластер и возвращает ApplyFuture.
+// future.Error() блокирует до коммита и возвращает ошибку или nil.
+// future.Response() возвращает ответ FSM.
+// future.Index() возвращает индекс записи в журнале.
+func (s *Server) Apply(cmd any, timeout time.Duration) ApplyFuture {
+	return s.cm.Apply(cmd, timeout)
 }
 
 // DisconnectAll закрывает все клиентские соединения с другими узлами для этого сервера.

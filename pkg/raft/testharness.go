@@ -7,6 +7,8 @@ import (
 	"time"
 )
 
+const submitTimeout = 5 * time.Second
+
 func init() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 }
@@ -343,9 +345,25 @@ func (h *Harness) CheckNotCommitted(cmd int) {
 	}
 }
 
-// SubmitToServer отправляет команду серверу с идентификатором serverId.
+// SubmitToServer отправляет команду серверу и дожидается коммита.
+// Возвращает индекс записи или -1 при ошибке (не лидер, потеря лидерства, shutdown).
 func (h *Harness) SubmitToServer(serverId int, cmd any) int {
-	return h.cluster[serverId].Submit(cmd)
+	future := h.cluster[serverId].Apply(cmd, 0)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- future.Error()
+	}()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			return -1
+		}
+		return future.Index()
+	case <-time.After(submitTimeout):
+		return -1
+	}
 }
 
 func tlog(format string, a ...any) {

@@ -17,6 +17,9 @@ func NewCommitChannelFSM(commitChan chan<- CommitEntry) *CommitChannelFSM {
 }
 
 func (f *CommitChannelFSM) Apply(log *LogEntry) any {
+	if log.Type == LogNoop {
+		return nil
+	}
 	f.commitChan <- CommitEntry{
 		Command: log.Command,
 		Index:   log.Index,
