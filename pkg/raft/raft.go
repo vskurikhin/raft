@@ -97,6 +97,17 @@ type commitTuple struct {
 	future *logFuture
 }
 
+// ErrConfigurationChangeNotSupported возвращается при попытке изменения
+// конфигурации кластера. Полная поддержка будет в Feature 2.
+var ErrConfigurationChangeNotSupported = fmt.Errorf("raft: configuration changes not supported yet")
+
+// configurationChangeFuture — placeholder для будущей реализации
+// изменения конфигурации кластера (Feature 2).
+type configurationChangeFuture struct {
+	deferError
+	peerID int
+}
+
 // ConsensusModule (CM) реализует единый узел консенсуса Raft.
 type ConsensusModule struct {
 	mu sync.Mutex
@@ -114,7 +125,10 @@ type ConsensusModule struct {
 	applyCh  chan *logFuture
 	inflight *list.List
 
-	triggerAEChan chan struct{}
+	commitCh          chan int
+	stepDown          chan struct{}
+	confChangeCh      chan *configurationChangeFuture
+	commitmentTracker *commitmentTracker
 
 	currentTerm int
 	votedFor    int
@@ -151,7 +165,9 @@ func NewConsensusModule(
 	cm.shutdownCh = make(chan struct{})
 	cm.applyCh = make(chan *logFuture)
 	cm.inflight = list.New()
-	cm.triggerAEChan = make(chan struct{}, 1)
+	cm.commitCh = make(chan int, 1)
+	cm.stepDown = make(chan struct{}, 1)
+	cm.confChangeCh = make(chan *configurationChangeFuture)
 	cm.state = Follower
 	cm.votedFor = -1
 	cm.commitIndex = -1
@@ -621,10 +637,19 @@ func (cm *ConsensusModule) startElection() {
 }
 
 // becomeFollower делает cm последователем и сбрасывает его состояние.
+// Если cm был лидером, отправляет сигнал в stepDown, чтобы leaderLoop
+// завершил работу и разрешил все ожидающие future с ErrLeadershipLost.
 // Ожидается, что cm.mu будет заблокирован.
 func (cm *ConsensusModule) becomeFollower(term int) {
+	wasLeader := cm.state == Leader
 	cm.dLogf("becomes Follower with term=%d; log=%v", term, cm.log)
 	cm.state = Follower
+	if wasLeader {
+		select {
+		case cm.stepDown <- struct{}{}:
+		default:
+		}
+	}
 	if term > cm.currentTerm {
 		cm.currentTerm = term
 		cm.votedFor = -1
@@ -641,7 +666,7 @@ func (cm *ConsensusModule) becomeFollower(term int) {
 	go cm.runElectionTimer()
 }
 
-// startLeader переводит cm в состояние лидера и начинает процесс пульсации.
+// startLeader переводит cm в состояние лидера и запускает единый leaderLoop.
 // Ожидается, что cm.mu будет заблокирован.
 func (cm *ConsensusModule) startLeader() {
 	cm.state = Leader
@@ -655,6 +680,11 @@ func (cm *ConsensusModule) startLeader() {
 		cm.currentTerm, cm.nextIndex, cm.matchIndex, cm.log,
 	)
 
+	cm.commitmentTracker = newCommitmentTracker(
+		cm.id, cm.peerIds, cm.commitCh, cm.currentTerm,
+	)
+	cm.commitmentTracker.setMatch(cm.id, len(cm.log)-1, cm.lookupTerm)
+
 	// Noop entry при утверждении лидерства (§5.4.2).
 	// Лидер должен закоммитить noop запись своего терма, чтобы
 	// зафиксировать любые незакоммиченные записи из предыдущих термов.
@@ -667,54 +697,6 @@ func (cm *ConsensusModule) startLeader() {
 	cm.dispatchLogsUnsafe([]*logFuture{noop})
 
 	go cm.runLeaderLoop()
-
-	// Эта горутина выполняется в фоновом режиме и отправляет сообщения
-	// AppendEntries соседям:
-	// * каждый раз, когда в triggerAEChan поступает уведомление;
-	// * либо каждые HeartbeatTimeoutMs мс, если в triggerAEChan не происходит событий.
-	go func(heartbeatTimeout time.Duration) {
-		// Немедленно отправить сообщения AppendEntries всем соседям.
-		cm.leaderSendAEs()
-
-		t := time.NewTimer(heartbeatTimeout)
-		defer t.Stop()
-		for {
-			doSend := false //nolint
-			select {
-			case <-t.C:
-				doSend = true
-
-				// Перезапустить таймер, чтобы он снова сработал через
-				// heartbeatTimeout.
-				t.Stop()
-				t.Reset(heartbeatTimeout)
-			case _, ok := <-cm.triggerAEChan:
-				if ok {
-					doSend = true
-				} else {
-					return
-				}
-
-				// Перезапустить таймер heartbeatTimeout.
-				if !t.Stop() {
-					<-t.C
-				}
-				t.Reset(heartbeatTimeout)
-			}
-
-			if doSend {
-				// Если этот узел больше не является лидером,
-				// остановить цикл отправки сообщений.
-				cm.mu.Lock()
-				if cm.state != Leader {
-					cm.mu.Unlock()
-					return
-				}
-				cm.mu.Unlock()
-				cm.leaderSendAEs()
-			}
-		}
-	}(HeartbeatTimeoutMs * time.Millisecond)
 }
 
 func (cm *ConsensusModule) nextIndexArgsEntries(peerID, savedCurrentTerm int) (int, AppendEntriesArgs, []LogEntry) {
@@ -746,22 +728,19 @@ func (cm *ConsensusModule) nextIndexArgsEntries(peerID, savedCurrentTerm int) (i
 	}, entries
 }
 
-// leaderSendAEsToPeer отправляет очередной раунд сообщений AppendEntries соседу,
-// обрабатывает их ответы и обновляет состояние CM.
+// leaderSendAEsToPeer отправляет AppendEntries указанному peer-у,
+// обрабатывает ответ и обновляет состояние CM. При успешной репликации
+// использует commitmentTracker для вычисления нового commitIndex.
 //
-// peerID - сосед
-// savedCurrentTerm - терм.
+// Вызов происходит в отдельной goroutine для каждого peer-а.
+// peerID — идентификатор получателя, savedCurrentTerm — терм на момент
+// формирования запроса (для защиты от устаревших ответов).
 func (cm *ConsensusModule) leaderSendAEsToPeer(peerID, savedCurrentTerm int) {
 	ni, args, entries := cm.nextIndexArgsEntries(peerID, savedCurrentTerm)
 	cm.dLogf("sending AppendEntries to %v: ni=%d, args=%+v", peerID, ni, args)
 	reply, err := cm.transport.AppendEntries(ServerID(peerID), args)
 	if err == nil {
 		cm.mu.Lock()
-		// К сожалению, здесь нельзя просто использовать
-		// defer cm.mu.Unlock(), поскольку в одной из ветвей
-		// выполнения требуется отправка данных в каналы.
-		// Поэтому необходимо явно вызывать cm.mu.Unlock()
-		// во всех путях выхода, начиная с этого места.
 		if reply.Term > cm.currentTerm {
 			cm.dLogf("term out of date in heartbeat reply")
 			cm.becomeFollower(reply.Term)
@@ -779,37 +758,13 @@ func (cm *ConsensusModule) leaderSendAEsToPeer(peerID, savedCurrentTerm int) {
 				cm.nextIndex[peerID] = ni + len(entries)
 				cm.matchIndex[peerID] = cm.nextIndex[peerID] - 1
 
-				savedCommitIndex := cm.commitIndex
-				for i := cm.commitIndex + 1; i < len(cm.log); i++ {
-					if cm.log[i].Term == cm.currentTerm {
-						matchCount := 1
-						for _, peerID := range cm.peerIds {
-							if cm.matchIndex[peerID] >= i {
-								matchCount++
-							}
-						}
-						if matchCount*2 > len(cm.peerIds)+1 {
-							cm.commitIndex = i
-						}
-					}
-				}
+				cm.commitmentTracker.setMatch(peerID, cm.matchIndex[peerID], cm.lookupTerm)
 				cm.dLogf(
 					"AppendEntries reply from %d success: nextIndex := %v, matchIndex := %v; commitIndex := %d",
-					peerID, cm.nextIndex, cm.matchIndex, cm.commitIndex,
+					peerID, cm.nextIndex, cm.matchIndex, cm.commitmentTracker.getCommitIndex(),
 				)
-				if cm.commitIndex != savedCommitIndex {
-					cm.dLogf("leader sets commitIndex := %d", cm.commitIndex)
-					commitIdx := cm.commitIndex
-					cm.persistToStorage()
-					cm.mu.Unlock()
-					cm.processLogs(commitIdx)
-					select {
-					case cm.triggerAEChan <- struct{}{}:
-					default:
-					}
-				} else {
-					cm.mu.Unlock()
-				}
+				cm.persistToStorage()
+				cm.mu.Unlock()
 			} else {
 				if reply.ConflictTerm >= 0 {
 					lastIndexOfTerm := -1
@@ -850,6 +805,15 @@ func (cm *ConsensusModule) leaderSendAEs() {
 	for _, peerID := range cm.peerIds {
 		go cm.leaderSendAEsToPeer(peerID, savedCurrentTerm)
 	}
+}
+
+// lookupTerm возвращает терм записи журнала по индексу.
+// Используется commitmentTracker для проверки Raft safety.
+func (cm *ConsensusModule) lookupTerm(index int) int {
+	if index < 0 || index >= len(cm.log) {
+		return -1
+	}
+	return cm.log[index].Term
 }
 
 // lastLogIndexAndTerm возвращает индекс и терм последней записи журнала.
@@ -962,36 +926,31 @@ func (cm *ConsensusModule) processLogs(commitIndex int) {
 
 // dispatchLogs присваивает индексы и термы записям, добавляет их в журнал
 // лидера (cm.log), помещает future в очередь inflight и инициирует
-// репликацию через triggerAEChan.
+// репликацию через commitmentTracker.
 //
 // Вызывается только из runLeaderLoop после проверки, что сервер всё ещё
-// является лидером. Предполагается, что будущие ответы будут разрешены
-// после коммита в processLogs, либо при потере лидерства в runLeaderLoop.
+// является лидером. После возврата runLeaderLoop вызывает leaderSendAEs
+// для немедленной репликации.
+//
+// Предполагается, что будущие ответы будут разрешены после коммита
+// в processLogs, либо при потере лидерства в runLeaderLoop.
 func (cm *ConsensusModule) dispatchLogs(applyLogs []*logFuture) {
 	cm.mu.Lock()
 	cm.dispatchLogsUnsafe(applyLogs)
 
-	// Попытка сразу продвинуть commitIndex (необходимо для одиночного узла
-	// и ускоряет коммит в многопоточном кластере после dispatchLogs).
+	// Продвигаем commitIndex через commitmentTracker.
+	// Для single-node кластера это приводит к немедленному коммиту.
+	// Для multi-node кластера учитываются matchIndex всех peer-ов.
+	cm.commitmentTracker.commit(len(cm.log)-1, cm.lookupTerm)
 	savedCommitIndex := cm.commitIndex
-	for i := cm.commitIndex + 1; i < len(cm.log); i++ {
-		if cm.log[i].Term == cm.currentTerm {
-			matchCount := 1
-			for _, peerID := range cm.peerIds {
-				if cm.matchIndex[peerID] >= i {
-					matchCount++
-				}
-			}
-			if matchCount*2 > len(cm.peerIds)+1 {
-				cm.commitIndex = i
-			}
-		}
+	if newCommitIndex := cm.commitmentTracker.getCommitIndex(); newCommitIndex > cm.commitIndex {
+		cm.dLogf("leader sets commitIndex := %d", newCommitIndex)
+		cm.commitIndex = newCommitIndex
 	}
 	newCommitIndex := cm.commitIndex
 	cm.mu.Unlock()
 
-	if newCommitIndex != savedCommitIndex {
-		cm.dLogf("leader sets commitIndex := %d", newCommitIndex)
+	if newCommitIndex > savedCommitIndex {
 		cm.processLogs(newCommitIndex)
 	}
 }
@@ -1015,23 +974,21 @@ func (cm *ConsensusModule) dispatchLogsUnsafe(applyLogs []*logFuture) {
 	for _, f := range applyLogs {
 		cm.inflight.PushBack(f)
 	}
-
-	select {
-	case cm.triggerAEChan <- struct{}{}:
-	default:
-	}
 }
 
-// runLeaderLoop — центральный цикл лидера. Запускается при переходе в
-// состояние Leader и завершается при потере лидерства или остановке CM.
+// runLeaderLoop — единый центральный цикл лидера. Запускается при переходе
+// в состояние Leader и завершается при потере лидерства или остановке CM.
 //
-// Цикл получает future из applyCh, собирает их в пакеты (group commit)
-// и передаёт в dispatchLogs. После успешной репликации и коммита
-// processLogs разрешает соответствующие future.
+// Обрабатывает все события лидера в одном select:
+//   - applyCh: новые команды от клиентов (групповой commit, §5.1)
+//   - commitCh: уведомление от commitmentTracker об изменении commitIndex
+//   - stepDown: обнаружение более высокого term из RPC-ответа
+//   - confChangeCh: изменения конфигурации кластера (placeholder)
+//   - heartbeatTicker: регулярная отправка Heartbeat/AppendEntries
+//   - shutdownCh: остановка модуля
 //
-// При потере лидерства (выход из цикла) все ожидающие future из списка
-// inflight получают ошибку ErrLeadershipLost, после чего список
-// очищается.
+// После выхода из цикла все ожидающие future из списка inflight
+// получают ошибку ErrLeadershipLost, после чего список очищается.
 func (cm *ConsensusModule) runLeaderLoop() {
 	defer func() {
 		cm.mu.Lock()
@@ -1042,8 +999,8 @@ func (cm *ConsensusModule) runLeaderLoop() {
 		cm.mu.Unlock()
 	}()
 
-	checkLeaderTicker := time.NewTicker(TickerTimeoutMs * time.Millisecond)
-	defer checkLeaderTicker.Stop()
+	heartbeatTicker := time.NewTicker(HeartbeatTimeoutMs * time.Millisecond)
+	defer heartbeatTicker.Stop()
 
 	for {
 		select {
@@ -1067,14 +1024,35 @@ func (cm *ConsensusModule) runLeaderLoop() {
 				}
 			}
 			cm.dispatchLogs(ready)
+			// Немедленная репликация после записи в журнал.
+			cm.leaderSendAEs()
 
-		case <-checkLeaderTicker.C:
+			heartbeatTicker.Stop()
+			heartbeatTicker.Reset(HeartbeatTimeoutMs * time.Millisecond)
+
+		case newCommitIndex := <-cm.commitCh:
 			cm.mu.Lock()
-			if cm.state != Leader {
+			if newCommitIndex > cm.commitIndex {
+				cm.dLogf("leader sets commitIndex := %d", newCommitIndex)
+				cm.commitIndex = newCommitIndex
 				cm.mu.Unlock()
-				return
+				cm.processLogs(newCommitIndex)
+				cm.leaderSendAEs()
+			} else {
+				cm.mu.Unlock()
 			}
+
+		case <-cm.stepDown:
+			cm.mu.Lock()
+			cm.dLogf("leader stepping down")
 			cm.mu.Unlock()
+			return
+
+		case <-heartbeatTicker.C:
+			cm.leaderSendAEs()
+
+		case future := <-cm.confChangeCh:
+			future.respond(ErrConfigurationChangeNotSupported)
 
 		case <-cm.shutdownCh:
 			return

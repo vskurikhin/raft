@@ -42,6 +42,9 @@ type Harness struct {
 	// кластера и определяет, работает ли данный сервер в настоящий момент.
 	alive []bool
 
+	// shutdownOnce защищает Shutdown() от повторного вызова.
+	shutdownOnce sync.Once
+
 	n int
 	t *testing.T
 }
@@ -112,15 +115,18 @@ func NewHarness(t *testing.T, n int) *Harness {
 }
 
 // Shutdown останавливает все серверы в тестовом окружении.
+// Идемпотентен — повторные вызовы безопасны.
 func (h *Harness) Shutdown() {
-	for i := 0; i < h.n; i++ {
-		if h.alive[i] {
-			h.alive[i] = false
-			h.cluster[i].Stop()
-			h.transports[i].Close()
+	h.shutdownOnce.Do(func() {
+		for i := 0; i < h.n; i++ {
+			if h.alive[i] {
+				h.alive[i] = false
+				h.cluster[i].Stop()
+				h.transports[i].Close()
+			}
+			close(h.commitChans[i])
 		}
-		close(h.commitChans[i])
-	}
+	})
 }
 
 // DisconnectPeer отключает сервер от всех остальных серверов кластера
@@ -150,6 +156,7 @@ func (h *Harness) ReconnectPeer(id int) {
 
 // CrashPeer «аварийно завершает работу» сервера, отключая его
 // и останавливая CM. Хранилище сохраняется.
+// TODO имеет гонку между collectCommits и очисткой h.commits[id].
 func (h *Harness) CrashPeer(id int) {
 	tlog("Crash %d", id)
 	h.DisconnectPeer(id)

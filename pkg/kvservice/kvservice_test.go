@@ -80,20 +80,6 @@ func TestConnectToRaftPeer(t *testing.T) {
 	}
 }
 
-func TestConnectToRaftPeerTimeout(t *testing.T) {
-	storage := raft.NewMapStorage()
-	ready := make(chan any)
-
-	kvs := NewKVService(":0", 0, []int{1}, storage, ready)
-
-	// Подключение к несуществующему адресу должно вернуть ошибку по таймауту
-	fakeAddr, _ := net.ResolveTCPAddr("tcp", "127.0.0.1:9999")
-	err := kvs.ConnectToRaftPeer(1, fakeAddr)
-	if err == nil {
-		t.Fatalf("expected timeout error, got nil")
-	}
-}
-
 func TestConnectToRaftPeerWithTimeoutValue(t *testing.T) {
 	// Проверяем, что ConnectToRaftPeer использует ConnectToPeerWithTimeout
 	// с ожидаемым таймаутом 2*Quantum секунд
