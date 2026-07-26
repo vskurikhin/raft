@@ -16,17 +16,17 @@ import (
 )
 
 const (
-	DebugCM = 1
-	Quantum = 2
+	// ProtocolVersion — версия протокола Raft, используемая данной реализацией.
+	// Значение 3. Совместимость с версиями 0, 1 и 2 не поддерживается.
+	ProtocolVersion = 3
 
+	Quantum             = 2
 	HeartbeatTimeoutMs  = 50 * Quantum
 	ReelectionTimeoutMs = 150 * Quantum
 	TickerTimeoutMs     = 10 * Quantum
-)
 
-// ProtocolVersion — версия протокола Raft, используемая данной реализацией.
-// Значение 3. Совместимость с версиями 0, 1 и 2 не поддерживается.
-const ProtocolVersion = 3
+	DebugCM = 0
+)
 
 // CommitEntry — это данные, которые Raft отправляет в канал фиксации.
 // Каждая запись фиксации уведомляет клиента о том, что консенсус по команде
@@ -82,7 +82,7 @@ const (
 // собрать до 64 команд перед отправкой одного AppendEntries RPC,
 // что снижает количество RPC-вызовов без значительного увеличения
 // времени ожидания.
-const maxApplyBatchSize = 64
+var maxApplyBatchSize = 64
 
 type LogEntry struct {
 	Index   int
@@ -868,26 +868,19 @@ func (cm *ConsensusModule) Apply(command any, timeout time.Duration) ApplyFuture
 }
 
 // runFSM — отдельная горутина, применяющая закоммиченные записи к FSM.
-// Получает батчи через fsmMutateCh и вызывает fsm.Apply для каждой записи
-// типа LogCommand. После применения отвечает в соответствующий future,
-// если он существует. Завершает работу при закрытии shutdownCh.
+// Если FSM реализует BatchingFSM, использует ApplyBatch для группового
+// применения; иначе вызывает Apply для каждой записи по отдельности.
+// Type assertion выполняется один раз при старте горутины.
+// Завершает работу при закрытии shutdownCh.
 func (cm *ConsensusModule) runFSM() {
+	batchingFSM, supportsBatch := cm.fsm.(BatchingFSM)
 	for {
 		select {
 		case batch := <-cm.fsmMutateCh:
-			for _, ct := range batch {
-				if ct.log.Type != LogCommand {
-					if ct.future != nil {
-						ct.future.response = nil
-						ct.future.respond(nil)
-					}
-					continue
-				}
-				resp := cm.fsm.Apply(ct.log)
-				if ct.future != nil {
-					ct.future.response = resp
-					ct.future.respond(nil)
-				}
+			if supportsBatch {
+				cm.applyBatch(batchingFSM, batch)
+			} else {
+				cm.applySingle(batch)
 			}
 		case <-cm.shutdownCh:
 			return
@@ -895,19 +888,100 @@ func (cm *ConsensusModule) runFSM() {
 	}
 }
 
+// applySingle применяет каждую запись из батча по отдельности через
+// cm.fsm.Apply. Используется для FSM, не реализующих BatchingFSM.
+func (cm *ConsensusModule) applySingle(batch []*commitTuple) {
+	for _, ct := range batch {
+		if ct.log.Type != LogCommand {
+			if ct.future != nil {
+				ct.future.response = nil
+				ct.future.respond(nil)
+			}
+			continue
+		}
+		resp := cm.fsm.Apply(ct.log)
+		if ct.future != nil {
+			ct.future.response = resp
+			ct.future.respond(nil)
+		}
+	}
+}
+
+// applyBatch применяет все LogCommand записи из батча за один вызов
+// ApplyBatch переданного BatchingFSM. Non-command записи (noop)
+// разрешаются с nil-ответом без вызова FSM. Паникует при несовпадении
+// длины возвращаемого среза — это нарушение контракта BatchingFSM.
+func (cm *ConsensusModule) applyBatch(fsm BatchingFSM, batch []*commitTuple) {
+	var logs []*LogEntry
+	var futures []*logFuture
+	var nonCmdFutures []*logFuture
+	for _, ct := range batch {
+		if ct.log.Type != LogCommand {
+			if ct.future != nil {
+				nonCmdFutures = append(nonCmdFutures, ct.future)
+			}
+			continue
+		}
+		logs = append(logs, ct.log)
+		futures = append(futures, ct.future)
+	}
+	for _, f := range nonCmdFutures {
+		f.response = nil
+		f.respond(nil)
+	}
+	if len(logs) == 0 {
+		return
+	}
+	responses := fsm.ApplyBatch(logs)
+	if len(responses) != len(logs) {
+		panic(fmt.Sprintf(
+			"ApplyBatch returned %d responses, expected %d",
+			len(responses), len(logs),
+		))
+	}
+	for i, f := range futures {
+		if f != nil {
+			f.response = responses[i]
+			f.respond(nil)
+		}
+	}
+}
+
 // processLogs собирает закоммиченные записи от lastApplied+1 до commitIndex
-// и отправляет их в FSM goroutine. Метод не требует удержания cm.mu при вызове,
-// но сам захватывает её внутри для чтения журнала и поиска соответствующих
-// future в списке inflight. После формирования батча отпускает блокировку
-// и отправляет данные в fsmMutateCh.
+// и отправляет их в FSM goroutine. Диапазон делится на под-батчи размером
+// не более maxApplyBatchSize, чтобы FSM goroutine не блокировалась на
+// обработке тысяч записей (например, после восстановления лидера).
+// Метод не требует удержания cm.mu при вызове, но сам захватывает её
+// внутри для чтения журнала и поиска future в списке inflight.
 func (cm *ConsensusModule) processLogs(commitIndex int) {
 	cm.mu.Lock()
 	if commitIndex <= cm.lastApplied {
 		cm.mu.Unlock()
 		return
 	}
-	var batch []*commitTuple
-	for idx := cm.lastApplied + 1; idx <= commitIndex; idx++ {
+	lastApplied := cm.lastApplied
+	cm.lastApplied = commitIndex
+	cm.persistToStorage()
+	cm.mu.Unlock()
+
+	start := lastApplied + 1
+	for start <= commitIndex {
+		end := start + maxApplyBatchSize - 1
+		if end > commitIndex {
+			end = commitIndex
+		}
+		cm.sendBatch(start, end)
+		start = end + 1
+	}
+}
+
+// sendBatch собирает под-батч записей журнала от start до end включительно
+// и отправляет в fsmMutateCh. Поиск future в inflight выполняется под
+// блокировкой cm.mu, отправка — без блокировки.
+func (cm *ConsensusModule) sendBatch(start, end int) {
+	cm.mu.Lock()
+	batch := make([]*commitTuple, 0, end-start+1)
+	for idx := start; idx <= end; idx++ {
 		var future *logFuture
 		for e := cm.inflight.Front(); e != nil; e = e.Next() {
 			if lf := e.Value.(*logFuture); lf.log.Index == idx {
@@ -922,10 +996,10 @@ func (cm *ConsensusModule) processLogs(commitIndex int) {
 		log := &cm.log[idx]
 		batch = append(batch, &commitTuple{log: log, future: future})
 	}
-	cm.lastApplied = commitIndex
-	cm.persistToStorage()
 	cm.mu.Unlock()
-	cm.fsmMutateCh <- batch
+	if len(batch) > 0 {
+		cm.fsmMutateCh <- batch
+	}
 }
 
 // dispatchLogs присваивает индексы и термы записям, добавляет их в журнал

@@ -591,7 +591,7 @@ func TestReplaceMultipleLogEntries(t *testing.T) {
 	sleepMs(100)
 	finalLeaderId, _ := h.CheckSingleLeader()
 	h.ReconnectPeer(origLeaderId)
-	sleepMs(400 * Quantum)
+	sleepMs(ReelectionTimeoutMs * 1.1 * Quantum)
 
 	// Отправляем ещё одну запись. Это необходимо, потому что лидеры не
 	// фиксируют записи из предыдущих термов (раздел 5.4.2 статьи), поэтому
@@ -1509,4 +1509,207 @@ func TestStability_ConcurrentClients(t *testing.T) {
 	// Проверяем, что все 10 команд закоммичены
 	h.CheckCommittedN(0, 3)
 	h.CheckCommittedN(9, 3)
+}
+
+// --- Тесты Batching (Feature 8) ---
+
+// RecordingBatchingFSM записывает все вызовы ApplyBatch для проверки
+// в тестах. Реализует BatchingFSM: ApplyBatch сохраняет полученные
+// записи, Apply возвращает nil (не должен вызываться для LogCommand).
+type RecordingBatchingFSM struct {
+	mu      sync.Mutex
+	batches []batchRecord
+}
+
+type batchRecord struct {
+	logs []*LogEntry
+}
+
+func NewRecordingBatchingFSM() *RecordingBatchingFSM {
+	return &RecordingBatchingFSM{}
+}
+
+func (f *RecordingBatchingFSM) Apply(log *LogEntry) any {
+	return nil
+}
+
+func (f *RecordingBatchingFSM) ApplyBatch(logs []*LogEntry) []any {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	entry := batchRecord{logs: make([]*LogEntry, len(logs))}
+	copy(entry.logs, logs)
+	f.batches = append(f.batches, entry)
+	resp := make([]any, len(logs))
+	for i, l := range logs {
+		resp[i] = l.Index
+	}
+	return resp
+}
+
+func (f *RecordingBatchingFSM) NumBatches() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.batches)
+}
+
+func (f *RecordingBatchingFSM) TotalEntries() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, b := range f.batches {
+		n += len(b.logs)
+	}
+	return n
+}
+
+func (f *RecordingBatchingFSM) MaxBatchSize() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	max := 0
+	for _, b := range f.batches {
+		if len(b.logs) > max {
+			max = len(b.logs)
+		}
+	}
+	return max
+}
+
+// TestNonBatchingFSM_ProcessLogsSubBatching проверяет, что sub-batching
+// в processLogs не ломает обычный FSM. Отправляет maxApplyBatchSize*2+5
+// команд на одноузловой кластер — этого достаточно, чтобы processLogs
+// создал более одного под-батча при обработке закоммиченных записей.
+func TestNonBatchingFSM_ProcessLogsSubBatching(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 120*time.Second)()
+	h := NewHarness(t, 1)
+	defer h.Shutdown()
+
+	h.CheckSingleLeader()
+
+	n := maxApplyBatchSize*2 + 5
+	for i := 0; i < n; i++ {
+		if idx := h.SubmitToServer(0, i); idx < 0 {
+			t.Fatalf("SubmitToServer(%d) failed", i)
+		}
+	}
+
+	for i := 0; i < n; i++ {
+		h.CheckCommitted(i)
+	}
+}
+
+// TestNonBatchingFSM_UnchangedBehavior проверяет, что обычный FSM
+// (не реализующий BatchingFSM) продолжает работать как раньше после
+// внедрения sub-batching и type assertion в runFSM. Отправляет 10 команд
+// и проверяет, что все future получают корректные ответы.
+func TestNonBatchingFSM_UnchangedBehavior(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 120*time.Second)()
+	h := NewHarness(t, 3)
+	defer h.Shutdown()
+
+	lid, _ := h.CheckSingleLeader()
+
+	var futures []ApplyFuture
+	for i := 0; i < 10; i++ {
+		f := h.cluster[lid].Apply(i, 5*time.Second)
+		futures = append(futures, f)
+	}
+	sleepMs(100 * Quantum)
+
+	for i, f := range futures {
+		if err := f.Error(); err != nil {
+			t.Errorf("future %d error: %v", i, err)
+		}
+	}
+	h.CheckSingleLeader()
+}
+
+// TestBatchingFSM_Basic проверяет, что FSM, реализующий BatchingFSM,
+// получает записи через ApplyBatch, а Apply не вызывается для LogCommand.
+// Использует RecordingBatchingFSM на одноузловом кластере.
+func TestBatchingFSM_Basic(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 60*time.Second)()
+	fsm := NewRecordingBatchingFSM()
+	cm := testServerWithFSM(t, fsm)
+	defer cm.Stop()
+
+	waitForLeader(t, cm, 800*time.Millisecond)
+
+	for i := 0; i < 5; i++ {
+		future := cm.Apply(i, 0)
+		if err := future.Error(); err != nil {
+			t.Fatalf("Apply %d failed: %v", i, err)
+		}
+	}
+
+	if fsm.NumBatches() == 0 {
+		t.Fatal("ApplyBatch was never called")
+	}
+	if fsm.TotalEntries() != 5 {
+		t.Fatalf("TotalEntries = %d, want 5", fsm.TotalEntries())
+	}
+}
+
+// TestBatchingFSM_BatchBoundary проверяет, что при отправке большого
+// числа команд каждый вызов ApplyBatch получает не более maxApplyBatchSize
+// записей. Запускает RecordingBatchingFSM на одноузловом кластере
+// и отправляет maxApplyBatchSize*3 команд.
+func TestBatchingFSM_BatchBoundary(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 120*time.Second)()
+	fsm := NewRecordingBatchingFSM()
+	cm := testServerWithFSM(t, fsm)
+	defer cm.Stop()
+
+	waitForLeader(t, cm, 800*time.Millisecond)
+
+	n := maxApplyBatchSize * 3
+	for i := 0; i < n; i++ {
+		future := cm.Apply(i, 0)
+		if err := future.Error(); err != nil {
+			t.Fatalf("Apply %d failed: %v", i, err)
+		}
+	}
+
+	if fsm.TotalEntries() != n {
+		t.Fatalf("TotalEntries = %d, want %d", fsm.TotalEntries(), n)
+	}
+
+	maxBatch := fsm.MaxBatchSize()
+	if maxBatch > maxApplyBatchSize {
+		t.Fatalf("batch size %d exceeds maxApplyBatchSize %d", maxBatch, maxApplyBatchSize)
+	}
+}
+
+// TestBatchingFSM_ApplyBatchResponseMatching проверяет, что future'ы
+// получают правильные ответы при использовании BatchingFSM.
+// RecordingBatchingFSM возвращает индекс записи в качестве ответа;
+// проверяем, что future.Response() возвращает ожидаемый индекс.
+func TestBatchingFSM_ApplyBatchResponseMatching(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 60*time.Second)()
+	fsm := NewRecordingBatchingFSM()
+	cm := testServerWithFSM(t, fsm)
+	defer cm.Stop()
+
+	waitForLeader(t, cm, 800*time.Millisecond)
+
+	futures := make([]ApplyFuture, 3)
+	for i := range futures {
+		futures[i] = cm.Apply(i*100, 0)
+	}
+
+	for i, f := range futures {
+		if err := f.Error(); err != nil {
+			t.Fatalf("Apply %d failed: %v", i, err)
+		}
+		resp := f.Response()
+		if resp == nil {
+			t.Fatalf("future %d response is nil", i)
+		}
+		respIdx, ok := resp.(int)
+		if !ok {
+			t.Fatalf("future %d response type %T, want int", i, resp)
+		}
+		if respIdx != f.Index() {
+			t.Fatalf("future %d response = %d, want index %d", i, respIdx, f.Index())
+		}
+	}
 }

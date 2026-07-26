@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -15,7 +16,7 @@ import (
 	"github.com/vskurikhin/raft/pkg/raft"
 )
 
-const DebugKV = 1
+const DebugKV = 0
 
 type KVService struct {
 	mu sync.Mutex
@@ -95,6 +96,21 @@ func (kvs *KVService) Apply(log *raft.LogEntry) any {
 	}
 
 	return cmd
+}
+
+// ApplyBatch реализует интерфейс raft.BatchingFSM. Вызывается Raft'ом
+// для группового применения закоммиченных записей журнала. Каждая запись
+// применяется к DataStore через Apply, результат (Command с заполненными
+// полями ResultValue/ResultFound) возвращается в срезе ответов для
+// сопоставления с соответствующими future клиентов.
+func (kvs *KVService) ApplyBatch(logs []*raft.LogEntry) []any {
+	_, _ = fmt.Fprintf(os.Stderr, "applying %d logs\n", len(logs))
+	results := make([]any, 0, len(logs))
+	for _, l := range logs {
+		cmd := kvs.Apply(l)
+		results = append(results, cmd)
+	}
+	return results
 }
 
 // NewKVService создаёт новый экземпляр KVService.
