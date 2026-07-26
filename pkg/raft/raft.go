@@ -681,8 +681,12 @@ func (cm *ConsensusModule) startLeader() {
 	)
 
 	cm.commitmentTracker = newCommitmentTracker(
-		cm.id, cm.peerIds, cm.commitCh, cm.currentTerm,
+		cm.id, cm.commitCh, cm.currentTerm, len(cm.log)-1,
 	)
+	voters := make([]int, len(cm.peerIds)+1)
+	voters[0] = cm.id
+	copy(voters[1:], cm.peerIds)
+	cm.commitmentTracker.setConfiguration(voters, cm.lookupTerm)
 	cm.commitmentTracker.setMatch(cm.id, len(cm.log)-1, cm.lookupTerm)
 
 	// Noop entry при утверждении лидерства (§5.4.2).
