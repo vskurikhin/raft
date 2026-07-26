@@ -31,6 +31,12 @@ type ApplyFuture interface {
 	Response() any
 }
 
+// ConfigurationFuture — Future, возвращающая конфигурацию кластера.
+type ConfigurationFuture interface {
+	IndexFuture
+	Configuration() Configuration
+}
+
 // deferError — базовая реализация Future с каналом завершения.
 type deferError struct {
 	err        error
@@ -81,11 +87,26 @@ func (l *logFuture) Response() any {
 	return l.response
 }
 
+// configurationsFuture — future для GetConfiguration.
+type configurationsFuture struct {
+	deferError
+	config Configuration
+}
+
+func (f *configurationsFuture) Index() int {
+	return 0
+}
+
+func (f *configurationsFuture) Configuration() Configuration {
+	return f.config
+}
+
 // errorFuture — future с заранее известной ошибкой.
 type errorFuture struct {
 	err error
 }
 
-func (e errorFuture) Error() error  { return e.err }
-func (e errorFuture) Index() int    { return 0 }
-func (e errorFuture) Response() any { return nil }
+func (e errorFuture) Error() error                 { return e.err }
+func (e errorFuture) Index() int                   { return 0 }
+func (e errorFuture) Response() any                { return nil }
+func (e errorFuture) Configuration() Configuration { return Configuration{} }

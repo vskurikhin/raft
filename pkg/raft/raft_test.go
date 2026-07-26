@@ -914,6 +914,7 @@ func TestBecomeFollowerDoubleClose(t *testing.T) {
 		state:              Follower,
 		currentTerm:        1,
 		votedFor:           -1,
+		leaderStartIndex:   -1,
 		electionTimerDone:  make(chan struct{}),
 		electionResetEvent: time.Now(),
 		storage:            NewMapStorage(),
@@ -925,6 +926,7 @@ func TestBecomeFollowerDoubleClose(t *testing.T) {
 		commitCh:           make(chan int, 1),
 		stepDown:           make(chan struct{}, 1),
 		confChangeCh:       make(chan *configurationChangeFuture),
+		configurationsCh:   make(chan *configurationsFuture),
 	}
 	cm.log = make([]LogEntry, 0)
 	cm.mu.Lock()
@@ -1128,25 +1130,356 @@ func TestLeader_Heartbeat_StopsAfterStepDown(t *testing.T) {
 	h.CheckSingleLeader()
 }
 
-// TestLeader_ConfChange_NotSupported проверяет, что confChange возвращает ошибку.
-func TestLeader_ConfChange_NotSupported(t *testing.T) {
+// TestLeader_AddVoter_Basic проверяет добавление нового voter через API.
+func TestLeader_AddVoter_Basic(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 200*Quantum*time.Millisecond)()
+	h := NewHarness(t, 2)
+	defer h.Shutdown()
+
+	lid, _ := h.CheckSingleLeader()
+
+	// Добавить сервер 2 как voter через публичный API.
+	future := h.cluster[lid].AddVoter(ServerID(2), "raft-2")
+	if err := future.Error(); err != nil {
+		t.Fatalf("AddVoter failed: %v", err)
+	}
+	if idx := future.Index(); idx < 0 {
+		t.Fatalf("AddVoter returned invalid index %d", idx)
+	}
+
+	sleepMs(100 * Quantum)
+
+	// Проверить, что конфигурация содержит сервер 2.
+	cfgFuture := h.cluster[lid].GetConfiguration()
+	cfg := cfgFuture.Configuration()
+	found := false
+	for _, s := range cfg.ConfigServers {
+		if s.ID == ServerID(2) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("server 2 not found in configuration after AddVoter")
+	}
+}
+
+// TestConfiguration_RemoveServer проверяет удаление сервера из конфигурации.
+func TestConfiguration_RemoveServer(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 200*Quantum*time.Millisecond)()
+	h := NewHarness(t, 3)
+	defer h.Shutdown()
+
+	lid, _ := h.CheckSingleLeader()
+
+	// Удалить не-лидера (сервер 2).
+	future := h.cluster[lid].RemoveServer(ServerID(2))
+	if err := future.Error(); err != nil {
+		t.Fatalf("RemoveServer failed: %v", err)
+	}
+	if idx := future.Index(); idx < 0 {
+		t.Fatalf("RemoveServer returned invalid index %d", idx)
+	}
+
+	sleepMs(100 * Quantum)
+
+	// Проверить, что сервер 2 отсутствует в конфигурации.
+	cfg := h.cluster[lid].GetConfiguration().Configuration()
+	for _, s := range cfg.ConfigServers {
+		if s.ID == ServerID(2) {
+			t.Fatal("server 2 found in configuration after RemoveServer")
+		}
+	}
+}
+
+// TestConfiguration_GetConfigurationOnFollower проверяет, что follower
+// может прочитать конфигурацию.
+func TestConfiguration_GetConfigurationOnFollower(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 200*Quantum*time.Millisecond)()
+	h := NewHarness(t, 3)
+	defer h.Shutdown()
+
+	// Найти follower.
+	_, _ = h.CheckSingleLeader()
+	for i := 0; i < 3; i++ {
+		_, _, isLeader := h.cluster[i].Report()
+		if !isLeader {
+			cfg := h.cluster[i].GetConfiguration().Configuration()
+			if len(cfg.ConfigServers) < 3 {
+				t.Fatalf("follower %d has incomplete config: %+v", i, cfg)
+			}
+			return
+		}
+	}
+	t.Fatal("no follower found")
+}
+
+// TestConfiguration_RejectNotLeader проверяет, что запрос к не-лидеру
+// возвращает ошибку.
+func TestConfiguration_RejectNotLeader(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	h := NewHarness(t, 3)
+	defer h.Shutdown()
+
+	lid, _ := h.CheckSingleLeader()
+	follower := (lid + 1) % 3
+
+	future := h.cluster[follower].AddVoter(ServerID(10), "raft-10")
+	if err := future.Error(); err != ErrNotLeader {
+		t.Fatalf("got %v, want ErrNotLeader", err)
+	}
+}
+
+// TestConfiguration_RejectDemoteLastVoter проверяет, что последний voter
+// не может быть демотирован.
+func TestConfiguration_RejectDemoteLastVoter(t *testing.T) {
 	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
 	lid, _ := h.CheckSingleLeader()
 
-	// Прямой вызов confChangeCh
-	future := &configurationChangeFuture{}
-	future.init(h.cluster[lid].shutdownCh)
-	select {
-	case h.cluster[lid].confChangeCh <- future:
-	case <-time.After(time.Second):
-		t.Fatal("timeout sending confChange")
+	// Демотировать всех voter'ов, кроме лидера — не должно получиться,
+	// так как последний voter не может быть демотирован.
+	future := h.cluster[lid].DemoteVoter(ServerID(lid))
+	if err := future.Error(); err == nil {
+		t.Fatal("expected error when demoting last voter")
+	}
+}
+
+// TestConfiguration_RejectAddNonvoterEmptyAddress проверяет валидацию
+// пустого адреса при добавлении сервера.
+func TestConfiguration_RejectAddNonvoterEmptyAddress(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	h := NewHarness(t, 1)
+	defer h.Shutdown()
+
+	h.CheckSingleLeader()
+
+	future := h.cluster[0].AddNonvoter(ServerID(5), "")
+	if err := future.Error(); err == nil {
+		t.Fatal("expected error for empty address")
+	}
+}
+
+// TestConfiguration_SequentialChanges проверяет два последовательных
+// изменения конфигурации.
+func TestConfiguration_SequentialChanges(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 200*Quantum*time.Millisecond)()
+	h := NewHarness(t, 2)
+	defer h.Shutdown()
+
+	lid, _ := h.CheckSingleLeader()
+
+	// Первое изменение: добавить сервер 2 как voter.
+	f1 := h.cluster[lid].AddVoter(ServerID(2), "raft-2")
+	if err := f1.Error(); err != nil {
+		t.Fatalf("first AddVoter failed: %v", err)
+	}
+	sleepMs(50 * Quantum)
+
+	// Второе изменение: демотировать сервер 1 (себя) — должно работать.
+	// Но на кластере из 2 узлов (0 и 1) добавили 2 как voter.
+	// Теперь демотируем сервер 1 (если это лидер 1 — не себя).
+	otherID := (lid + 1) % 2
+	f2 := h.cluster[lid].DemoteVoter(ServerID(otherID))
+	if err := f2.Error(); err != nil {
+		t.Fatalf("DemoteVoter failed: %v", err)
 	}
 
-	if err := future.Error(); err != ErrConfigurationChangeNotSupported {
-		t.Fatalf("got %v, want ErrConfigurationChangeNotSupported", err)
+	sleepMs(50 * Quantum)
+
+	// Проверить, что конфигурация обновлена.
+	cfg := h.cluster[lid].GetConfiguration().Configuration()
+	nonvoterFound := false
+	for _, s := range cfg.ConfigServers {
+		if s.ID == ServerID(otherID) && s.Suffrage == Nonvoter {
+			nonvoterFound = true
+		}
+	}
+	if !nonvoterFound {
+		t.Fatal("server was not demoted to nonvoter")
+	}
+}
+
+// TestConfiguration_HasVote проверяет hasVote utility.
+func TestConfiguration_HasVote(t *testing.T) {
+	cfg := Configuration{
+		ConfigServers: []ConfigServer{
+			{ID: 1, Suffrage: Voter},
+			{ID: 2, Suffrage: Nonvoter},
+			{ID: 3, Suffrage: Voter},
+		},
+	}
+	if !hasVote(cfg, 1) {
+		t.Error("expected server 1 to have vote")
+	}
+	if hasVote(cfg, 2) {
+		t.Error("expected server 2 to not have vote")
+	}
+	if hasVote(cfg, 99) {
+		t.Error("expected server 99 to not have vote")
+	}
+}
+
+// TestConfiguration_VoterIDs проверяет voterIDs utility.
+func TestConfiguration_VoterIDs(t *testing.T) {
+	cfg := Configuration{
+		ConfigServers: []ConfigServer{
+			{ID: 1, Suffrage: Voter},
+			{ID: 2, Suffrage: Nonvoter},
+			{ID: 3, Suffrage: Voter},
+		},
+	}
+	ids := voterIDs(cfg)
+	if len(ids) != 2 || ids[0] != 1 || ids[1] != 3 {
+		t.Fatalf("got %v, want [1 3]", ids)
+	}
+}
+
+// TestConfiguration_NextAddVoter проверяет nextConfiguration с AddVoter.
+func TestConfiguration_NextAddVoter(t *testing.T) {
+	cfg := Configuration{
+		ConfigServers: []ConfigServer{
+			{ID: 1, Address: "addr1", Suffrage: Voter},
+		},
+	}
+
+	req := configurationChangeRequest{
+		command:       AddVoter,
+		serverID:      2,
+		serverAddress: "addr2",
+	}
+	next, err := nextConfiguration(cfg, 0, req)
+	if err != nil {
+		t.Fatalf("nextConfiguration failed: %v", err)
+	}
+	if len(next.ConfigServers) != 2 {
+		t.Fatalf("got %d servers, want 2", len(next.ConfigServers))
+	}
+	if !hasVote(next, 2) {
+		t.Error("server 2 should be a voter")
+	}
+}
+
+// TestConfiguration_NextRemoveServer проверяет nextConfiguration с RemoveServer.
+func TestConfiguration_NextRemoveServer(t *testing.T) {
+	cfg := Configuration{
+		ConfigServers: []ConfigServer{
+			{ID: 1, Address: "addr1", Suffrage: Voter},
+			{ID: 2, Address: "addr2", Suffrage: Voter},
+		},
+	}
+
+	req := configurationChangeRequest{
+		command:  RemoveServer,
+		serverID: 2,
+	}
+	next, err := nextConfiguration(cfg, 0, req)
+	if err != nil {
+		t.Fatalf("nextConfiguration failed: %v", err)
+	}
+	if len(next.ConfigServers) != 1 {
+		t.Fatalf("got %d servers, want 1", len(next.ConfigServers))
+	}
+}
+
+// TestConfiguration_NextRemoveLastVoter проверяет, что удаление последнего
+// voter'а запрещено.
+func TestConfiguration_NextRemoveLastVoter(t *testing.T) {
+	cfg := Configuration{
+		ConfigServers: []ConfigServer{
+			{ID: 1, Address: "addr1", Suffrage: Voter},
+		},
+	}
+
+	req := configurationChangeRequest{
+		command:  RemoveServer,
+		serverID: 1,
+	}
+	_, err := nextConfiguration(cfg, 0, req)
+	if err == nil {
+		t.Fatal("expected error when removing last voter")
+	}
+}
+
+// TestConfiguration_NextDemoteLastVoter проверяет, что демотирование
+// последнего voter'а запрещено.
+func TestConfiguration_NextDemoteLastVoter(t *testing.T) {
+	cfg := Configuration{
+		ConfigServers: []ConfigServer{
+			{ID: 1, Address: "addr1", Suffrage: Voter},
+		},
+	}
+
+	req := configurationChangeRequest{
+		command:  DemoteVoter,
+		serverID: 1,
+	}
+	_, err := nextConfiguration(cfg, 0, req)
+	if err == nil {
+		t.Fatal("expected error when demoting last voter")
+	}
+}
+
+// TestConfiguration_NextCheckDuplicateID проверяет, что дубликат ID
+// обнаруживается при проверке конфигурации.
+func TestConfiguration_NextCheckDuplicateID(t *testing.T) {
+	err := checkConfiguration(Configuration{
+		ConfigServers: []ConfigServer{
+			{ID: 1, Address: "addr1", Suffrage: Voter},
+			{ID: 1, Address: "addr2", Suffrage: Voter},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error for duplicate ID")
+	}
+}
+
+// TestConfiguration_CheckNoVoters проверяет, что конфигурация без voter'ов
+// отклоняется.
+func TestConfiguration_CheckNoVoters(t *testing.T) {
+	err := checkConfiguration(Configuration{
+		ConfigServers: []ConfigServer{
+			{ID: 1, Address: "addr1", Suffrage: Nonvoter},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error for no voters")
+	}
+}
+
+// TestConfiguration_CheckEmptyAddress проверяет, что пустой адрес
+// отклоняется.
+func TestConfiguration_CheckEmptyAddress(t *testing.T) {
+	err := checkConfiguration(Configuration{
+		ConfigServers: []ConfigServer{
+			{ID: 1, Address: "", Suffrage: Voter},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected error for empty address")
+	}
+}
+
+// TestConfiguration_EncodeDecode проверяет round-trip кодирования.
+func TestConfiguration_EncodeDecode(t *testing.T) {
+	cfg := Configuration{
+		ConfigServers: []ConfigServer{
+			{ID: 1, Address: "addr1", Suffrage: Voter},
+			{ID: 2, Address: "addr2", Suffrage: Nonvoter},
+		},
+	}
+	data, err := EncodeConfiguration(cfg)
+	if err != nil {
+		t.Fatalf("EncodeConfiguration failed: %v", err)
+	}
+	decoded, err := DecodeConfiguration(data)
+	if err != nil {
+		t.Fatalf("DecodeConfiguration failed: %v", err)
+	}
+	if len(decoded.ConfigServers) != 2 {
+		t.Fatalf("got %d servers, want 2", len(decoded.ConfigServers))
 	}
 }
 

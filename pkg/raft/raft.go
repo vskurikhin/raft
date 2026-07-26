@@ -25,7 +25,7 @@ const (
 	ReelectionTimeoutMs = 150 * Quantum
 	TickerTimeoutMs     = 10 * Quantum
 
-	DebugCM = 0
+	DebugCM = 1
 )
 
 // CommitEntry — это данные, которые Raft отправляет в канал фиксации.
@@ -97,15 +97,15 @@ type commitTuple struct {
 	future *logFuture
 }
 
-// ErrConfigurationChangeNotSupported возвращается при попытке изменения
-// конфигурации кластера. Полная поддержка будет в Feature 2.
-var ErrConfigurationChangeNotSupported = fmt.Errorf("raft: configuration changes not supported yet")
-
-// configurationChangeFuture — placeholder для будущей реализации
-// изменения конфигурации кластера (Feature 2).
+// configurationChangeFuture — future для изменения конфигурации кластера.
 type configurationChangeFuture struct {
 	deferError
-	peerID int
+	req   configurationChangeRequest
+	index int
+}
+
+func (f *configurationChangeFuture) Index() int {
+	return f.index
 }
 
 // ConsensusModule (CM) реализует единый узел консенсуса Raft.
@@ -128,6 +128,7 @@ type ConsensusModule struct {
 	commitCh          chan int
 	stepDown          chan struct{}
 	confChangeCh      chan *configurationChangeFuture
+	configurationsCh  chan *configurationsFuture
 	commitmentTracker *commitmentTracker
 
 	currentTerm int
@@ -136,12 +137,15 @@ type ConsensusModule struct {
 
 	commitIndex        int
 	lastApplied        int
+	leaderStartIndex   int
 	state              CMState
 	electionResetEvent time.Time
 	electionTimerDone  chan struct{}
 
 	nextIndex  map[int]int
 	matchIndex map[int]int
+
+	configurations configurations
 }
 
 // NewConsensusModule создаёт новый экземпляр CM.
@@ -167,17 +171,25 @@ func NewConsensusModule(
 	cm.inflight = list.New()
 	cm.commitCh = make(chan int, 1)
 	cm.stepDown = make(chan struct{}, 1)
-	cm.confChangeCh = make(chan *configurationChangeFuture)
+	cm.confChangeCh = make(chan *configurationChangeFuture, 1)
+	cm.configurationsCh = make(chan *configurationsFuture, 1)
 	cm.state = Follower
 	cm.votedFor = -1
 	cm.commitIndex = -1
 	cm.lastApplied = -1
+	cm.leaderStartIndex = -1
 	cm.nextIndex = make(map[int]int)
 	cm.matchIndex = make(map[int]int)
 	cm.electionTimerDone = make(chan struct{})
 
 	if cm.storage.HasData() {
 		cm.restoreFromStorage()
+	}
+
+	// Установить начальную конфигурацию, если она ещё не задана
+	// (первый запуск или хранилище не содержит данных).
+	if len(cm.configurations.latest.ConfigServers) == 0 {
+		cm.setInitialConfiguration()
 	}
 
 	go cm.runFSM()
@@ -268,6 +280,8 @@ func (cm *ConsensusModule) restoreFromStorage() {
 	} else {
 		log.Fatal("log not found in storage")
 	}
+
+	cm.rebuildConfigurations()
 }
 
 // dLogf выводит отладочное сообщение, если DebugCM > 0.
@@ -454,6 +468,15 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 				cm.dLogf("... inserting entries %v from index %d", args.Entries[newEntriesIndex:], logInsertIndex)
 				cm.log = append(cm.log[:logInsertIndex], args.Entries[newEntriesIndex:]...)
 				cm.dLogf("... log is now: %v", cm.log)
+				// Если перезапись затронула конфигурацию, откатываем latest.
+				cm.processLogConflict(logInsertIndex)
+			}
+
+			// Обработать LogConfiguration записи в полученном диапазоне.
+			for _, entry := range args.Entries[newEntriesIndex:] {
+				if entry.Type == LogConfiguration {
+					cm.processConfigurationLogEntry(&entry)
+				}
 			}
 
 			if args.LeaderCommit > cm.commitIndex {
@@ -573,8 +596,13 @@ func (cm *ConsensusModule) startElection() {
 	cm.persistToStorage()
 	cm.dLogf("becomes Candidate (currentTerm=%d); log=%v", savedCurrentTerm, cm.log)
 
+	// Определяем состав кластера из текущей конфигурации.
+	cfg := cm.configurations.latest
+	voters := voterIDs(cfg)
+	voterCount := len(voters)
+
 	// Одиночный узел: побеждает на выборах немедленно.
-	if len(cm.peerIds) == 0 {
+	if voterCount <= 1 {
 		cm.startLeader()
 		return
 	}
@@ -582,9 +610,13 @@ func (cm *ConsensusModule) startElection() {
 	var votesReceived atomic.Int32
 	votesReceived.Store(1)
 
-	// Параллельно отправить RPC-запросы RequestVote всем остальным серверам.
-	for _, peerID := range cm.peerIds {
-		go func() {
+	// Параллельно отправить RPC-запросы RequestVote всем серверам из конфигурации.
+	for _, s := range cfg.ConfigServers {
+		peerID := int(s.ID)
+		if peerID == cm.id {
+			continue
+		}
+		go func(peerID int) {
 			cm.mu.Lock()
 			savedLastLogIndex, savedLastLogTerm := cm.lastLogIndexAndTerm()
 			cm.mu.Unlock()
@@ -604,32 +636,35 @@ func (cm *ConsensusModule) startElection() {
 			reply, err := cm.transport.RequestVote(ServerID(peerID), args)
 			if err == nil {
 				cm.mu.Lock()
-				defer cm.mu.Unlock()
 				cm.dLogf("received RequestVoteReply %+v", reply)
 
 				if cm.state != Candidate {
 					cm.dLogf("while waiting for reply, state = %v", cm.state)
+					cm.mu.Unlock()
 					return
 				}
 
 				if reply.Term > cm.currentTerm {
 					cm.dLogf("term out of date in RequestVoteReply")
 					cm.becomeFollower(reply.Term)
+					cm.mu.Unlock()
 					return
 				} else if reply.Term == cm.currentTerm {
 					if reply.VoteGranted {
 						votesReceived.Add(1)
-						if int(votesReceived.Load())*2 > len(cm.peerIds)+1 {
+						if int(votesReceived.Load())*2 > voterCount {
 							// Выиграл выборы!
 							cm.dLogf("wins election with %d votes", votesReceived.Load())
 							cm.startLeader()
+							cm.mu.Unlock()
 							slog.Info("wins election", slog.Int("votes", int(votesReceived.Load())))
 							return
 						}
 					}
 				}
+				cm.mu.Unlock()
 			}
-		}()
+		}(peerID)
 	}
 
 	// Запустить новый таймер выборов на случай, если текущие выборы не завершатся успешно.
@@ -671,7 +706,12 @@ func (cm *ConsensusModule) becomeFollower(term int) {
 func (cm *ConsensusModule) startLeader() {
 	cm.state = Leader
 
-	for _, peerID := range cm.peerIds {
+	cfg := cm.configurations.latest
+	for _, s := range cfg.ConfigServers {
+		peerID := int(s.ID)
+		if peerID == cm.id {
+			continue
+		}
 		cm.nextIndex[peerID] = len(cm.log)
 		cm.matchIndex[peerID] = -1
 	}
@@ -680,13 +720,11 @@ func (cm *ConsensusModule) startLeader() {
 		cm.currentTerm, cm.nextIndex, cm.matchIndex, cm.log,
 	)
 
+	cm.leaderStartIndex = len(cm.log) - 1
 	cm.commitmentTracker = newCommitmentTracker(
 		cm.id, cm.commitCh, cm.currentTerm, len(cm.log)-1,
 	)
-	voters := make([]int, len(cm.peerIds)+1)
-	voters[0] = cm.id
-	copy(voters[1:], cm.peerIds)
-	cm.commitmentTracker.setConfiguration(voters, cm.lookupTerm)
+	cm.commitmentTracker.setConfiguration(voterIDs(cfg), cm.lookupTerm)
 	cm.commitmentTracker.setMatch(cm.id, len(cm.log)-1, cm.lookupTerm)
 
 	// Noop entry при утверждении лидерства (§5.4.2).
@@ -804,9 +842,21 @@ func (cm *ConsensusModule) leaderSendAEs() {
 		return
 	}
 	savedCurrentTerm := cm.currentTerm
+
+	peers := make(map[int]struct{})
+	for _, s := range cm.configurations.committed.ConfigServers {
+		if int(s.ID) != cm.id {
+			peers[int(s.ID)] = struct{}{}
+		}
+	}
+	for _, s := range cm.configurations.latest.ConfigServers {
+		if int(s.ID) != cm.id {
+			peers[int(s.ID)] = struct{}{}
+		}
+	}
 	cm.mu.Unlock()
 
-	for _, peerID := range cm.peerIds {
+	for peerID := range peers {
 		go cm.leaderSendAEsToPeer(peerID, savedCurrentTerm)
 	}
 }
@@ -1070,6 +1120,8 @@ func (cm *ConsensusModule) dispatchLogsUnsafe(applyLogs []*logFuture) {
 func (cm *ConsensusModule) runLeaderLoop() {
 	defer func() {
 		cm.mu.Lock()
+		inflightCount := cm.inflight.Len()
+		cm.dLogf("leaderLoop exit: responding to %d inflight futures", inflightCount)
 		for e := cm.inflight.Front(); e != nil; e = e.Next() {
 			e.Value.(*logFuture).respond(ErrLeadershipLost)
 		}
@@ -1113,6 +1165,21 @@ func (cm *ConsensusModule) runLeaderLoop() {
 			if newCommitIndex > cm.commitIndex {
 				cm.dLogf("leader sets commitIndex := %d", newCommitIndex)
 				cm.commitIndex = newCommitIndex
+
+				// Обновить committed конфигурацию, если latest был закоммичен.
+				if cm.configurations.latestIndex > cm.configurations.committedIndex &&
+					newCommitIndex >= cm.configurations.latestIndex {
+					cm.configurations.committed = cm.configurations.latest
+					cm.configurations.committedIndex = cm.configurations.latestIndex
+				}
+
+				// Проверить, остался ли лидер в committed конфигурации.
+				if !hasVote(cm.configurations.committed, cm.id) {
+					cm.dLogf("leader stepping down: not in committed configuration")
+					cm.mu.Unlock()
+					cm.becomeFollower(cm.currentTerm)
+					return
+				}
 				cm.mu.Unlock()
 				cm.processLogs(newCommitIndex)
 				cm.leaderSendAEs()
@@ -1129,12 +1196,295 @@ func (cm *ConsensusModule) runLeaderLoop() {
 		case <-heartbeatTicker.C:
 			cm.leaderSendAEs()
 
-		case future := <-cm.confChangeCh:
-			future.respond(ErrConfigurationChangeNotSupported)
+		case future := <-cm.configurationChangeChIfStable():
+			cm.appendConfigurationEntry(future)
 
 		case <-cm.shutdownCh:
 			return
 		}
+	}
+}
+
+// configurationChangeChIfStable возвращает канал confChangeCh только когда
+// конфигурация стабильна (latest == committed), noop лидера закоммичен
+// и сервер всё ещё является лидером.
+func (cm *ConsensusModule) configurationChangeChIfStable() chan *configurationChangeFuture {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	if cm.state != Leader {
+		return nil
+	}
+	if cm.configurations.latestIndex != cm.configurations.committedIndex {
+		return nil
+	}
+	if cm.commitIndex < cm.leaderStartIndex {
+		return nil
+	}
+	return cm.confChangeCh
+}
+
+// AddVoter добавляет новый сервер как voter или обновляет адрес существующего.
+func (cm *ConsensusModule) AddVoter(id ServerID, addr ServerAddress) IndexFuture {
+	future := &configurationChangeFuture{
+		req: configurationChangeRequest{
+			command:       AddVoter,
+			serverID:      id,
+			serverAddress: addr,
+		},
+	}
+	future.init(cm.shutdownCh)
+
+	if err := cm.enqueueConfigurationChange(future); err != nil {
+		return errorFuture{err}
+	}
+	return future
+}
+
+// AddNonvoter добавляет новый сервер как nonvoter или обновляет адрес существующего.
+func (cm *ConsensusModule) AddNonvoter(id ServerID, addr ServerAddress) IndexFuture {
+	future := &configurationChangeFuture{
+		req: configurationChangeRequest{
+			command:       AddNonvoter,
+			serverID:      id,
+			serverAddress: addr,
+		},
+	}
+	future.init(cm.shutdownCh)
+
+	if err := cm.enqueueConfigurationChange(future); err != nil {
+		return errorFuture{err}
+	}
+	return future
+}
+
+// DemoteVoter понижает voter до nonvoter.
+func (cm *ConsensusModule) DemoteVoter(id ServerID) IndexFuture {
+	future := &configurationChangeFuture{
+		req: configurationChangeRequest{
+			command:  DemoteVoter,
+			serverID: id,
+		},
+	}
+	future.init(cm.shutdownCh)
+
+	if err := cm.enqueueConfigurationChange(future); err != nil {
+		return errorFuture{err}
+	}
+	return future
+}
+
+// RemoveServer удаляет сервер из конфигурации кластера.
+func (cm *ConsensusModule) RemoveServer(id ServerID) IndexFuture {
+	future := &configurationChangeFuture{
+		req: configurationChangeRequest{
+			command:  RemoveServer,
+			serverID: id,
+		},
+	}
+	future.init(cm.shutdownCh)
+
+	if err := cm.enqueueConfigurationChange(future); err != nil {
+		return errorFuture{err}
+	}
+	return future
+}
+
+// GetConfiguration возвращает текущую конфигурацию кластера.
+// Для лидера возвращает latest конфигурацию; для follower — committed.
+func (cm *ConsensusModule) GetConfiguration() ConfigurationFuture {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	return &configurationsFuture{
+		config: cm.configurations.latest,
+	}
+}
+
+// enqueueConfigurationChange отправляет запрос на изменение конфигурации
+// в канал confChangeCh лидера. Возвращает ошибку, если сервер не лидер.
+func (cm *ConsensusModule) enqueueConfigurationChange(future *configurationChangeFuture) error {
+	cm.mu.Lock()
+	if cm.state != Leader {
+		cm.mu.Unlock()
+		return ErrNotLeader
+	}
+	cm.mu.Unlock()
+
+	select {
+	case cm.confChangeCh <- future:
+		return nil
+	case <-cm.shutdownCh:
+		return ErrRaftShutdown
+	}
+}
+
+// setInitialConfiguration создаёт начальную конфигурацию на основе peerIds.
+// Все серверы из peerIds становятся voter'ами.
+func (cm *ConsensusModule) setInitialConfiguration() {
+	servers := make([]ConfigServer, 0, len(cm.peerIds)+1)
+	servers = append(servers, ConfigServer{
+		ID:       ServerID(cm.id),
+		Address:  ServerAddress(fmt.Sprintf("%d", cm.id)),
+		Suffrage: Voter,
+	})
+	for _, peerID := range cm.peerIds {
+		servers = append(servers, ConfigServer{
+			ID:       ServerID(peerID),
+			Address:  ServerAddress(fmt.Sprintf("%d", peerID)),
+			Suffrage: Voter,
+		})
+	}
+	cfg := Configuration{ConfigServers: servers}
+	cm.configurations = configurations{
+		committed:      cfg,
+		committedIndex: 0,
+		latest:         cfg,
+		latestIndex:    0,
+	}
+}
+
+// appendConfigurationEntry записывает запись LogConfiguration в журнал лидера
+// и запускает репликацию. Вызывается из leaderLoop.
+func (cm *ConsensusModule) appendConfigurationEntry(future *configurationChangeFuture) {
+	cm.mu.Lock()
+	nextCfg, err := nextConfiguration(
+		cm.configurations.committed,
+		cm.configurations.committedIndex,
+		future.req,
+	)
+	if err != nil {
+		cm.mu.Unlock()
+		future.respond(err)
+		return
+	}
+
+	data, err := EncodeConfiguration(nextCfg)
+	if err != nil {
+		cm.mu.Unlock()
+		future.respond(err)
+		return
+	}
+
+	entry := &logFuture{
+		log: LogEntry{
+			Type:    LogConfiguration,
+			Command: data,
+		},
+	}
+	entry.init(cm.shutdownCh)
+
+	cm.configurations.latest = nextCfg
+	cm.configurations.latestIndex = len(cm.log)
+
+	cm.dispatchLogsUnsafe([]*logFuture{entry})
+	cm.configurations.latestIndex = entry.log.Index
+	future.index = entry.log.Index
+
+	cm.commitmentTracker.setConfiguration(voterIDs(nextCfg), cm.lookupTerm)
+
+	cm.commitmentTracker.commit(len(cm.log)-1, cm.lookupTerm)
+	savedCommitIndex := cm.commitIndex
+	if newCI := cm.commitmentTracker.getCommitIndex(); newCI > cm.commitIndex {
+		cm.dLogf("leader sets commitIndex := %d", newCI)
+		cm.commitIndex = newCI
+	}
+	cm.mu.Unlock()
+
+	if cm.commitIndex > savedCommitIndex {
+		cm.processLogs(cm.commitIndex)
+	}
+	cm.leaderSendAEs()
+
+	go func() {
+		err := entry.Error()
+		if err == nil {
+			cm.mu.Lock()
+			cm.startStopReplication(nextCfg)
+			cm.configurations.committed = nextCfg
+			cm.configurations.committedIndex = entry.log.Index
+			cm.mu.Unlock()
+		}
+		future.respond(err)
+	}()
+}
+
+// startStopReplication обновляет набор реплицируемых peer'ов в соответствии
+// с новой конфигурацией. Добавляет новые серверы в nextIndex/matchIndex
+// и удаляет отсутствующие.
+func (cm *ConsensusModule) startStopReplication(cfg Configuration) {
+	for peerID := range cm.nextIndex {
+		if peerID == cm.id {
+			continue
+		}
+		found := false
+		for _, s := range cfg.ConfigServers {
+			if int(s.ID) == peerID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			delete(cm.nextIndex, peerID)
+			delete(cm.matchIndex, peerID)
+		}
+	}
+	for _, s := range cfg.ConfigServers {
+		peerID := int(s.ID)
+		if peerID == cm.id {
+			continue
+		}
+		if _, ok := cm.nextIndex[peerID]; !ok {
+			cm.nextIndex[peerID] = len(cm.log)
+			cm.matchIndex[peerID] = -1
+		}
+	}
+}
+
+// rebuildConfigurations восстанавливает конфигурации из журнала после
+// загрузки из хранилища. Сканирует лог в поиске LogConfiguration записей.
+func (cm *ConsensusModule) rebuildConfigurations() {
+	cm.setInitialConfiguration()
+	for i, entry := range cm.log {
+		if entry.Type == LogConfiguration {
+			entryCmd, ok := entry.Command.([]byte)
+			if !ok {
+				continue
+			}
+			cfg, err := DecodeConfiguration(entryCmd)
+			if err != nil {
+				continue
+			}
+			cm.configurations.committed = cm.configurations.latest
+			cm.configurations.committedIndex = cm.configurations.latestIndex
+			cm.configurations.latest = cfg
+			cm.configurations.latestIndex = i
+		}
+	}
+}
+
+// processConfigurationLogEntry обрабатывает LogConfiguration запись
+// на follower при репликации.
+func (cm *ConsensusModule) processConfigurationLogEntry(entry *LogEntry) {
+	entryCmd, ok := entry.Command.([]byte)
+	if !ok {
+		return
+	}
+	cfg, err := DecodeConfiguration(entryCmd)
+	if err != nil {
+		return
+	}
+	cm.configurations.committed = cm.configurations.latest
+	cm.configurations.committedIndex = cm.configurations.latestIndex
+	cm.configurations.latest = cfg
+	cm.configurations.latestIndex = entry.Index
+}
+
+// processLogConflict вызывается при конфликте логов (перезаписи) в
+// AppendEntries. Если конфликт затрагивает latest конфигурацию,
+// откатываем её до committed.
+func (cm *ConsensusModule) processLogConflict(conflictIndex int) {
+	if conflictIndex <= cm.configurations.latestIndex && conflictIndex > 0 {
+		cm.configurations.latest = cm.configurations.committed
+		cm.configurations.latestIndex = cm.configurations.committedIndex
 	}
 }
 
