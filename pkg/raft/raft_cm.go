@@ -133,6 +133,13 @@ type ConsensusModule struct {
 	// последнего снэпшота для создания нового.
 	snapshotThreshold int
 
+	// termIndexMap — карта term → последний LogEntry.Index с этим term.
+	// O(1) lookup для ConflictTerm вместо O(n) slices.Backward(cm.log).
+	// Инкрементально обновляется в dispatchLogsUnsafe; перестраивается
+	// целиком при обрезке/компактировании/замене журнала.
+	// Требует удержания cm.mu (Lock) при чтении и записи.
+	termIndexMap map[int]int
+
 	// trailingLogs — количество записей журнала, сохраняемых после
 	// последнего снэпшота.
 	trailingLogs int
@@ -267,6 +274,7 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 				cm.log = append(cm.log[:logInsertPos], args.Entries[newEntriesIndex:]...)
 				cm.dLogf("... log is now: %v", cm.log)
 				cm.rebuildLastLog()
+				cm.rebuildTermIndexMap()
 				// Если перезапись затронула конфигурацию, откатываем latest.
 				cm.processLogConflict(logInsertIndex)
 			}
@@ -851,6 +859,9 @@ func (cm *ConsensusModule) compactLogs(compactIndex int) {
 	kept := make([]LogEntry, len(cm.log)-pos)
 	copy(kept, cm.log[pos:])
 	cm.log = kept
+	if pos > 0 {
+		cm.rebuildTermIndexMap()
+	}
 }
 
 // configurationChangeChIfStable возвращает канал confChangeCh только когда
@@ -913,6 +924,7 @@ func (cm *ConsensusModule) dispatchLogsUnsafe(applyLogs []*logFuture) {
 		lastIndex++
 		f.log.Index = lastIndex
 		f.log.Term = term
+		cm.termIndexMap[term] = lastIndex
 		cm.log = append(cm.log, f.log)
 	}
 	cm.setLastLog(lastIndex, term)
@@ -1067,6 +1079,7 @@ func (cm *ConsensusModule) handleInstallSnapshot(rpc RPC, req *InstallSnapshotRe
 		cm.log = nil
 	}
 	cm.rebuildLastLog()
+	cm.rebuildTermIndexMap()
 	cm.persistToStorage()
 	cm.mu.Unlock()
 
@@ -1298,6 +1311,20 @@ func (cm *ConsensusModule) rebuildLastLog() {
 	} else {
 		cm.lastLogIndex = -1
 		cm.lastLogTerm = -1
+	}
+}
+
+// rebuildTermIndexMap перестраивает карту term→lastIndex из текущего cm.log.
+// Вызывается после любого изменения журнала, которое не является простым
+// append в конец: обрезка (AppendEntries conflict), компактирование
+// (compactLogs), замена (installSnapshot), загрузка (restoreFromStorage).
+// Сложность O(n) по длине журнала. Вызывается редко — только при
+// несовпадении термов на follower или компактировании.
+// Требует удержания cm.mu (Lock).
+func (cm *ConsensusModule) rebuildTermIndexMap() {
+	cm.termIndexMap = make(map[int]int)
+	for _, entry := range cm.log {
+		cm.termIndexMap[entry.Term] = entry.Index
 	}
 }
 

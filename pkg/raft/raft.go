@@ -172,6 +172,7 @@ func NewConsensusModule(
 	cm.nextIndex = make(map[int]int)
 	cm.matchIndex = make(map[int]int)
 	cm.peerReplications = make(map[int]*peerReplication)
+	cm.termIndexMap = make(map[int]int)
 	cm.electionTimerDone = make(chan struct{})
 	cm.preVoteDisabled = false
 	cm.leaderLastContact = time.Time{}

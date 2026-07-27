@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"slices"
 	"time"
 )
 
@@ -129,15 +128,8 @@ func (cm *ConsensusModule) leaderSendAEsToPeer(peerID, savedCurrentTerm int) {
 				cm.mu.Unlock()
 			} else {
 				if reply.ConflictTerm >= 0 {
-					lastIndexOfTerm := -1
-					for i, v := range slices.Backward(cm.log) {
-						if v.Term == reply.ConflictTerm {
-							lastIndexOfTerm = i
-							break
-						}
-					}
-					if lastIndexOfTerm >= 0 {
-						cm.nextIndex[peerID] = lastIndexOfTerm + 1
+					if lastIndex, ok := cm.termIndexMap[reply.ConflictTerm]; ok {
+						cm.nextIndex[peerID] = lastIndex + 1
 					} else {
 						cm.nextIndex[peerID] = reply.ConflictIndex
 					}

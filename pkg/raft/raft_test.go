@@ -2782,3 +2782,298 @@ func TestRace_ConcurrentTriggerAllPeers(t *testing.T) {
 	// После конкурентных вызовов кластер должен быть жив.
 	h.CheckSingleLeader()
 }
+
+// TestIntegration_TermIndexConsistency проверяет, что termIndexMap
+// консистентен с cm.log после отправки команд и смены лидера.
+//
+// Сценарий:
+//  1. Создать кластер из 3 серверов, отправить 3 команды.
+//  2. Проверить termIndexMap на лидере.
+//  3. Сменить лидера (отключить, дождаться выборов среди оставшихся).
+//  4. Проверить termIndexMap на новом лидере.
+//
+// Ожидание: для каждой записи в cm.log termIndexMap содержит её терм.
+func TestIntegration_TermIndexConsistency(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 30*time.Second)()
+
+	h := NewHarness(t, 3)
+	defer h.Shutdown()
+
+	// Отправляем 3 команды, ждём коммита.
+	for i := 0; i < 3; i++ {
+		lid, _ := h.CheckSingleLeader()
+		h.SubmitToServer(lid, 100+i)
+	}
+	time.Sleep(Quantum * 150 * time.Millisecond)
+
+	// Проверяем termIndexMap на лидере.
+	lid, _ := h.CheckSingleLeader()
+	cm := h.cluster[lid]
+	cm.mu.Lock()
+	for _, entry := range cm.log {
+		if _, ok := cm.termIndexMap[entry.Term]; !ok {
+			cm.mu.Unlock()
+			t.Fatalf("leader %d: termIndexMap missing term %d", lid, entry.Term)
+		}
+	}
+	cm.mu.Unlock()
+
+	// Сменить лидера: отключаем текущего, дожидаемся выборов среди 2 оставшихся.
+	h.DisconnectPeer(lid)
+
+	newLid, _ := h.CheckSingleLeader()
+	if newLid == lid {
+		t.Fatal("leadership should have changed after disconnect")
+	}
+
+	// Проверить termIndexMap на новом лидере.
+	cm = h.cluster[newLid]
+	cm.mu.Lock()
+	for _, entry := range cm.log {
+		if _, ok := cm.termIndexMap[entry.Term]; !ok {
+			cm.mu.Unlock()
+			t.Fatalf("new leader %d: termIndexMap missing term %d", newLid, entry.Term)
+		}
+	}
+	cm.mu.Unlock()
+
+	h.ReconnectPeer(lid)
+}
+
+// TestIntegration_TermIndexAfterLogTruncation проверяет termIndexMap
+// после обрезки лога на follower из-за конфликта термов.
+//
+// Сценарий:
+//  1. Кластер из 3 серверов, отправить 3 команды.
+//  2. Отключить follower.
+//  3. Сменить лидера (отключить/подключить), отправить 3 команды.
+//  4. Подключить follower — репликация с конфликтом.
+//  5. Дождаться синхронизации лога, проверить termIndexMap.
+//
+// Ожидание: termIndexMap содержит все термы из обновлённого лога.
+func TestIntegration_TermIndexAfterLogTruncation(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 30*time.Second)()
+
+	h := NewHarness(t, 3)
+	defer h.Shutdown()
+
+	// Фаза 1: отправляем 3 команды.
+	for i := 0; i < 3; i++ {
+		lid, _ := h.CheckSingleLeader()
+		h.SubmitToServer(lid, 100+i)
+	}
+	time.Sleep(Quantum * 150 * time.Millisecond)
+
+	lid, _ := h.CheckSingleLeader()
+
+	// Выбираем и отключаем follower.
+	var victimID int
+	for id := range h.cluster {
+		if id != lid {
+			victimID = id
+			break
+		}
+	}
+	h.DisconnectPeer(victimID)
+	defer h.ReconnectPeer(victimID)
+
+	// Смена лидера и фаза 2: 3 команды в новом терме.
+	h.DisconnectPeer(lid)
+	time.Sleep(Quantum * 150 * time.Millisecond)
+	h.ReconnectPeer(lid)
+
+	for i := 0; i < 3; i++ {
+		newLid, _ := h.CheckSingleLeader()
+		h.SubmitToServer(newLid, 200+i)
+	}
+	time.Sleep(Quantum * 150 * time.Millisecond)
+
+	// Подключаем жертву — триггерим репликацию с конфликтом.
+	h.ReconnectPeer(victimID)
+
+	// Ждём, пока все серверы сойдутся на последнем индексе.
+	lid, _ = h.CheckSingleLeader()
+	leaderCM := h.cluster[lid]
+	leaderCM.mu.Lock()
+	targetIdx := leaderCM.lastLogIndex
+	leaderCM.mu.Unlock()
+
+	victimCM := h.cluster[victimID]
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		victimCM.mu.Lock()
+		lastIdx := victimCM.lastLogIndex
+		victimCM.mu.Unlock()
+
+		if lastIdx >= targetIdx {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out: victim %d lastIdx=%d, want >=%d",
+				victimID, lastIdx, targetIdx)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Проверяем termIndexMap на жертве.
+	victimCM.mu.Lock()
+	defer victimCM.mu.Unlock()
+
+	for _, entry := range victimCM.log {
+		if _, ok := victimCM.termIndexMap[entry.Term]; !ok {
+			t.Fatalf("follower %d: termIndexMap missing term %d (Index %d)",
+				victimID, entry.Term, entry.Index)
+		}
+	}
+}
+
+// TestRace_TermIndexMapDispatchAndConflict проверяет, что конкурентное
+// инкрементальное обновление termIndexMap (dispatchLogsUnsafe) и
+// чтение (leaderSendAEsToPeer с ConflictTerm) не вызывают data race.
+//
+// Сценарий:
+//  1. Создать CM-лидер.
+//  2. Запустить горутину dispatch, вызывающую dispatchLogsUnsafe.
+//  3. Запустить горутину conflict, вызывающую leaderSendAEsToPeer.
+//  4. Остановить через shutdownCh.
+//
+// Ожидание: -race не обнаруживает data race.
+func TestRace_TermIndexMapDispatchAndConflict(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 10*time.Second)()
+
+	storage := NewMapStorage()
+	mock := &mockTransportConflict{replyTerm: 1, success: false, conflictTerm: 1}
+	cm := &ConsensusModule{
+		id:           0,
+		storage:      storage,
+		state:        Leader,
+		currentTerm:  1,
+		transport:    mock,
+		log:          make([]LogEntry, 0),
+		nextIndex:    map[int]int{1: -1},
+		matchIndex:   map[int]int{1: -1, 0: -1},
+		lastLogIndex: -1,
+		lastLogTerm:  -1,
+		commitIndex:  -1,
+		inflight:     make(map[int]*logFuture),
+		termIndexMap: make(map[int]int),
+		shutdownCh:   make(chan struct{}),
+		configurations: configurations{
+			committed: Configuration{
+				ConfigServers: []ConfigServer{
+					{ID: 0, Suffrage: Voter},
+					{ID: 1, Suffrage: Voter},
+				},
+			},
+			latest: Configuration{
+				ConfigServers: []ConfigServer{
+					{ID: 0, Suffrage: Voter},
+					{ID: 1, Suffrage: Voter},
+				},
+			},
+		},
+	}
+	defer cm.Stop()
+
+	done := make(chan struct{})
+	// Горутина dispatch: пишет в termIndexMap.
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				f := &logFuture{
+					deferError: deferError{errCh: make(chan error, 1)},
+					log:        LogEntry{Type: LogCommand, Data: []byte("x")},
+				}
+				cm.mu.Lock()
+				cm.dispatchLogsUnsafe([]*logFuture{f})
+				cm.mu.Unlock()
+			}
+		}
+	}()
+
+	// Горутина conflict: читает termIndexMap (через leaderSendAEsToPeer).
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				cm.leaderSendAEsToPeer(1, 1)
+			}
+		}
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	close(done)
+}
+
+// TestRace_TermIndexMapCompactAndRead проверяет, что конкурентное
+// компактирование (compactLogs, перестраивает termIndexMap) и
+// чтение termIndexMap не вызывают data race.
+//
+// Сценарий:
+//  1. Создать CM с логом из 10 записей.
+//  2. Запустить горутину compact, вызывающую compactLogs.
+//  3. Запустить горутину reader, читающую termIndexMap.
+//  4. Остановить через shutdownCh.
+//
+// Ожидание: -race не обнаруживает data race.
+func TestRace_TermIndexMapCompactAndRead(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 10*time.Second)()
+
+	cm := &ConsensusModule{
+		storage:      NewMapStorage(),
+		state:        Follower,
+		currentTerm:  1,
+		log:          make([]LogEntry, 0),
+		nextIndex:    map[int]int{},
+		matchIndex:   map[int]int{},
+		lastLogIndex: 10,
+		lastLogTerm:  1,
+		commitIndex:  -1,
+		termIndexMap: make(map[int]int),
+		shutdownCh:   make(chan struct{}),
+	}
+	cm.mu.Lock()
+	for i := 0; i < 10; i++ {
+		cm.log = append(cm.log, LogEntry{Index: i + 1, Term: 1})
+	}
+	cm.rebuildTermIndexMap()
+	cm.mu.Unlock()
+	defer cm.Stop()
+
+	done := make(chan struct{})
+	// Горутина compact: перестраивает termIndexMap.
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				cm.mu.Lock()
+				cm.compactLogs(5)
+				cm.mu.Unlock()
+			}
+		}
+	}()
+
+	// Горутина reader: читает termIndexMap.
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				cm.mu.Lock()
+				_ = cm.termIndexMap[1]
+				cm.mu.Unlock()
+			}
+		}
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	close(done)
+}

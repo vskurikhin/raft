@@ -68,6 +68,7 @@ func (cm *ConsensusModule) restoreFromStorage() {
 		log.Fatal("log not found in storage")
 	}
 	cm.rebuildLastLog()
+	cm.rebuildTermIndexMap()
 
 	cm.rebuildConfigurations()
 
