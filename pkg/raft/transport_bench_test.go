@@ -45,11 +45,11 @@ func setupInmemBenchmark(b *testing.B) (*InmemTransport, func()) {
 func setupTCPBenchmark(b *testing.B) (*TCPTransport, func()) {
 	b.Helper()
 	timeout := time.Second
-	server, err := NewTCPTransport("127.0.0.1:0", timeout)
+	server, err := NewTCPTransport("127.0.0.1:0", timeout, 2)
 	if err != nil {
 		b.Fatalf("NewTCPTransport(server): %v", err)
 	}
-	client, err := NewTCPTransport("127.0.0.1:0", timeout)
+	client, err := NewTCPTransport("127.0.0.1:0", timeout, 2)
 	if err != nil {
 		server.Close()
 		b.Fatalf("NewTCPTransport(client): %v", err)

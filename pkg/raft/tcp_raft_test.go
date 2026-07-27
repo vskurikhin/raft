@@ -45,7 +45,7 @@ func newTCPHarness(t *testing.T, n int) *tcpHarness {
 
 	// Создаём транспорты (каждый на своём порту).
 	for i := 0; i < n; i++ {
-		trans, err := NewTCPTransport("127.0.0.1:0", 500*time.Millisecond)
+		trans, err := NewTCPTransport("127.0.0.1:0", 500*time.Millisecond, 2)
 		if err != nil {
 			t.Fatalf("NewTCPTransport(%d): %v", i, err)
 		}

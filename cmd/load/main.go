@@ -17,9 +17,9 @@ import (
 )
 
 const (
-	KeyCount       = 4000
-	Workers        = 1
-	RequestRate    = 200 // общий RPS
+	KeyCount       = 2000
+	Workers        = 5
+	RequestRate    = 10 // общий RPS
 	VerifyPercent  = 100
 	GetPercent     = 90
 	RequestTimeout = 10 * time.Second

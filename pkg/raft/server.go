@@ -16,6 +16,7 @@ type Server struct {
 
 	serverID int
 	peerIds  []int
+	maxPool  int
 
 	storage Storage
 	fsm     FSM
@@ -29,13 +30,15 @@ type Server struct {
 }
 
 // Config — конфигурация для создания нового сервера Raft.
-// Содержит идентификатор сервера, список идентификаторов узлов-соседей,
-// адрес для RPC и карту адресов узлов-соседей.
 type Config struct {
 	PeerAddresses map[int]net.Addr
 	PeerIds       []int
 	RPCAddress    string
 	ServerID      int
+
+	// MaxPool — максимальное количество соединений в пуле на один целевой
+	// адрес (0 = defaultMaxPool).
+	MaxPool int
 }
 
 // New создаёт новый сервер Raft с заданной конфигурацией cfg, хранилищем storage,
@@ -44,6 +47,7 @@ func New(cfg Config, storage Storage, ready <-chan any, fsm FSM) *Server {
 	s := &Server{
 		serverID: cfg.ServerID,
 		peerIds:  cfg.PeerIds,
+		maxPool:  cfg.MaxPool,
 		storage:  storage,
 		fsm:      fsm,
 		ready:    ready,
@@ -64,7 +68,7 @@ func NewServer(serverID int, peerIds []int, storage Storage, ready <-chan any, f
 
 // Serve запускает TCP-транспорт на указанном адресе и создаёт ConsensusModule.
 func (s *Server) Serve(address string) {
-	transport, err := NewTCPTransport(address, HeartbeatTimeoutMs*time.Millisecond/2)
+	transport, err := NewTCPTransport(address, HeartbeatTimeoutMs*time.Millisecond/2, s.maxPool)
 	if err != nil {
 		log.Fatalf("raft: failed to create TCPTransport: %v", err)
 	}

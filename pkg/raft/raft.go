@@ -28,7 +28,7 @@ const (
 	ReelectionTimeoutMs = 127 * Quantum
 	TickerTimeoutMs     = 11 * Quantum
 
-	DebugCM = 1
+	DebugCM = 0
 )
 
 // CommitEntry — это данные, которые Raft отправляет в канал фиксации.
@@ -100,7 +100,7 @@ const defaultSnapshotThreshold = 1024
 // defaultSnapshotInterval — интервал проверки необходимости снэпшота.
 // Каждые 15 секунд runSnapshots проверяет, не превышен ли порог
 // defaultSnapshotThreshold.
-const defaultSnapshotInterval = 5 * time.Second
+const defaultSnapshotInterval = 3 * time.Second
 
 // defaultTrailingLogs — количество записей журнала, сохраняемых
 // после самого свежего снэпшота. Нужно для поддержки репликации

@@ -22,11 +22,11 @@ func newInmemTransportPair(t *testing.T) (Transport, Transport, func()) {
 func newTCPTransportPair(t *testing.T) (Transport, Transport, func()) {
 	t.Helper()
 	timeout := time.Second
-	server, err := NewTCPTransport("127.0.0.1:0", timeout)
+	server, err := NewTCPTransport("127.0.0.1:0", timeout, 2)
 	if err != nil {
 		t.Fatalf("NewTCPTransport(server): %v", err)
 	}
-	client, err := NewTCPTransport("127.0.0.1:0", timeout)
+	client, err := NewTCPTransport("127.0.0.1:0", timeout, 2)
 	if err != nil {
 		server.Close()
 		t.Fatalf("NewTCPTransport(client): %v", err)
@@ -245,11 +245,11 @@ func TestTransportStubsReturnNotImplemented(t *testing.T) {
 			return t1, t2, func() { t1.Close(); t2.Close() }
 		}},
 		{"TCPTransport", func(t *testing.T) (Transport, Transport, func()) {
-			t1, err := NewTCPTransport("127.0.0.1:0", 100*time.Millisecond)
+			t1, err := NewTCPTransport("127.0.0.1:0", 100*time.Millisecond, 2)
 			if err != nil {
 				t.Fatalf("NewTCPTransport: %v", err)
 			}
-			t2, err := NewTCPTransport("127.0.0.1:0", 100*time.Millisecond)
+			t2, err := NewTCPTransport("127.0.0.1:0", 100*time.Millisecond, 2)
 			if err != nil {
 				t1.Close()
 				t.Fatalf("NewTCPTransport: %v", err)
@@ -329,7 +329,7 @@ func TestTransportLocalAddr(t *testing.T) {
 			return NewInmemTransport("test-addr")
 		}},
 		{"TCPTransport", func(t *testing.T) Transport {
-			trans, err := NewTCPTransport("127.0.0.1:0", 500*time.Millisecond)
+			trans, err := NewTCPTransport("127.0.0.1:0", 500*time.Millisecond, 2)
 			if err != nil {
 				t.Fatalf("NewTCPTransport: %v", err)
 			}

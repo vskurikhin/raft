@@ -17,7 +17,7 @@ import (
 )
 
 // DebugClient включает вывод отладочной информации.
-const DebugClient = 1
+const DebugClient = 0
 
 type KVClient struct {
 	addrs []string

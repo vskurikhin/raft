@@ -9,7 +9,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"os"
 	"sync"
 	"time"
 
@@ -138,7 +137,6 @@ func (s *kvSnapshot) Release() {}
 // полями ResultValue/ResultFound) возвращается в срезе ответов для
 // сопоставления с соответствующими future клиентов.
 func (kvs *KVService) ApplyBatch(logs []*raft.LogEntry) []any {
-	_, _ = fmt.Fprintf(os.Stderr, "applying %d logs\n", len(logs))
 	results := make([]any, 0, len(logs))
 	for _, l := range logs {
 		cmd := kvs.Apply(l)
