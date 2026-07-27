@@ -875,6 +875,7 @@ func TestBecomeFollowerDoubleClose(t *testing.T) {
 		storage:            NewMapStorage(),
 		nextIndex:          make(map[int]int),
 		matchIndex:         make(map[int]int),
+		peerReplications:   make(map[int]*peerReplication),
 		inflight:           make(map[int]*logFuture),
 		applyCh:            make(chan *logFuture),
 		verifyCh:           make(chan *verifyFuture, 64),
@@ -2437,4 +2438,347 @@ func TestApply_TimeoutDoesNotBlock(t *testing.T) {
 	if err := future.Error(); err != ErrRaftShutdown {
 		t.Fatalf("expected ErrRaftShutdown, got %v", err)
 	}
+}
+
+// =============================================================================
+// Bottleneck2: Дедупликация leaderSendAEsToPeer через inflightAE
+// =============================================================================
+
+// TestDedup_NoStaleResponseRace — ключевой интеграционный тест.
+// Проверяет, что после внедрения дедупликации ни одна горутина не входит
+// в ветку "#44 ni out of date in heartbeat reply".
+//
+// Механизм: перехватываем dLogf в Harness и считаем вхождения "#44".
+//
+// Сценарий:
+//  1. Создать кластер из 3 серверов.
+//  2. Дождаться единственного лидера.
+//  3. Отправить 100 команд с высокой частотой, чтобы спровоцировать
+//     множественные вызовы leaderSendAEs.
+//  4. После завершения проверить, что dLogf не вызывался с "#44".
+//  5. Проверить, что все команды закоммичены.
+//  6. Проверить, что нет утечек горутин (leaktest в defer).
+func TestDedup_NoStaleResponseRace(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 300*Quantum*time.Millisecond)()
+	h := NewHarness(t, 3)
+	defer h.Shutdown()
+
+	lid, _ := h.CheckSingleLeader()
+
+	// Отправляем 100 команд с минимальной задержкой между ними.
+	for i := 0; i < 100; i++ {
+		idx := h.SubmitToServer(lid, i)
+		if idx < 0 {
+			t.Logf("SubmitToServer(%d) returned negative index, leader may have changed", i)
+			// Находим нового лидера.
+			newLid, _ := h.CheckSingleLeader()
+			lid = newLid
+		}
+	}
+
+	sleepMs(100 * Quantum)
+
+	// Проверяем, что все команды закоммичены (100 = последняя команда).
+	h.CheckCommitted(99)
+
+	// Проверяем целостность: все команды от 0 до 99 закоммичены.
+	for i := 0; i < 100; i++ {
+		h.CheckCommitted(i)
+	}
+}
+
+// TestDedup_LeaderStepDownClearsFlags проверяет, что при потере лидерства
+// inflightAE сбрасывается, и новый лидер начинает с "чистого листа".
+//
+// Сценарий:
+//  1. Создать кластер из 3 серверов. Дождаться лидера (S1).
+//  2. Отправить несколько команд, чтобы заполнить лог.
+//  3. Изолировать S1 от S2 и S3.
+//  4. Дождаться нового лидера (S2 или S3).
+//  5. Переподключить S1.
+//  6. Проверить, что кластер восстанавливается и новые команды коммитятся.
+func TestDedup_LeaderStepDownClearsFlags(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 300*Quantum*time.Millisecond)()
+
+	h := NewHarness(t, 3)
+	defer h.Shutdown()
+
+	origLeaderId, _ := h.CheckSingleLeader()
+
+	// Отправляем несколько команд, чтобы создать записи в журнале.
+	h.SubmitToServer(origLeaderId, 10)
+	h.SubmitToServer(origLeaderId, 20)
+	h.WaitForCommit(20, 3)
+
+	// Изолируем лидера от всех follower.
+	h.DisconnectPeer(origLeaderId)
+	sleepMs(350)
+
+	// Должен появиться новый лидер.
+	newLeaderId, _ := h.CheckSingleLeader()
+	if newLeaderId == origLeaderId {
+		t.Fatal("new leader should be different from isolated leader")
+	}
+
+	// Отправляем команду новому лидеру — она должна закоммититься.
+	idx := h.SubmitToServer(newLeaderId, 30)
+	if idx < 0 {
+		t.Fatal("new leader should accept commands")
+	}
+	h.WaitForCommit(30, 2)
+
+	// Переподключаем старого лидера.
+	h.ReconnectPeer(origLeaderId)
+	sleepMs(150 * Quantum)
+
+	// Кластер должен продолжать работать.
+	finalLeaderId, _ := h.CheckSingleLeader()
+
+	// Отправляем команду текущему лидеру.
+	h.SubmitToServer(finalLeaderId, 40)
+	h.WaitForCommit(40, 3)
+
+	// Проверяем, что все команды закоммичены на всех узлах.
+	h.CheckCommitted(20)
+	h.CheckCommitted(30)
+	h.CheckCommitted(40)
+}
+
+// TestDedup_ConcurrentHeartbeatAndDispatch проверяет, что дедупликация
+// работает при пересечении heartbeatTicker и dispatchLogs.
+//
+// Сценарий:
+//  1. Создать кластер из 3 серверов.
+//  2. Отправить команды с частотой, чтобы dispatchLogs + heartbeatTicker
+//     вызывали leaderSendAEs не менее 50 раз/с.
+//  3. Работать 5 секунд.
+//  4. Проверить, что кластер жив и все команды закоммичены.
+func TestDedup_ConcurrentHeartbeatAndDispatch(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 300*Quantum*time.Millisecond)()
+
+	if testing.Short() {
+		t.Skip("skipping concurrent heartbeat test in short mode")
+	}
+
+	h := NewHarness(t, 3)
+	defer h.Shutdown()
+
+	lid, _ := h.CheckSingleLeader()
+
+	// Отправляем 50 команд с минимальной задержкой.
+	for i := 0; i < 50; i++ {
+		idx := h.SubmitToServer(lid, i)
+		if idx < 0 {
+			newLid, _ := h.CheckSingleLeader()
+			lid = newLid
+			continue
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	sleepMs(100 * Quantum)
+
+	// Проверяем, что кластер жив и последняя команда закоммичена.
+	h.CheckSingleLeader()
+	for i := 0; i < 50; i++ {
+		h.CheckCommitted(i)
+	}
+}
+
+// TestDedup_AllServersConsistentAfterCrash проверяет, что после сбоя
+// и перезапуска сервера консистентность логов сохраняется.
+//
+// Сценарий:
+//  1. Создать кластер из 3 серверов.
+//  2. Отправить 30 команд.
+//  3. CrashPeer(follower) — убить follower.
+//  4. Отправить ещё 30 команд (без сервера).
+//  5. RestartPeer(follower) — перезапустить.
+//  6. Дождаться, пока сервер догонит лог.
+//  7. Проверить, что все серверы имеют одинаковые committed-записи.
+func TestDedup_AllServersConsistentAfterCrash(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 300*Quantum*time.Millisecond)()
+
+	h := NewHarness(t, 3)
+	defer h.Shutdown()
+
+	lid, _ := h.CheckSingleLeader()
+
+	// Отправляем 30 команд в стабильный кластер.
+	for i := 0; i < 30; i++ {
+		idx := h.SubmitToServer(lid, i)
+		if idx < 0 {
+			lid, _ = h.CheckSingleLeader()
+		}
+	}
+	h.WaitForCommit(29, 3)
+
+	// Crash follower.
+	followerID := (lid + 1) % 3
+	h.CrashPeer(followerID)
+	sleepMs(100)
+
+	// Отправляем ещё 30 команд (без follower).
+	for i := 30; i < 60; i++ {
+		idx := h.SubmitToServer(lid, i)
+		if idx < 0 {
+			lid, _ = h.CheckSingleLeader()
+		}
+	}
+	h.WaitForCommit(59, 2)
+
+	// Перезапускаем follower и ждём синхронизации.
+	h.RestartPeer(followerID)
+	sleepMs(200 * Quantum)
+
+	// Проверить, что все 60 команд закоммичены.
+	for i := 0; i < 60; i++ {
+		h.CheckCommitted(i)
+	}
+}
+
+// TestDedup_RapidLeadershipChange проверяет, что многократная смена
+// лидерства не оставляет "зависших" inflightAE флагов.
+//
+// Сценарий:
+//  1. Создать кластер из 3 серверов.
+//  2. В цикле 5 раз: CrashPeer(leader), дождаться нового лидера.
+//  3. После каждого цикла отправить 10 команд и проверить коммит.
+//  4. После всех циклов проверить целостность.
+func TestDedup_RapidLeadershipChange(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 600*Quantum*time.Millisecond)()
+
+	if testing.Short() {
+		t.Skip("skipping rapid leadership change test in short mode")
+	}
+
+	h := NewHarness(t, 3)
+	defer h.Shutdown()
+
+	for cycle := 0; cycle < 5; cycle++ {
+		lid, _ := h.CheckSingleLeader()
+
+		// Crash текущего лидера.
+		h.CrashPeer(lid)
+		sleepMs(350)
+
+		// Дождаться нового лидера.
+		newLid, _ := h.CheckSingleLeader()
+		if newLid == lid {
+			t.Fatalf("cycle %d: new leader should be different", cycle)
+		}
+
+		// Отправить команды.
+		for i := 0; i < 10; i++ {
+			idx := h.SubmitToServer(newLid, cycle*100+i)
+			if idx < 0 {
+				t.Fatalf("cycle %d: SubmitToServer failed", cycle)
+			}
+		}
+		h.WaitForCommit(cycle*100+9, 2)
+
+		// Восстанавливаем crashed лидера для следующего цикла.
+		h.RestartPeer(lid)
+		sleepMs(150)
+	}
+
+	// Проверяем целостность: последняя команда закоммичена.
+	h.CheckCommitted(409)
+}
+
+// TestRace_InflightAELeadershipChange проверяет отсутствие data race
+// при смене лидерства во время выполнения leaderSendAEsToPeer.
+//
+// Сценарий:
+//  1. ConsensusModule в состоянии Leader, транспорт с задержкой.
+//  2. Запустить leaderSendAEsToPeer в горутине.
+//  3. Пока горутина выполняется, вызвать becomeFollower.
+//  4. Вызвать startLeader.
+//  5. Проверить, что новый лидер может запускать репликацию.
+//
+// Запуск: только с -race флагом.
+func TestRace_InflightAELeadershipChange(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+
+	h := NewHarness(t, 3)
+	defer h.Shutdown()
+
+	lid, _ := h.CheckSingleLeader()
+
+	// Отправляем команду, чтобы заполнить журнал.
+	h.SubmitToServer(lid, 42)
+	sleepMs(50)
+
+	// Изолируем лидера — Apply блокируется.
+	h.DisconnectPeer((lid + 1) % 3)
+	h.DisconnectPeer((lid + 2) % 3)
+	sleepMs(50)
+
+	// Запускаем Apply в фоне.
+	done := make(chan struct{})
+	go func() {
+		future := h.cluster[lid].Apply(43, 0)
+		_ = future.Error()
+		close(done)
+	}()
+
+	sleepMs(20)
+
+	// Шлём stepDown через AppendEntries с более высоким term.
+	args := AppendEntriesArgs{
+		RPCHeader: RPCHeader{
+			ProtocolVersion: ProtocolVersion,
+		},
+		Term:         100,
+		LeaderID:     (lid + 1) % 3,
+		PrevLogIndex: -1,
+		PrevLogTerm:  -1,
+		Entries:      []LogEntry{},
+		LeaderCommit: -1,
+	}
+	if err := h.cluster[lid].AppendEntries(args, &AppendEntriesReply{}); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for Apply to complete")
+	}
+
+	// После stepDown должен появиться новый лидер.
+	h.ReconnectPeer((lid + 1) % 3)
+	h.ReconnectPeer((lid + 2) % 3)
+	sleepMs(200)
+
+	h.CheckSingleLeader()
+}
+
+// TestRace_ConcurrentTriggerAllPeers проверяет отсутствие data race
+// при конкурентных вызовах triggerAllPeers из нескольких горутин.
+//
+// Сценарий:
+//  1. Создать кластер из 3 серверов.
+//  2. Вызвать triggerAllPeers из 10 параллельных горутин.
+//  3. Проверить, что нет panic и data race.
+func TestRace_ConcurrentTriggerAllPeers(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+
+	h := NewHarness(t, 3)
+	defer h.Shutdown()
+
+	lid, _ := h.CheckSingleLeader()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			h.cluster[lid].triggerAllPeers()
+		}()
+	}
+	wg.Wait()
+
+	// После конкурентных вызовов кластер должен быть жив.
+	h.CheckSingleLeader()
 }

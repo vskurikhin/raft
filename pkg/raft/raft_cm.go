@@ -66,6 +66,21 @@ type ConsensusModule struct {
 	nextIndex  map[int]int
 	matchIndex map[int]int
 
+	// peerReplications — карта долгоживущих контекстов репликации
+	// по идентификатору peer.
+	//
+	// Инициализируется в startLeader при старте лидерства. Каждый entry
+	// содержит per-peer горутину replicateLoop с триггер-каналом для
+	// коалесцирующей отправки AppendEntries.
+	//
+	// При потере лидерства (becomeFollower) или остановке leaderLoop
+	// все горутины останавливаются через stopCh, карта очищается.
+	//
+	// Инвариант:
+	//   peerReplications[peerID] != nil  — peer активен в конфигурации
+	//   peerReplications[peerID] == nil  — peer не в конфигурации
+	peerReplications map[int]*peerReplication
+
 	configurations configurations
 
 	// preVoteDisabled отключает механизм Pre-Vote.
@@ -706,7 +721,7 @@ func (cm *ConsensusModule) appendConfigurationEntry(future *configurationChangeF
 	if cm.commitIndex > savedCommitIndex {
 		cm.processLogs(cm.commitIndex)
 	}
-	cm.leaderSendAEs()
+	cm.triggerAllPeers()
 
 	go func() {
 		err := entry.Error()
@@ -787,6 +802,16 @@ func (cm *ConsensusModule) applySingle(batch []*commitTuple) {
 func (cm *ConsensusModule) becomeFollower(term int) {
 	wasLeader := cm.state == Leader
 	cm.dLogf("becomes Follower with term=%d; log=%v", term, cm.log)
+
+	// Остановить все per-peer горутины репликации.
+	// ВАЖНО: close(stopCh) без ожидания doneCh, так как ожидание
+	// под cm.mu приводит к дедлоку: replicateLoop может быть внутри
+	// leaderSendAEsToPeer, ожидающей cm.mu.
+	for peerID, pr := range cm.peerReplications {
+		close(pr.stopCh)
+		delete(cm.peerReplications, peerID)
+	}
+
 	cm.state = Follower
 	if wasLeader {
 		select {
@@ -1401,6 +1426,15 @@ func (cm *ConsensusModule) runLeaderLoop() {
 			future.respond(ErrLeadershipLost)
 		}
 		cm.inflight = make(map[int]*logFuture)
+
+		// Остановить все per-peer горутины репликации.
+		// ВАЖНО: close(stopCh) без ожидания doneCh — replicateLoop
+		// может быть заблокирован в leaderSendAEsToPeer (ожидание RPC
+		// или попытка захвата cm.mu), что приведёт к дедлоку.
+		for peerID, pr := range cm.peerReplications {
+			close(pr.stopCh)
+			delete(cm.peerReplications, peerID)
+		}
 		cm.mu.Unlock()
 	}()
 
@@ -1433,7 +1467,7 @@ func (cm *ConsensusModule) runLeaderLoop() {
 			}
 			cm.dispatchLogs(ready)
 			// Немедленная репликация после записи в журнал.
-			cm.leaderSendAEs()
+			cm.triggerAllPeers()
 
 			heartbeatTicker.Stop()
 			heartbeatTicker.Reset(HeartbeatTimeoutMs * time.Millisecond)
@@ -1461,7 +1495,7 @@ func (cm *ConsensusModule) runLeaderLoop() {
 				cm.mu.Unlock()
 				// Не вызываем processLogs здесь — накапливаем commitIndex
 				// до следующего тика applyTicker для объединения батчей.
-				cm.leaderSendAEs()
+				cm.triggerAllPeers()
 			} else {
 				cm.mu.Unlock()
 			}
@@ -1486,7 +1520,7 @@ func (cm *ConsensusModule) runLeaderLoop() {
 			return
 
 		case <-heartbeatTicker.C:
-			cm.leaderSendAEs()
+			cm.triggerAllPeers()
 
 		case future := <-cm.configurationChangeChIfStable():
 			cm.appendConfigurationEntry(future)
@@ -1506,7 +1540,7 @@ func (cm *ConsensusModule) runLeaderLoop() {
 			cm.pendingVerify = append(cm.pendingVerify, vf)
 			cm.mu.Unlock()
 			if len(cm.pendingVerify) == 1 {
-				cm.leaderSendAEs()
+				cm.triggerAllPeers()
 			}
 
 		case future := <-cm.leadershipTransferCh:
@@ -1939,6 +1973,16 @@ func (cm *ConsensusModule) startLeader() {
 		}
 		cm.nextIndex[peerID] = cm.lastLogIndex + 1
 		cm.matchIndex[peerID] = -1
+
+		// Создать per-peer горутину репликации.
+		pr := &peerReplication{
+			peerID:    peerID,
+			triggerCh: make(chan struct{}, 1),
+			stopCh:    make(chan struct{}),
+			doneCh:    make(chan struct{}),
+		}
+		cm.peerReplications[peerID] = pr
+		go cm.replicateLoop(pr)
 	}
 	cm.dLogf(
 		"becomes Leader; term=%d, nextIndex=%v, matchIndex=%v; log=%v",
@@ -1982,6 +2026,12 @@ func (cm *ConsensusModule) startStopReplication(cfg Configuration) {
 			}
 		}
 		if !found {
+			// Остановить горутину репликации для удалённого peer.
+			// ВАЖНО: close(stopCh) без ожидания doneCh — см. becomeFollower.
+			if pr, ok := cm.peerReplications[peerID]; ok {
+				close(pr.stopCh)
+				delete(cm.peerReplications, peerID)
+			}
 			delete(cm.nextIndex, peerID)
 			delete(cm.matchIndex, peerID)
 		}
@@ -1994,6 +2044,17 @@ func (cm *ConsensusModule) startStopReplication(cfg Configuration) {
 		if _, ok := cm.nextIndex[peerID]; !ok {
 			cm.nextIndex[peerID] = cm.lastLogIndex + 1
 			cm.matchIndex[peerID] = -1
+		}
+		if _, ok := cm.peerReplications[peerID]; !ok {
+			// Создать горутину репликации для нового peer.
+			pr := &peerReplication{
+				peerID:    peerID,
+				triggerCh: make(chan struct{}, 1),
+				stopCh:    make(chan struct{}),
+				doneCh:    make(chan struct{}),
+			}
+			cm.peerReplications[peerID] = pr
+			go cm.replicateLoop(pr)
 		}
 	}
 }

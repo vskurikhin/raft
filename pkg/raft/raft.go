@@ -10,7 +10,7 @@ const (
 	ProtocolVersion = 3
 
 	Quantum             = 2
-	HeartbeatTimeoutMs  = 17 * Quantum
+	HeartbeatTimeoutMs  = 23 * Quantum
 	ReelectionTimeoutMs = 127 * Quantum
 	TickerTimeoutMs     = 11 * Quantum
 
@@ -171,6 +171,7 @@ func NewConsensusModule(
 	cm.lastLogTerm = -1
 	cm.nextIndex = make(map[int]int)
 	cm.matchIndex = make(map[int]int)
+	cm.peerReplications = make(map[int]*peerReplication)
 	cm.electionTimerDone = make(chan struct{})
 	cm.preVoteDisabled = false
 	cm.leaderLastContact = time.Time{}

@@ -1,6 +1,43 @@
 package raft
 
-import "slices"
+import (
+	"slices"
+	"time"
+)
+
+// peerReplication — контекст долгоживущей горутины репликации
+// для одного удалённого peer.
+//
+// Создаётся при старте лидерства (startLeader) и при добавлении
+// нового сервера в конфигурацию (startStopReplication).
+// Живёт, пока peer в конфигурации и сервер является лидером.
+//
+// Триггер-канал (triggerCh) ёмкостью 1 обеспечивает coalescing:
+// множественные уведомления о новых записях схлопываются в один
+// сигнал. Это предотвращает burst репликаций при высокой частоте
+// dispatchLogs.
+//
+// Канал stopCh закрывается при потере лидерства или удалении peer.
+// Горутина завершает цикл и закрывает doneCh.
+//
+// Инвариант:
+//
+//	peerReplications[peerID] != nil  — peer активен
+//	peerReplications[peerID] == nil  — peer не в конфигурации
+type peerReplication struct {
+	peerID int
+
+	// triggerCh — сигнал о новых данных для репликации.
+	// Ёмкость 1: множественные уведомления coalescятся
+	// в один сигнал. Неблокирующая отправка (select + default).
+	triggerCh chan struct{}
+
+	// stopCh закрывается при выходе из лидерства или при удалении peer.
+	stopCh chan struct{}
+
+	// doneCh закрывается после завершения replicateLoop.
+	doneCh chan struct{}
+}
 
 func (cm *ConsensusModule) nextIndexArgsEntries(peerID, savedCurrentTerm int) (int, AppendEntriesArgs, []LogEntry) {
 	cm.mu.Lock()
@@ -32,13 +69,9 @@ func (cm *ConsensusModule) nextIndexArgsEntries(peerID, savedCurrentTerm int) (i
 	}, entries
 }
 
-// leaderSendAEsToPeer отправляет AppendEntries указанному peer-у,
-// обрабатывает ответ и обновляет состояние CM. При успешной репликации
-// использует commitmentTracker для вычисления нового commitIndex.
-//
-// Вызов происходит в отдельной goroutine для каждого peer-а.
-// peerID — идентификатор получателя, savedCurrentTerm — терм на момент
-// формирования запроса (для защиты от устаревших ответов).
+// leaderSendAEsToPeer отправляет AppendEntries указанному peer и
+// обрабатывает ответ. Вызывается из replicateLoop, выполняется
+// в контексте per-peer долгоживущей горутины.
 func (cm *ConsensusModule) leaderSendAEsToPeer(peerID, savedCurrentTerm int) {
 	cm.mu.Lock()
 	ni := cm.nextIndex[peerID]
@@ -120,31 +153,87 @@ func (cm *ConsensusModule) leaderSendAEsToPeer(peerID, savedCurrentTerm int) {
 	}
 }
 
-// leaderSendAEs отправляет очередной раунд сообщений AppendEntries всем
-// соседям, обрабатывает их ответы и обновляет состояние CM.
-func (cm *ConsensusModule) leaderSendAEs() {
+// triggerReplication уведомляет per-peer горутину репликации
+// о наличии новых записей для отправки.
+//
+// Неблокирующая: если канал triggerCh уже заполнен (горутина
+// ещё не обработала предыдущий сигнал), текущий вызов
+// coalescится — горутина получит все новые записи при
+// следующем чтении nextIndex.
+func (cm *ConsensusModule) triggerReplication(peerID int) {
+	cm.mu.Lock()
+	pr := cm.peerReplications[peerID]
+	cm.mu.Unlock()
+
+	if pr == nil {
+		return
+	}
+
+	select {
+	case pr.triggerCh <- struct{}{}:
+	default:
+	}
+}
+
+// triggerAllPeers уведомляет все per-peer горутины репликации
+// о необходимости отправки AppendEntries. Вызывается из
+// runLeaderLoop после dispatchLogs, commitCh, heartbeatTicker
+// и при pendingVerify.
+//
+// Каждая горутина получает не более одного уведомления
+// благодаря coalescing-каналу ёмкостью 1.
+func (cm *ConsensusModule) triggerAllPeers() {
 	cm.mu.Lock()
 	if cm.state != Leader {
 		cm.mu.Unlock()
 		return
 	}
-	savedCurrentTerm := cm.currentTerm
-
-	peers := make(map[int]struct{})
-	for _, s := range cm.configurations.committed.ConfigServers {
-		if int(s.ID) != cm.id {
-			peers[int(s.ID)] = struct{}{}
-		}
-	}
-	for _, s := range cm.configurations.latest.ConfigServers {
-		if int(s.ID) != cm.id {
-			peers[int(s.ID)] = struct{}{}
-		}
+	peerIDs := make([]int, 0, len(cm.peerReplications))
+	for peerID := range cm.peerReplications {
+		peerIDs = append(peerIDs, peerID)
 	}
 	cm.mu.Unlock()
 
-	for peerID := range peers {
-		go cm.leaderSendAEsToPeer(peerID, savedCurrentTerm)
+	for _, peerID := range peerIDs {
+		cm.triggerReplication(peerID)
+	}
+}
+
+// replicateLoop — долгоживущий цикл репликации для одного peer.
+//
+// Запускается в отдельной горутине. Ожидает сигнал на triggerCh
+// (новые записи в журнале) или heartbeatTicker (плановый heartbeat),
+// затем вызывает leaderSendAEsToPeer для синхронной отправки
+// AppendEntries.
+//
+// Выходит при закрытии stopCh или при обнаружении, что сервер
+// больше не лидер (cm.state != Leader). В обоих случаях закрывает
+// doneCh для синхронизации завершения.
+func (cm *ConsensusModule) replicateLoop(pr *peerReplication) {
+	defer close(pr.doneCh)
+
+	heartbeatTicker := time.NewTicker(HeartbeatTimeoutMs * time.Millisecond)
+	defer heartbeatTicker.Stop()
+
+	for {
+		select {
+		case <-pr.stopCh:
+			return
+
+		case <-pr.triggerCh:
+
+		case <-heartbeatTicker.C:
+		}
+
+		cm.mu.Lock()
+		if cm.state != Leader {
+			cm.mu.Unlock()
+			return
+		}
+		savedCurrentTerm := cm.currentTerm
+		cm.mu.Unlock()
+
+		cm.leaderSendAEsToPeer(pr.peerID, savedCurrentTerm)
 	}
 }
 
