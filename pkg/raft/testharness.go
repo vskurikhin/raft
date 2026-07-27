@@ -422,6 +422,35 @@ func (h *Harness) collectCommits(i int) {
 	}
 }
 
+// LeadershipTransfer инициирует передачу лидерства через публичный API.
+func (h *Harness) LeadershipTransfer(serverID int, targetID ServerID) LeadershipTransferFuture {
+	return h.cluster[serverID].LeadershipTransfer(targetID)
+}
+
+// SendTimeoutNow отправляет TimeoutNow напрямую через транспорт.
+// Используется в тестах для проверки реакции на TimeoutNow без участия
+// лидера (например, тест TimeoutNow на Follower).
+func (h *Harness) SendTimeoutNow(from, to int) (TimeoutNowResponse, error) {
+	return h.transports[from].TimeoutNow(
+		ServerID(to),
+		TimeoutNowRequest{
+			RPCHeader: RPCHeader{
+				ProtocolVersion: ProtocolVersion,
+				ServerID:        from,
+			},
+		},
+	)
+}
+
+// CheckLeaderIs проверяет, что лидером является указанный сервер.
+func (h *Harness) CheckLeaderIs(expectedID int) {
+	h.t.Helper()
+	leaderID, _ := h.CheckSingleLeader()
+	if leaderID != expectedID {
+		h.t.Fatalf("leader = %d, want %d", leaderID, expectedID)
+	}
+}
+
 // itoa — простейшее преобразование int в строку (без импорта strconv).
 func itoa(n int) string {
 	if n == 0 {

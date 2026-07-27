@@ -439,9 +439,9 @@ func TestInmemStubsReturnNotImplemented(t *testing.T) {
 	trans := NewInmemTransport("test")
 	defer trans.Close()
 	t.Run("TimeoutNow", func(t *testing.T) {
-		_, err := trans.TimeoutNow(1, TimeoutNowArgs{})
-		if err != ErrNotImplemented {
-			t.Fatalf("want ErrNotImplemented, got %v", err)
+		_, err := trans.TimeoutNow(1, TimeoutNowRequest{})
+		if err != ErrNotReachable {
+			t.Fatalf("want ErrNotReachable, got %v", err)
 		}
 	})
 	t.Run("InstallSnapshot", func(t *testing.T) {

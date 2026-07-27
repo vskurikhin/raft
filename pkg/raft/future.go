@@ -7,11 +7,12 @@ import (
 )
 
 var (
-	ErrNotLeader           = errors.New("raft: not leader")
-	ErrLeadershipLost      = errors.New("raft: leadership lost while committing")
-	ErrRaftShutdown        = errors.New("raft: raft is shutdown")
-	ErrEnqueueTimeout      = errors.New("raft: timeout enqueuing operation")
-	ErrUnsupportedProtocol = errors.New("raft: unsupported protocol version")
+	ErrNotLeader                    = errors.New("raft: not leader")
+	ErrLeadershipLost               = errors.New("raft: leadership lost while committing")
+	ErrRaftShutdown                 = errors.New("raft: raft is shutdown")
+	ErrEnqueueTimeout               = errors.New("raft: timeout enqueuing operation")
+	ErrUnsupportedProtocol          = errors.New("raft: unsupported protocol version")
+	ErrLeadershipTransferInProgress = errors.New("raft: leadership transfer in progress")
 )
 
 // Future представляет асинхронную операцию Raft.
@@ -99,6 +100,18 @@ func (f *configurationsFuture) Index() int {
 
 func (f *configurationsFuture) Configuration() Configuration {
 	return f.config
+}
+
+// LeadershipTransferFuture используется для ожидания результата
+// передачи лидерства от одного узла другому.
+type LeadershipTransferFuture interface {
+	Future
+}
+
+// leadershipTransferFuture — future для отслеживания передачи лидерства.
+type leadershipTransferFuture struct {
+	deferError
+	targetID ServerID
 }
 
 // errorFuture — future с заранее известной ошибкой.

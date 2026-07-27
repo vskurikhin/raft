@@ -272,8 +272,15 @@ func TestTransportStubsReturnNotImplemented(t *testing.T) {
 					t.Fatalf("RequestPreVote: want ErrNotImplemented, got %v", err)
 				}
 			}
-			if _, err := client.TimeoutNow(1, TimeoutNowArgs{}); err != ErrNotImplemented {
-				t.Fatalf("TimeoutNow: want ErrNotImplemented, got %v", err)
+			// TimeoutNow реализован только для InmemTransport.
+			if _, ok := client.(*InmemTransport); ok {
+				if _, err := client.TimeoutNow(1, TimeoutNowRequest{}); err != ErrNotReachable {
+					t.Fatalf("TimeoutNow: want ErrNotReachable, got %v", err)
+				}
+			} else {
+				if _, err := client.TimeoutNow(1, TimeoutNowRequest{}); err != ErrNotImplemented {
+					t.Fatalf("TimeoutNow: want ErrNotImplemented, got %v", err)
+				}
 			}
 			if _, err := client.InstallSnapshot(1, InstallSnapshotRequest{}, nil); err != ErrNotImplemented {
 				t.Fatalf("InstallSnapshot: want ErrNotImplemented, got %v", err)

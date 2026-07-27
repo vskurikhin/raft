@@ -13,14 +13,18 @@ var ErrNotImplemented = errors.New("raft: not implemented")
 // или отключён от данного транспорта.
 var ErrNotReachable = errors.New("raft: peer not reachable")
 
-// Заглушки для RPC-типов, которые будут реализованы в будущих фичах.
-// Определены здесь для компиляции Transport interface.
+// TimeoutNowRequest — RPC-запрос от лидера узлу-цели с требованием
+// немедленно начать выборы (без PreVote).
+type TimeoutNowRequest struct {
+	RPCHeader
+}
 
-// TimeoutNowArgs — заглушка.
-type TimeoutNowArgs struct{}
-
-// TimeoutNowReply — заглушка.
-type TimeoutNowReply struct{}
+// TimeoutNowResponse — ответ на TimeoutNowRequest.
+type TimeoutNowResponse struct {
+	RPCHeader
+	Success bool
+	Term    int
+}
 
 // InstallSnapshotRequest — заглушка.
 type InstallSnapshotRequest struct{}
@@ -115,8 +119,9 @@ type Transport interface {
 	RequestPreVote(ServerID, RequestPreVoteArgs) (RequestPreVoteReply, error)
 
 	// TimeoutNow отправляет TimeoutNow RPC узлу peerID.
-	// В текущей реализации возвращает ErrNotImplemented.
-	TimeoutNow(ServerID, TimeoutNowArgs) (TimeoutNowReply, error)
+	// Лидер вызывает этот RPC при graceful leadership transfer,
+	// предписывая целевому узлу начать немедленные выборы.
+	TimeoutNow(ServerID, TimeoutNowRequest) (TimeoutNowResponse, error)
 
 	// InstallSnapshot отправляет snapshot узлу peerID.
 	// В текущей реализации возвращает ErrNotImplemented.

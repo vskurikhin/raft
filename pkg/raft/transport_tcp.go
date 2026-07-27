@@ -16,6 +16,8 @@ func init() {
 	gob.Register(AppendEntriesReply{})
 	gob.Register(RequestVoteArgs{})
 	gob.Register(RequestVoteReply{})
+	gob.Register(TimeoutNowRequest{})
+	gob.Register(TimeoutNowResponse{})
 }
 
 // tcpRPCRequest — структура для gob-кодирования RPC-запроса.
@@ -117,9 +119,11 @@ func (t *TCPTransport) RequestPreVote(_ ServerID, _ RequestPreVoteArgs) (Request
 	return RequestPreVoteReply{}, ErrNotImplemented
 }
 
-// TimeoutNow не реализован.
-func (t *TCPTransport) TimeoutNow(_ ServerID, _ TimeoutNowArgs) (TimeoutNowReply, error) {
-	return TimeoutNowReply{}, ErrNotImplemented
+// TimeoutNow отправляет TimeoutNowRequest указанному узлу по TCP.
+// В текущей реализации не реализован — возвращает ErrNotImplemented.
+// Для graceful leadership transfer в production используйте InmemTransport.
+func (t *TCPTransport) TimeoutNow(_ ServerID, _ TimeoutNowRequest) (TimeoutNowResponse, error) {
+	return TimeoutNowResponse{}, ErrNotImplemented
 }
 
 // InstallSnapshot не реализован.
@@ -223,6 +227,8 @@ func (t *TCPTransport) serveConn(conn net.Conn) {
 		cmd = &v
 	case RequestVoteArgs:
 		cmd = &v
+	case TimeoutNowRequest:
+		cmd = &v
 	}
 
 	rpc := RPC{
@@ -308,6 +314,8 @@ func (t *TCPTransport) sendRPC(peerID ServerID, method string, args any) (any, e
 	case AppendEntriesReply:
 		reply = &v
 	case RequestVoteReply:
+		reply = &v
+	case TimeoutNowResponse:
 		reply = &v
 	}
 

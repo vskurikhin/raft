@@ -164,6 +164,25 @@ type ConsensusModule struct {
 	// leaderID — ID текущего лидера (если известен).
 	// Устанавливается при получении AppendEntries от лидера.
 	leaderID int
+
+	// leadershipTransferCh — канал для запросов на передачу лидерства.
+	// Запросы обрабатываются в leaderLoop.
+	leadershipTransferCh chan *leadershipTransferFuture
+
+	// leadershipTransferInProgress — atomic-флаг, блокирующий Apply
+	// во время передачи лидерства.
+	leadershipTransferInProgress int32
+
+	// leadershipTransferFuture — текущий future передачи лидерства.
+	// Устанавливается в handleLeadershipTransfer, отвечается в stepDown.
+	leadershipTransferFuture *leadershipTransferFuture
+
+	// candidateFromLeadershipTransfer — true, если данный узел стал
+	// кандидатом из-за получения TimeoutNow. Влияет на:
+	//   — пропуск PreVote в runElectionTimer
+	//   — обработку RequestVote (голосуем даже при известном лидере)
+	//   — обработку AppendEntries (не step-down от старого лидера)
+	candidateFromLeadershipTransfer atomic.Bool
 }
 
 // NewConsensusModule создаёт новый экземпляр CM.
@@ -202,6 +221,7 @@ func NewConsensusModule(
 	cm.preVoteDisabled = false
 	cm.leaderLastContact = time.Time{}
 	cm.leaderID = -1
+	cm.leadershipTransferCh = make(chan *leadershipTransferFuture, 1)
 
 	if cm.storage.HasData() {
 		cm.restoreFromStorage()
@@ -257,6 +277,8 @@ func (cm *ConsensusModule) runRPCReader() {
 				var reply RequestPreVoteReply
 				err := cm.RequestPreVote(*cmd, &reply)
 				rpc.RespChan <- RPCResponse{Reply: &reply, Error: err}
+			case *TimeoutNowRequest:
+				cm.timeoutNow(rpc, cmd)
 			default:
 				rpc.RespChan <- RPCResponse{Error: ErrNotImplemented}
 			}
@@ -348,6 +370,9 @@ type RequestVoteArgs struct {
 	CandidateID  int
 	LastLogIndex int
 	LastLogTerm  int
+	// LeadershipTransfer — true, если запрос голоса вызван TimeoutNow.
+	// Позволяет bypass проверку "есть лидер" в RequestVote handler.
+	LeadershipTransfer bool
 }
 
 func (r *RequestVoteArgs) GetRPCHeader() RPCHeader {
@@ -412,10 +437,30 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 		cm.becomeFollower(args.Term)
 	}
 
-	if cm.currentTerm == args.Term &&
-		(cm.votedFor == -1 || cm.votedFor == args.CandidateID) &&
-		(args.LastLogTerm > lastLogTerm ||
-			(args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)) {
+	// Проверка наличия известного лидера.
+	// Если есть лидер, но это leadership transfer — голосуем (bypass).
+	if cm.leaderID >= 0 && cm.leaderID != args.CandidateID && !args.LeadershipTransfer {
+		cm.dLogf("... leader known, denying vote for %d", args.CandidateID)
+		reply.VoteGranted = false
+		reply.RPCHeader = RPCHeader{
+			ProtocolVersion: ProtocolVersion,
+			ServerID:        cm.id,
+		}
+		reply.Term = cm.currentTerm
+		cm.persistToStorage()
+		return nil
+	}
+
+	termOk := cm.currentTerm == args.Term
+	voteOk := cm.votedFor == -1 || cm.votedFor == args.CandidateID
+	logOk := args.LastLogTerm > lastLogTerm ||
+		(args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)
+	if !termOk || !voteOk || !logOk {
+		cm.dLogf("... vote denied: termOk=%v (cur=%d, args=%d), voteOk=%v (votedFor=%d, cand=%d), logOk=%v (args=(%d,%d), local=(%d,%d))",
+			termOk, cm.currentTerm, args.Term, voteOk, cm.votedFor, args.CandidateID,
+			logOk, args.LastLogTerm, args.LastLogIndex, lastLogTerm, lastLogIndex)
+	}
+	if termOk && voteOk && logOk {
 		reply.VoteGranted = true
 		cm.votedFor = args.CandidateID
 		cm.electionResetEvent = time.Now()
@@ -554,6 +599,25 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 	}
 
 	cm.dLogf("AppendEntries: %+v", args)
+
+	// Candidate от leadership transfer не должен делать step-down
+	// при получении AppendEntries от старого лидера, если терм равен
+	// текущему или на 1 меньше. Исключение: терм строго больше нашего.
+	if cm.state == Candidate && cm.candidateFromLeadershipTransfer.Load() {
+		if args.Term > cm.currentTerm {
+			cm.dLogf("... term out of date in AppendEntries (candidate from LT)")
+			cm.becomeFollower(args.Term)
+			cm.candidateFromLeadershipTransfer.Store(false)
+		}
+		reply.RPCHeader = RPCHeader{
+			ProtocolVersion: ProtocolVersion,
+			ServerID:        cm.id,
+		}
+		reply.Term = cm.currentTerm
+		reply.Success = false
+		cm.persistToStorage()
+		return nil
+	}
 
 	if args.Term > cm.currentTerm {
 		cm.dLogf("... term out of date in AppendEntries")
@@ -704,7 +768,7 @@ func (cm *ConsensusModule) runElectionTimer() {
 			// Начать выборы (или Pre-Vote), если в течение времени ожидания мы
 			// не получили сообщение от лидера или не проголосовали за кого-либо.
 			if elapsed := time.Since(cm.electionResetEvent); elapsed >= timeoutDuration {
-				if cm.preVoteDisabled {
+				if cm.preVoteDisabled || cm.candidateFromLeadershipTransfer.Load() {
 					cm.startElection()
 					cm.mu.Unlock()
 					return
@@ -725,6 +789,11 @@ func (cm *ConsensusModule) runElectionTimer() {
 
 // startElection запускает новые выборы с этим CM в качестве кандидата.
 // Ожидается, что cm.mu будет заблокирован.
+//
+// Если candidateFromLeadershipTransfer установлен, в RequestVoteArgs
+// передаётся LeadershipTransfer=true, что bypass проверку наличия лидера
+// на узлах-получателях. Флаг сбрасывается после того, как все горутины
+// отправили RequestVote, чтобы последующие обычные выборы не имели этого флага.
 func (cm *ConsensusModule) startElection() {
 	cm.state = Candidate
 	cm.currentTerm += 1
@@ -733,6 +802,11 @@ func (cm *ConsensusModule) startElection() {
 	cm.votedFor = cm.id
 	cm.persistToStorage()
 	cm.dLogf("becomes Candidate (currentTerm=%d); log=%v", savedCurrentTerm, cm.log)
+
+	// Сохраняем флаг в локальную переменную до его сброса.
+	isLeadershipTransfer := cm.candidateFromLeadershipTransfer.Load()
+	// Сбрасываем флаг, чтобы последующие обычные выборы не имели этого флага.
+	cm.candidateFromLeadershipTransfer.Store(false)
 
 	// Определяем состав кластера из текущей конфигурации.
 	cfg := cm.configurations.latest
@@ -754,7 +828,7 @@ func (cm *ConsensusModule) startElection() {
 		if peerID == cm.id {
 			continue
 		}
-		go func(peerID int) {
+		go func(peerID int, lt bool) {
 			cm.mu.Lock()
 			savedLastLogIndex, savedLastLogTerm := cm.lastLogIndexAndTerm()
 			cm.mu.Unlock()
@@ -764,10 +838,11 @@ func (cm *ConsensusModule) startElection() {
 					ProtocolVersion: ProtocolVersion,
 					ServerID:        cm.id,
 				},
-				Term:         savedCurrentTerm,
-				CandidateID:  cm.id,
-				LastLogIndex: savedLastLogIndex,
-				LastLogTerm:  savedLastLogTerm,
+				Term:               savedCurrentTerm,
+				CandidateID:        cm.id,
+				LastLogIndex:       savedLastLogIndex,
+				LastLogTerm:        savedLastLogTerm,
+				LeadershipTransfer: lt,
 			}
 
 			cm.dLogf("sending RequestVote to %d: %+v", peerID, args)
@@ -802,7 +877,7 @@ func (cm *ConsensusModule) startElection() {
 				}
 				cm.mu.Unlock()
 			}
-		}(peerID)
+		}(peerID, isLeadershipTransfer)
 	}
 
 	// Запустить новый таймер выборов на случай, если текущие выборы не завершатся успешно.
@@ -1214,6 +1289,13 @@ func (cm *ConsensusModule) Apply(command any, timeout time.Duration) ApplyFuture
 		cm.mu.Unlock()
 		return errorFuture{ErrNotLeader}
 	}
+	// Во время передачи лидерства Apply блокируется — клиент получает
+	// ErrLeadershipTransferInProgress. Это предотвращает ситуации, когда
+	// новые команды приходят после того, как таргет уже догнал журнал.
+	if atomic.LoadInt32(&cm.leadershipTransferInProgress) != 0 {
+		cm.mu.Unlock()
+		return errorFuture{ErrLeadershipTransferInProgress}
+	}
 	cm.mu.Unlock()
 
 	var timer <-chan time.Time
@@ -1228,6 +1310,210 @@ func (cm *ConsensusModule) Apply(command any, timeout time.Duration) ApplyFuture
 	case cm.applyCh <- future:
 		return future
 	}
+}
+
+// LeadershipTransfer инициирует graceful передачу лидерства указанному узлу.
+//
+// Алгоритм:
+//  1. Проверка: цель != cm.id (нельзя передать лидерство себе).
+//  2. Проверка: цель — voter в текущей конфигурации.
+//  3. Проверка: передача ещё не идёт (leadershipTransferInProgress == 0).
+//  4. Создание leadershipTransferFuture, отправка в leadershipTransferCh.
+//  5. Возврат future клиенту.
+//
+// Возвращает ErrNotLeader, если узел не является лидером.
+// Возвращает ErrLeadershipTransferInProgress, если передача уже идёт.
+func (cm *ConsensusModule) LeadershipTransfer(targetID ServerID) LeadershipTransferFuture {
+	future := &leadershipTransferFuture{targetID: targetID}
+	future.init(cm.shutdownCh)
+
+	cm.mu.Lock()
+	if cm.state != Leader {
+		cm.mu.Unlock()
+		return errorFuture{ErrNotLeader}
+	}
+	// Проверка, что цель — voter в текущей конфигурации.
+	if !hasVote(cm.configurations.latest, int(targetID)) {
+		cm.mu.Unlock()
+		return errorFuture{ErrLeadershipLost}
+	}
+	if targetID == ServerID(cm.id) {
+		cm.mu.Unlock()
+		return errorFuture{ErrLeadershipLost}
+	}
+	// Проверка, что передача ещё не идёт.
+	if atomic.LoadInt32(&cm.leadershipTransferInProgress) != 0 {
+		cm.mu.Unlock()
+		return errorFuture{ErrLeadershipTransferInProgress}
+	}
+	cm.mu.Unlock()
+
+	select {
+	case cm.leadershipTransferCh <- future:
+		return future
+	case <-cm.shutdownCh:
+		return errorFuture{ErrRaftShutdown}
+	}
+}
+
+// timeoutNow обрабатывает входящий TimeoutNowRequest.
+// Устанавливает candidateFromLeadershipTransfer и форсирует немедленные
+// выборы (без PreVote, без ожидания election timeout).
+func (cm *ConsensusModule) timeoutNow(rpc RPC, req *TimeoutNowRequest) {
+	cm.dLogf("received TimeoutNow from %d", req.ServerID)
+
+	// Уже лидер — no-op.
+	cm.mu.Lock()
+	if cm.state == Leader {
+		term := cm.currentTerm
+		cm.mu.Unlock()
+		rpc.RespChan <- RPCResponse{
+			Reply: &TimeoutNowResponse{
+				RPCHeader: RPCHeader{ProtocolVersion: ProtocolVersion, ServerID: cm.id},
+				Success:   false,
+				Term:      term,
+			},
+		}
+		return
+	}
+	// Если не лидер, проверяем только состояние Follower (Candidate/PreCandidate
+	// не могут получить TimeoutNow).
+	if cm.state != Follower {
+		cm.mu.Unlock()
+		rpc.RespChan <- RPCResponse{
+			Reply: &TimeoutNowResponse{
+				RPCHeader: RPCHeader{ProtocolVersion: ProtocolVersion, ServerID: cm.id},
+				Success:   false,
+				Term:      cm.currentTerm,
+			},
+		}
+		return
+	}
+
+	// Форсированная остановка текущего election timer.
+	select {
+	case <-cm.electionTimerDone:
+	default:
+		close(cm.electionTimerDone)
+	}
+	cm.electionTimerDone = make(chan struct{})
+	cm.candidateFromLeadershipTransfer.Store(true)
+	cm.dLogf("candidateFromLeadershipTransfer set to true (cm.id=%d)", cm.id)
+
+	// Запускаем форсированные выборы немедленно, без ожидания election timeout.
+	// cm.mu удерживается, что гарантирует атомарность.
+	cm.startElection()
+	newTerm := cm.currentTerm
+	cm.dLogf("started immediate election after TimeoutNow, term=%d (cm.id=%d)", newTerm, cm.id)
+	cm.mu.Unlock()
+
+	rpc.RespChan <- RPCResponse{
+		Reply: &TimeoutNowResponse{
+			RPCHeader: RPCHeader{ProtocolVersion: ProtocolVersion, ServerID: cm.id},
+			Success:   true,
+			Term:      newTerm,
+		},
+	}
+}
+
+// handleLeadershipTransfer реализует логику передачи лидерства.
+//
+// Вызывается только из leaderLoop. Блокирует leaderLoop до завершения
+// передачи или таймаута. Все новые Apply и confChange во время передачи
+// отклоняются через флаг leadershipTransferInProgress.
+func (cm *ConsensusModule) handleLeadershipTransfer(future *leadershipTransferFuture) {
+	targetID := int(future.targetID)
+
+	// 1. Устанавливаем флаг блокировки Apply.
+	// Флаг будет снят в stepDown или в defer leaderLoop при ошибке.
+	atomic.StoreInt32(&cm.leadershipTransferInProgress, 1)
+
+	// 2. Проверяем, что цель — voter и достижима.
+	cm.mu.Lock()
+	if !hasVote(cm.configurations.latest, targetID) {
+		cm.mu.Unlock()
+		atomic.StoreInt32(&cm.leadershipTransferInProgress, 0)
+		future.respond(ErrLeadershipLost)
+		return
+	}
+	lastIdx := len(cm.log) - 1
+	targetNextIdx := cm.nextIndex[targetID]
+	savedCurrentTerm := cm.currentTerm
+	cm.mu.Unlock()
+
+	// 3. Если цель отстаёт по журналу — догоняем.
+	if targetNextIdx <= lastIdx {
+		done := make(chan error, 1)
+		go func() {
+			for {
+				// Отправляем сигнал репликации целевому узлу.
+				cm.leaderSendAEsToPeer(targetID, savedCurrentTerm)
+
+				// Ждём короткий интервал, затем проверяем nextIndex.
+				time.Sleep(10 * time.Millisecond)
+
+				cm.mu.Lock()
+				if cm.nextIndex[targetID] > lastIdx {
+					cm.mu.Unlock()
+					done <- nil
+					return
+				}
+				// Если лидерство потеряно — выход.
+				if cm.state != Leader {
+					cm.mu.Unlock()
+					done <- ErrLeadershipLost
+					return
+				}
+				cm.mu.Unlock()
+			}
+		}()
+
+		// Таймаут догоняющей репликации.
+		select {
+		case err := <-done:
+			if err != nil {
+				atomic.StoreInt32(&cm.leadershipTransferInProgress, 0)
+				future.respond(err)
+				return
+			}
+		case <-cm.shutdownCh:
+			atomic.StoreInt32(&cm.leadershipTransferInProgress, 0)
+			future.respond(ErrRaftShutdown)
+			return
+		case <-time.After(cm.electionTimeout()):
+			atomic.StoreInt32(&cm.leadershipTransferInProgress, 0)
+			future.respond(ErrLeadershipLost)
+			return
+		}
+	}
+
+	// 4. Отправляем TimeoutNow цели.
+	reply, err := cm.transport.TimeoutNow(
+		ServerID(targetID),
+		TimeoutNowRequest{
+			RPCHeader: RPCHeader{
+				ProtocolVersion: ProtocolVersion,
+				ServerID:        cm.id,
+			},
+		},
+	)
+	if err != nil {
+		atomic.StoreInt32(&cm.leadershipTransferInProgress, 0)
+		future.respond(err)
+		return
+	}
+	if !reply.Success {
+		// Цель уже была лидером или в процессе выборов.
+		atomic.StoreInt32(&cm.leadershipTransferInProgress, 0)
+		future.respond(ErrLeadershipLost)
+		return
+	}
+
+	// 5. TimeoutNow отправлен успешно — сохраняем future для ответа
+	// в stepDown, когда leaderLoop обнаружит более высокий term.
+	// Флаг leadershipTransferInProgress остаётся установленным
+	// до stepDown — так Apply блокируется на всё время передачи.
+	cm.leadershipTransferFuture = future
 }
 
 // runFSM — отдельная горутина, применяющая закоммиченные записи к FSM.
@@ -1433,6 +1719,11 @@ func (cm *ConsensusModule) dispatchLogsUnsafe(applyLogs []*logFuture) {
 func (cm *ConsensusModule) runLeaderLoop() {
 	defer func() {
 		cm.mu.Lock()
+		if cm.leadershipTransferFuture != nil {
+			atomic.StoreInt32(&cm.leadershipTransferInProgress, 0)
+			cm.leadershipTransferFuture.respond(ErrLeadershipLost)
+			cm.leadershipTransferFuture = nil
+		}
 		inflightCount := cm.inflight.Len()
 		cm.dLogf("leaderLoop exit: responding to %d inflight futures", inflightCount)
 		for e := cm.inflight.Front(); e != nil; e = e.Next() {
@@ -1503,6 +1794,11 @@ func (cm *ConsensusModule) runLeaderLoop() {
 		case <-cm.stepDown:
 			cm.mu.Lock()
 			cm.dLogf("leader stepping down")
+			if cm.leadershipTransferFuture != nil {
+				atomic.StoreInt32(&cm.leadershipTransferInProgress, 0)
+				cm.leadershipTransferFuture.respond(nil)
+				cm.leadershipTransferFuture = nil
+			}
 			cm.mu.Unlock()
 			return
 
@@ -1511,6 +1807,11 @@ func (cm *ConsensusModule) runLeaderLoop() {
 
 		case future := <-cm.configurationChangeChIfStable():
 			cm.appendConfigurationEntry(future)
+
+		case future := <-cm.leadershipTransferCh:
+			// Запуск graceful передачи лидерства.
+			// Блокирует leaderLoop до завершения передачи или таймаута.
+			cm.handleLeadershipTransfer(future)
 
 		case <-cm.shutdownCh:
 			return
@@ -1619,6 +1920,11 @@ func (cm *ConsensusModule) enqueueConfigurationChange(future *configurationChang
 	if cm.state != Leader {
 		cm.mu.Unlock()
 		return ErrNotLeader
+	}
+	// Во время передачи лидерства изменения конфигурации блокируются.
+	if atomic.LoadInt32(&cm.leadershipTransferInProgress) != 0 {
+		cm.mu.Unlock()
+		return ErrLeadershipTransferInProgress
 	}
 	cm.mu.Unlock()
 

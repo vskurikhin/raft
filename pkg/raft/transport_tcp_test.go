@@ -544,7 +544,7 @@ func TestTCPStubsReturnNotImplemented(t *testing.T) {
 		}
 	})
 	t.Run("TimeoutNow", func(t *testing.T) {
-		_, err := trans.TimeoutNow(1, TimeoutNowArgs{})
+		_, err := trans.TimeoutNow(1, TimeoutNowRequest{})
 		if err != ErrNotImplemented {
 			t.Fatalf("want ErrNotImplemented, got %v", err)
 		}
