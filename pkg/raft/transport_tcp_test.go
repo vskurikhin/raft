@@ -528,7 +528,8 @@ func TestTCPLocalAddr(t *testing.T) {
 	}
 }
 
-// TestTCPStubsReturnNotImplemented проверяет, что stub-методы возвращают ErrNotImplemented.
+// TestTCPStubsReturnNotImplemented проверяет, что нереализованные методы возвращают
+// ErrNotImplemented, а реализованные (RequestPreVote, TimeoutNow) — транспортную ошибку.
 func TestTCPStubsReturnNotImplemented(t *testing.T) {
 	defer leaktest.CheckTimeout(t, time.Second)()
 	trans, err := NewTCPTransport("127.0.0.1:0", 100*time.Millisecond)
@@ -539,14 +540,14 @@ func TestTCPStubsReturnNotImplemented(t *testing.T) {
 
 	t.Run("RequestPreVote", func(t *testing.T) {
 		_, err := trans.RequestPreVote(1, RequestPreVoteArgs{})
-		if err != ErrNotImplemented {
-			t.Fatalf("want ErrNotImplemented, got %v", err)
+		if err == nil || err == ErrNotImplemented {
+			t.Fatalf("want transport error, got %v", err)
 		}
 	})
 	t.Run("TimeoutNow", func(t *testing.T) {
 		_, err := trans.TimeoutNow(1, TimeoutNowRequest{})
-		if err != ErrNotImplemented {
-			t.Fatalf("want ErrNotImplemented, got %v", err)
+		if err == nil || err == ErrNotImplemented {
+			t.Fatalf("want transport error, got %v", err)
 		}
 	})
 	t.Run("InstallSnapshot", func(t *testing.T) {

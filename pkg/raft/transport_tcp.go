@@ -18,6 +18,8 @@ func init() {
 	gob.Register(RequestVoteReply{})
 	gob.Register(TimeoutNowRequest{})
 	gob.Register(TimeoutNowResponse{})
+	gob.Register(RequestPreVoteArgs{})
+	gob.Register(RequestPreVoteReply{})
 }
 
 // tcpRPCRequest — структура для gob-кодирования RPC-запроса.
@@ -114,16 +116,32 @@ func (t *TCPTransport) RequestVote(peerID ServerID, args RequestVoteArgs) (Reque
 	return *r, nil
 }
 
-// RequestPreVote не реализован.
-func (t *TCPTransport) RequestPreVote(_ ServerID, _ RequestPreVoteArgs) (RequestPreVoteReply, error) {
-	return RequestPreVoteReply{}, ErrNotImplemented
+// RequestPreVote отправляет PreVote RPC узлу peerID по TCP.
+func (t *TCPTransport) RequestPreVote(peerID ServerID, args RequestPreVoteArgs) (RequestPreVoteReply, error) {
+	var zero RequestPreVoteReply
+	reply, err := t.sendRPC(peerID, "RequestPreVote", &args)
+	if err != nil {
+		return zero, err
+	}
+	r, ok := reply.(*RequestPreVoteReply)
+	if !ok {
+		return zero, fmt.Errorf("raft: unexpected reply type %T", reply)
+	}
+	return *r, nil
 }
 
 // TimeoutNow отправляет TimeoutNowRequest указанному узлу по TCP.
-// В текущей реализации не реализован — возвращает ErrNotImplemented.
-// Для graceful leadership transfer в production используйте InmemTransport.
-func (t *TCPTransport) TimeoutNow(_ ServerID, _ TimeoutNowRequest) (TimeoutNowResponse, error) {
-	return TimeoutNowResponse{}, ErrNotImplemented
+func (t *TCPTransport) TimeoutNow(peerID ServerID, args TimeoutNowRequest) (TimeoutNowResponse, error) {
+	var zero TimeoutNowResponse
+	reply, err := t.sendRPC(peerID, "TimeoutNow", &args)
+	if err != nil {
+		return zero, err
+	}
+	r, ok := reply.(*TimeoutNowResponse)
+	if !ok {
+		return zero, fmt.Errorf("raft: unexpected reply type %T", reply)
+	}
+	return *r, nil
 }
 
 // InstallSnapshot не реализован.
@@ -229,6 +247,8 @@ func (t *TCPTransport) serveConn(conn net.Conn) {
 		cmd = &v
 	case TimeoutNowRequest:
 		cmd = &v
+	case RequestPreVoteArgs:
+		cmd = &v
 	}
 
 	rpc := RPC{
@@ -316,6 +336,8 @@ func (t *TCPTransport) sendRPC(peerID ServerID, method string, args any) (any, e
 	case RequestVoteReply:
 		reply = &v
 	case TimeoutNowResponse:
+		reply = &v
+	case RequestPreVoteReply:
 		reply = &v
 	}
 

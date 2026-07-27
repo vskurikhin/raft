@@ -262,25 +262,11 @@ func TestTransportStubsReturnNotImplemented(t *testing.T) {
 			client, _, cleanup := tt.fn(t)
 			defer cleanup()
 
-			// RequestPreVote реализован только для InmemTransport.
-			if _, ok := client.(*InmemTransport); ok {
-				if _, err := client.RequestPreVote(1, RequestPreVoteArgs{}); err == nil || err == ErrNotImplemented {
-					t.Fatalf("RequestPreVote: want transport error, got %v", err)
-				}
-			} else {
-				if _, err := client.RequestPreVote(1, RequestPreVoteArgs{}); err != ErrNotImplemented {
-					t.Fatalf("RequestPreVote: want ErrNotImplemented, got %v", err)
-				}
+			if _, err := client.RequestPreVote(1, RequestPreVoteArgs{}); err == nil || err == ErrNotImplemented {
+				t.Fatalf("RequestPreVote: want transport error, got %v", err)
 			}
-			// TimeoutNow реализован только для InmemTransport.
-			if _, ok := client.(*InmemTransport); ok {
-				if _, err := client.TimeoutNow(1, TimeoutNowRequest{}); err != ErrNotReachable {
-					t.Fatalf("TimeoutNow: want ErrNotReachable, got %v", err)
-				}
-			} else {
-				if _, err := client.TimeoutNow(1, TimeoutNowRequest{}); err != ErrNotImplemented {
-					t.Fatalf("TimeoutNow: want ErrNotImplemented, got %v", err)
-				}
+			if _, err := client.TimeoutNow(1, TimeoutNowRequest{}); err == nil || err == ErrNotImplemented {
+				t.Fatalf("TimeoutNow: want transport error, got %v", err)
 			}
 			if _, err := client.InstallSnapshot(1, InstallSnapshotRequest{}, nil); err != ErrNotImplemented {
 				t.Fatalf("InstallSnapshot: want ErrNotImplemented, got %v", err)
