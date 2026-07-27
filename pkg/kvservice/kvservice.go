@@ -16,7 +16,12 @@ import (
 	"github.com/vskurikhin/raft/pkg/raft"
 )
 
-const DebugKV = 0
+const DebugKV = 1
+
+// requestTimeout — таймаут для Apply-операций (PUT, CAS).
+// Если за это время не удалось отправить команду в applyCh лидера,
+// возвращается ErrEnqueueTimeout.
+const requestTimeout = 10 * time.Second
 
 type KVService struct {
 	mu sync.Mutex
@@ -185,6 +190,7 @@ func (kvs *KVService) ServeHTTP(address string) {
 	mux.HandleFunc("POST /get/", kvs.handleGet)
 	mux.HandleFunc("POST /put/", kvs.handlePut)
 	mux.HandleFunc("POST /cas/", kvs.handleCAS)
+	mux.HandleFunc("POST /verifyleader/", kvs.handleVerifyLeader)
 
 	kvs.srv = &http.Server{
 		Addr:    address,
@@ -237,6 +243,15 @@ func (kvs *KVService) sendHTTPResponse(w http.ResponseWriter, v any) {
 	}
 }
 
+func (kvs *KVService) handleVerifyLeader(w http.ResponseWriter, req *http.Request) {
+	// ReadIndex-проверка лидерства (Raft §8) без записи в журнал.
+	if err := kvs.rs.VerifyLeader().Error(); err != nil {
+		kvs.sendHTTPResponse(w, api.StatusResponse{RespStatus: api.StatusNotLeader})
+		return
+	}
+	kvs.sendHTTPResponse(w, api.StatusResponse{RespStatus: api.StatusOK})
+}
+
 func (kvs *KVService) handlePut(w http.ResponseWriter, req *http.Request) {
 	pr := &api.PutRequest{}
 	if err := readRequestJSON(req, pr); err != nil {
@@ -245,6 +260,14 @@ func (kvs *KVService) handlePut(w http.ResponseWriter, req *http.Request) {
 	}
 	kvs.kvLogf("HTTP PUT %v", pr)
 
+	// ReadIndex-проверка лидерства (Raft §8) без записи в журнал.
+	if err := kvs.rs.VerifyLeader().Error(); err != nil {
+		kvs.sendHTTPResponse(w, api.PutResponse{
+			RespStatus: api.StatusNotLeader,
+		})
+		return
+	}
+
 	cmd := Command{
 		Kind:  CommandPut,
 		Key:   pr.Key,
@@ -252,15 +275,10 @@ func (kvs *KVService) handlePut(w http.ResponseWriter, req *http.Request) {
 		ID:    kvs.id,
 	}
 
-	future := kvs.rs.Apply(cmd, 0)
-
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- future.Error()
-	}()
+	future := kvs.rs.Apply(cmd, requestTimeout)
 
 	select {
-	case err := <-errCh:
+	case err := <-future.ErrorCh():
 		if err != nil {
 			kvs.sendHTTPResponse(w, api.PutResponse{
 				RespStatus: api.StatusNotLeader,
@@ -287,37 +305,28 @@ func (kvs *KVService) handleGet(w http.ResponseWriter, req *http.Request) {
 	}
 	kvs.kvLogf("HTTP GET %v", gr)
 
-	cmd := Command{
-		Kind: CommandGet,
-		Key:  gr.Key,
-		ID:   kvs.id,
-	}
-
-	future := kvs.rs.Apply(cmd, 0)
-
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- future.Error()
-	}()
-
+	// ReadIndex: подтверждение лидерства без записи в raft-журнал (Raft §8).
+	future := kvs.rs.VerifyLeader()
 	select {
-	case err := <-errCh:
+	case err := <-future.ErrorCh():
 		if err != nil {
 			kvs.sendHTTPResponse(w, api.GetResponse{
 				RespStatus: api.StatusNotLeader,
 			})
 			return
 		}
-		cmdResp := future.Response().(Command)
-		kvs.sendHTTPResponse(w, api.GetResponse{
-			RespStatus: api.StatusOK,
-			KeyFound:   cmdResp.ResultFound,
-			Value:      cmdResp.ResultValue,
-		})
-
 	case <-req.Context().Done():
 		return
 	}
+
+	// Локальное чтение из DataStore (без raft-журнала, только после ReadIndex).
+	cmd := Command{Kind: CommandGet, Key: gr.Key, ID: kvs.id}
+	value, found := kvs.ds.Get(cmd.Key)
+	kvs.sendHTTPResponse(w, api.GetResponse{
+		RespStatus: api.StatusOK,
+		KeyFound:   found,
+		Value:      value,
+	})
 }
 
 func (kvs *KVService) handleCAS(w http.ResponseWriter, req *http.Request) {
@@ -328,23 +337,26 @@ func (kvs *KVService) handleCAS(w http.ResponseWriter, req *http.Request) {
 	}
 	kvs.kvLogf("HTTP CAS %v", cr)
 
+	// ReadIndex-проверка лидерства (Raft §8) без записи в журнал.
+	if err := kvs.rs.VerifyLeader().Error(); err != nil {
+		kvs.sendHTTPResponse(w, api.CASResponse{
+			RespStatus: api.StatusNotLeader,
+		})
+		return
+	}
+
 	cmd := Command{
 		Kind:         CommandCAS,
 		Key:          cr.Key,
-		Value:        cr.Value,
 		CompareValue: cr.CompareValue,
+		Value:        cr.Value,
 		ID:           kvs.id,
 	}
 
-	future := kvs.rs.Apply(cmd, 0)
-
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- future.Error()
-	}()
+	future := kvs.rs.Apply(cmd, requestTimeout)
 
 	select {
-	case err := <-errCh:
+	case err := <-future.ErrorCh():
 		if err != nil {
 			kvs.sendHTTPResponse(w, api.CASResponse{
 				RespStatus: api.StatusNotLeader,

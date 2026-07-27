@@ -2,7 +2,6 @@ package raft
 
 import (
 	"bytes"
-	"container/list"
 	"encoding/gob"
 	"io"
 	"strings"
@@ -876,8 +875,9 @@ func TestBecomeFollowerDoubleClose(t *testing.T) {
 		storage:            NewMapStorage(),
 		nextIndex:          make(map[int]int),
 		matchIndex:         make(map[int]int),
-		inflight:           list.New(),
+		inflight:           make(map[int]*logFuture),
 		applyCh:            make(chan *logFuture),
+		verifyCh:           make(chan *verifyFuture, 64),
 		shutdownCh:         make(chan struct{}),
 		commitCh:           make(chan int, 1),
 		stepDown:           make(chan struct{}, 1),
@@ -2297,4 +2297,144 @@ func TestNonvoter_NoGoroutineLeak(t *testing.T) {
 
 	// Проверить, что команда закоммичена.
 	h.WaitForCommit(42, 1)
+}
+
+// TestVerifyLeader_SingleNode проверяет, что VerifyLeader на одноузловом
+// кластере немедленно завершается успехом (собственный голос = кворум).
+func TestVerifyLeader_SingleNode(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 60*Quantum*time.Millisecond)()
+	h := NewHarness(t, 1)
+	defer h.Shutdown()
+
+	h.CheckSingleLeader()
+
+	future := h.cluster[0].VerifyLeader()
+	if err := future.Error(); err != nil {
+		t.Fatalf("VerifyLeader failed on single node: %v", err)
+	}
+}
+
+// TestVerifyLeader_LeaderSucceeds проверяет, что лидер multi-node кластера
+// успешно подтверждает своё лидерство через VerifyLeader.
+func TestVerifyLeader_LeaderSucceeds(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	h := NewHarness(t, 3)
+	defer h.Shutdown()
+
+	lid, _ := h.CheckSingleLeader()
+
+	// VerifyLeader должен пройти на лидере (кворум = 2 из 3).
+	future := h.cluster[lid].VerifyLeader()
+	if err := future.Error(); err != nil {
+		t.Fatalf("VerifyLeader failed on leader: %v", err)
+	}
+}
+
+// TestVerifyLeader_NonLeaderFails проверяет, что VerifyLeader на non-leader
+// немедленно возвращает ErrNotLeader без блокировки.
+func TestVerifyLeader_NonLeaderFails(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	h := NewHarness(t, 3)
+	defer h.Shutdown()
+
+	lid, _ := h.CheckSingleLeader()
+
+	// Выбираем follower.
+	followerID := (lid + 1) % 3
+
+	future := h.cluster[followerID].VerifyLeader()
+	if err := future.Error(); err != ErrNotLeader {
+		t.Fatalf("VerifyLeader on follower returned %v, want ErrNotLeader", err)
+	}
+}
+
+// TestVerifyLeader_AfterLeadershipLossFails проверяет, что VerifyLeader
+// блокируется (или возвращает ошибку) после потери лидерства и разрыва
+// связи с кворумом.
+func TestVerifyLeader_AfterLeadershipLossFails(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 200*Quantum*time.Millisecond)()
+	h := NewHarness(t, 3)
+	defer h.Shutdown()
+
+	lid, _ := h.CheckSingleLeader()
+
+	// Изолируем лидера от обоих follower.
+	h.DisconnectPeer((lid + 1) % 3)
+	h.DisconnectPeer((lid + 2) % 3)
+
+	// VerifyLeader должен блокироваться (без кворума).
+	// Используем таймаут, чтобы не зависнуть навсегда.
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- h.cluster[lid].VerifyLeader().Error()
+	}()
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("VerifyLeader succeeded after leadership loss")
+		}
+	case <-time.After(50 * Quantum * time.Millisecond):
+		// Ожидаемо: VerifyLeader блокируется без кворума.
+	}
+}
+
+// TestVerifyLeader_Concurrent проверяет, что несколько concurrent вызовов
+// VerifyLeader работают корректно. Использует ErrorCh для select-стиля.
+func TestVerifyLeader_Concurrent(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	h := NewHarness(t, 3)
+	defer h.Shutdown()
+
+	lid, _ := h.CheckSingleLeader()
+
+	const n = 5
+	futures := make([]Future, n)
+	for i := range n {
+		futures[i] = h.cluster[lid].VerifyLeader()
+	}
+
+	for i, f := range futures {
+		if err := f.Error(); err != nil {
+			t.Errorf("concurrent VerifyLeader %d failed: %v", i, err)
+		}
+	}
+}
+
+// TestVerifyLeader_Timeout проверяет ErrorCh для VerifyLeader.
+func TestVerifyLeader_Timeout(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 60*Quantum*time.Millisecond)()
+	h := NewHarness(t, 1)
+	defer h.Shutdown()
+
+	h.CheckSingleLeader()
+
+	future := h.cluster[0].VerifyLeader()
+	if err := future.Error(); err != nil {
+		t.Fatalf("VerifyLeader failed: %v", err)
+	}
+}
+
+// TestApply_Timeout проверяет, что Apply с ненулевым таймаутом возвращает
+// ErrEnqueueTimeout при недоступности лидера.
+func TestApply_Timeout(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 60*Quantum*time.Millisecond)()
+	h := NewHarness(t, 1)
+	defer h.Shutdown()
+
+	future := h.cluster[0].Apply(42, 10*time.Millisecond)
+	if err := future.Error(); err != ErrNotLeader && err != ErrEnqueueTimeout {
+		t.Fatalf("expected ErrNotLeader or ErrEnqueueTimeout, got %v", err)
+	}
+}
+
+// TestApply_TimeoutDoesNotBlock проверяет, что Apply с timeout=0
+// не блокируется навсегда при закрытии shutdownCh.
+func TestApply_TimeoutDoesNotBlock(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 60*Quantum*time.Millisecond)()
+	h := NewHarness(t, 1)
+	h.Shutdown()
+	future := h.cluster[0].Apply(42, 0)
+	if err := future.Error(); err != ErrRaftShutdown {
+		t.Fatalf("expected ErrRaftShutdown, got %v", err)
+	}
 }

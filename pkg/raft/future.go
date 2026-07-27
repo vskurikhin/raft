@@ -27,6 +27,35 @@ var (
 // Future представляет асинхронную операцию Raft.
 type Future interface {
 	Error() error
+	// ErrorCh возвращает канал, по которому приходит ошибка выполнения.
+	// Позволяет использовать select для ожидания без создания го-рутины.
+	ErrorCh() <-chan error
+}
+
+// verifyFuture — Future для ReadIndex-подтверждения лидерства (Raft §8).
+// Отправляется в verifyCh, обрабатывается в runLeaderLoop.
+// После получения кворумного подтверждения от большинства узлов
+// respond(nil). При потере лидерства respond(ErrNotLeader).
+type verifyFuture struct {
+	deferError
+	quorumSize int
+	votes      int
+	notifyCh   chan *verifyFuture
+}
+
+// vote учитывает голос follower при подтверждении лидерства.
+// Если leader == false, future немедленно завершается с ErrNotLeader.
+// Если votes >= quorumSize, future завершается с nil.
+// Потокобезопасен.
+func (v *verifyFuture) vote(leader bool) {
+	if !leader {
+		v.respond(ErrNotLeader)
+		return
+	}
+	v.votes++
+	if v.votes >= v.quorumSize {
+		v.respond(nil)
+	}
 }
 
 // IndexFuture — Future, возвращающая индекс записи в журнале.
@@ -53,6 +82,7 @@ type deferError struct {
 	errCh      chan error
 	once       sync.Once
 	responded  bool
+	mu         sync.Mutex
 	shutdownCh chan struct{}
 }
 
@@ -73,12 +103,22 @@ func (d *deferError) Error() error {
 }
 
 func (d *deferError) respond(err error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	if d.errCh == nil || d.responded {
 		return
 	}
+	d.responded = true
+	d.mu.Unlock()
 	d.errCh <- err
 	close(d.errCh)
-	d.responded = true
+	d.mu.Lock()
+}
+
+// ErrorCh возвращает канал, по которому приходит ошибка выполнения future.
+// Позволяет использовать select для ожидания без создания го-рутины.
+func (d *deferError) ErrorCh() <-chan error {
+	return d.errCh
 }
 
 // logFuture — future для одной записи журнала.
@@ -128,7 +168,13 @@ type errorFuture struct {
 	err error
 }
 
-func (e errorFuture) Error() error                 { return e.err }
+func (e errorFuture) Error() error { return e.err }
+func (e errorFuture) ErrorCh() <-chan error {
+	ch := make(chan error, 1)
+	ch <- e.err
+	close(ch)
+	return ch
+}
 func (e errorFuture) Index() int                   { return 0 }
 func (e errorFuture) Response() any                { return nil }
 func (e errorFuture) Configuration() Configuration { return Configuration{} }

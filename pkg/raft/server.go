@@ -68,7 +68,7 @@ func NewServer(serverID int, peerIds []int, storage Storage, ready <-chan any, f
 
 // Serve запускает TCP-транспорт на указанном адресе и создаёт ConsensusModule.
 func (s *Server) Serve(address string) {
-	transport, err := NewTCPTransport(address, HeartbeatTimeoutMs*time.Millisecond/2, s.maxPool)
+	transport, err := NewTCPTransport(address, ReelectionTimeoutMs*time.Millisecond/3, s.maxPool)
 	if err != nil {
 		log.Fatalf("raft: failed to create TCPTransport: %v", err)
 	}
@@ -138,6 +138,13 @@ func (s *Server) GetListenAddr() net.Addr {
 func (s *Server) IsLeader() bool {
 	_, _, isLeader := s.cm.Report()
 	return isLeader
+}
+
+// VerifyLeader проверяет, что сервер всё ещё является лидером
+// (ReadIndex, Raft §8). Возвращает Future, которая завершится с
+// ошибкой, если лидерство утеряно.
+func (s *Server) VerifyLeader() Future {
+	return s.cm.VerifyLeader()
 }
 
 // Shutdown останавливает сервер.
