@@ -734,7 +734,7 @@ func TestInmemAppendEntriesWithEntries(t *testing.T) {
 	}()
 	defer close(done)
 
-	entries := []LogEntry{{Index: 0, Term: 1, Command: "cmd1"}}
+	entries := []LogEntry{{Index: 0, Term: 1, Data: "cmd1"}}
 	args := AppendEntriesArgs{
 		Term:         1,
 		LeaderID:     0,

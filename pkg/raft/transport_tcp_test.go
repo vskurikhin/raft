@@ -441,7 +441,7 @@ func TestTCPGobRegistration(t *testing.T) {
 			PrevLogIndex: -1,
 			PrevLogTerm:  -1,
 			Entries: []LogEntry{
-				{Index: 0, Term: 1, Type: LogCommand, Command: "test"},
+				{Index: 0, Term: 1, Type: LogCommand, Data: "test"},
 			},
 			LeaderCommit: -1,
 		}

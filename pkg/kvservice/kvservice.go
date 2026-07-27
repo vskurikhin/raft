@@ -77,9 +77,9 @@ func New(cfg Config, storage raft.Storage, readyChan <-chan any) *KVService {
 // записи журнала. Команда применяется к DataStore, результат сохраняется
 // в полях ResultValue/ResultFound команды и возвращается в future клиента.
 func (kvs *KVService) Apply(log *raft.LogEntry) any {
-	cmd, ok := log.Command.(Command)
+	cmd, ok := log.Data.(Command)
 	if !ok {
-		kvs.kvLogf("unknown command type %T", log.Command)
+		kvs.kvLogf("unknown command type %T", log.Data)
 		return nil
 	}
 

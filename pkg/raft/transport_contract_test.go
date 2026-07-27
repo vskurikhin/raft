@@ -300,7 +300,7 @@ func TestTransportAppendEntriesWithEntries(t *testing.T) {
 				PrevLogIndex: -1,
 				PrevLogTerm:  -1,
 				Entries: []LogEntry{
-					{Index: 0, Term: 1, Type: LogCommand, Command: []byte("test")},
+					{Index: 0, Term: 1, Type: LogCommand, Data: []byte("test")},
 				},
 				LeaderCommit: -1,
 			}

@@ -291,7 +291,7 @@ func (h *Harness) CheckCommitted(cmd int) (nc int, index int) {
 		cmdAtC := -1
 		for i := 0; i < h.n; i++ {
 			if h.connected[i] {
-				cmdOfN := h.commits[i][c].Command.(int)
+				cmdOfN := h.commits[i][c].Data.(int)
 				if cmdAtC >= 0 {
 					if cmdOfN != cmdAtC {
 						h.t.Errorf("got %d, want %d at h.commits[%d][%d]", cmdOfN, cmdAtC, i, c)
@@ -342,7 +342,7 @@ func (h *Harness) WaitForCommit(cmd int, n int) {
 		for i := 0; i < h.n; i++ {
 			if h.connected[i] {
 				for c := 0; c < len(h.commits[i]); c++ {
-					if h.commits[i][c].Command.(int) == cmd {
+					if h.commits[i][c].Data.(int) == cmd {
 						nc++
 						break
 					}
@@ -367,7 +367,7 @@ func (h *Harness) CheckNotCommitted(cmd int) {
 	for i := 0; i < h.n; i++ {
 		if h.connected[i] {
 			for c := 0; c < len(h.commits[i]); c++ {
-				gotCmd := h.commits[i][c].Command.(int)
+				gotCmd := h.commits[i][c].Data.(int)
 				if gotCmd == cmd {
 					h.t.Errorf("found %d at commits[%d][%d], expected none", cmd, i, c)
 				}

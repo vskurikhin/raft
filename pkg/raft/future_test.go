@@ -426,7 +426,7 @@ func TestFSMApplyInOrder(t *testing.T) {
 	capture.mu.Lock()
 	entries := make([]int, len(capture.entries))
 	for i, e := range capture.entries {
-		entries[i] = e.Command.(int)
+		entries[i] = e.Data.(int)
 	}
 	capture.mu.Unlock()
 
@@ -490,7 +490,7 @@ func TestBatchApplyOrderAndIndices(t *testing.T) {
 	entries := make([]int, 0, len(capture.entries))
 	for _, e := range capture.entries {
 		if e.Type == LogCommand {
-			entries = append(entries, e.Command.(int))
+			entries = append(entries, e.Data.(int))
 		}
 	}
 	capture.mu.Unlock()

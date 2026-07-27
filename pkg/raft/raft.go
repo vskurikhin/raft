@@ -33,8 +33,8 @@ const (
 // Каждая запись фиксации уведомляет клиента о том, что консенсус по команде
 // был достигнут и эта команда может быть применена к машине состояний клиента.
 type CommitEntry struct {
-	// Command — это команда клиента, которая была зафиксирована.
-	Command any
+	// Data — это команда клиента, которая была зафиксирована.
+	Data any
 
 	// Index — это индекс журнала, по которому была зафиксирована команда клиента.
 	Index int
@@ -89,10 +89,10 @@ const (
 var maxApplyBatchSize = 64
 
 type LogEntry struct {
-	Index   int
-	Term    int
-	Type    LogType
-	Command any
+	Index int
+	Term  int
+	Type  LogType
+	Data  any
 }
 
 // commitTuple связывает запись журнала с future для отправки в FSM.
@@ -138,6 +138,12 @@ type ConsensusModule struct {
 	currentTerm int
 	votedFor    int
 	log         []LogEntry
+
+	// lastLogIndex — кэш индекса последней записи в журнале.
+	// Обновляется через setLastLog при любом изменении журнала.
+	lastLogIndex int
+	// lastLogTerm — кэш терма последней записи в журнале.
+	lastLogTerm int
 
 	commitIndex        int
 	lastApplied        int
@@ -215,6 +221,8 @@ func NewConsensusModule(
 	cm.commitIndex = -1
 	cm.lastApplied = -1
 	cm.leaderStartIndex = -1
+	cm.lastLogIndex = -1
+	cm.lastLogTerm = -1
 	cm.nextIndex = make(map[int]int)
 	cm.matchIndex = make(map[int]int)
 	cm.electionTimerDone = make(chan struct{})
@@ -327,6 +335,7 @@ func (cm *ConsensusModule) restoreFromStorage() {
 	} else {
 		log.Fatal("log not found in storage")
 	}
+	cm.rebuildLastLog()
 
 	cm.rebuildConfigurations()
 }
@@ -653,7 +662,7 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 		// Обратите внимание, что в особом случае, когда PrevLogIndex == -1,
 		// условие считается истинным автоматически.
 		if args.PrevLogIndex == -1 ||
-			(args.PrevLogIndex < len(cm.log) && args.PrevLogTerm == cm.log[args.PrevLogIndex].Term) {
+			(args.PrevLogIndex <= cm.lastLogIndex && cm.lookupTerm(args.PrevLogIndex) == args.PrevLogTerm) {
 			reply.Success = true
 
 			// Находит точку вставки — место, где происходит несовпадение термов
@@ -662,6 +671,7 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 			logInsertIndex := args.PrevLogIndex + 1
 			newEntriesIndex := 0
 
+			// FIXME(compact): cm.log[logInsertIndex] по позиции, не по индексу.
 			for logInsertIndex < len(cm.log) && newEntriesIndex < len(args.Entries) {
 				if cm.log[logInsertIndex].Term != args.Entries[newEntriesIndex].Term {
 					break
@@ -678,6 +688,7 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 				cm.dLogf("... inserting entries %v from index %d", args.Entries[newEntriesIndex:], logInsertIndex)
 				cm.log = append(cm.log[:logInsertIndex], args.Entries[newEntriesIndex:]...)
 				cm.dLogf("... log is now: %v", cm.log)
+				cm.rebuildLastLog()
 				// Если перезапись затронула конфигурацию, откатываем latest.
 				cm.processLogConflict(logInsertIndex)
 			}
@@ -690,7 +701,7 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 			}
 
 			if args.LeaderCommit > cm.commitIndex {
-				cm.commitIndex = min(args.LeaderCommit, len(cm.log)-1)
+				cm.commitIndex = min(args.LeaderCommit, cm.lastLogIndex)
 				cm.dLogf("... setting commitIndex=%d", cm.commitIndex)
 				cm.persistToStorage()
 				commitIdx := cm.commitIndex
@@ -700,18 +711,14 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 			}
 		} else {
 			// Не найдено совпадение для PrevLogIndex/PrevLogTerm.
-			// Заполнить ConflictIndex и ConflictTerm, чтобы помочь лидеру
-			// быстрее привести наш журнал в актуальное состояние.
-			if args.PrevLogIndex >= len(cm.log) {
-				reply.ConflictIndex = len(cm.log)
+			if args.PrevLogIndex > cm.lastLogIndex {
+				reply.ConflictIndex = cm.lastLogIndex + 1
 				reply.ConflictTerm = -1
 			} else {
-				// PrevLogIndex указывает на существующую запись в нашем журнале,
-				// но PrevLogTerm не совпадает с термом записи
-				// cm.log[PrevLogIndex].
-				reply.ConflictTerm = cm.log[args.PrevLogIndex].Term
+				reply.ConflictTerm = cm.lookupTerm(args.PrevLogIndex)
 
 				var i int
+				// FIXME(compact): искать по cm.log[i].Index, не по позиции.
 				for i = args.PrevLogIndex - 1; i >= 0; i-- {
 					if cm.log[i].Term != reply.ConflictTerm {
 						break
@@ -1131,7 +1138,7 @@ func (cm *ConsensusModule) startLeader() {
 		if peerID == cm.id {
 			continue
 		}
-		cm.nextIndex[peerID] = len(cm.log)
+		cm.nextIndex[peerID] = cm.lastLogIndex + 1
 		cm.matchIndex[peerID] = -1
 	}
 	cm.dLogf(
@@ -1139,12 +1146,12 @@ func (cm *ConsensusModule) startLeader() {
 		cm.currentTerm, cm.nextIndex, cm.matchIndex, cm.log,
 	)
 
-	cm.leaderStartIndex = len(cm.log) - 1
+	cm.leaderStartIndex = cm.lastLogIndex
 	cm.commitmentTracker = newCommitmentTracker(
-		cm.id, cm.commitCh, cm.currentTerm, len(cm.log)-1,
+		cm.id, cm.commitCh, cm.currentTerm, cm.lastLogIndex,
 	)
 	cm.commitmentTracker.setConfiguration(voterIDs(cfg), cm.lookupTerm)
-	cm.commitmentTracker.setMatch(cm.id, len(cm.log)-1, cm.lookupTerm)
+	cm.commitmentTracker.setMatch(cm.id, cm.lastLogIndex, cm.lookupTerm)
 
 	// Noop entry при утверждении лидерства (§5.4.2).
 	// Лидер должен закоммитить noop запись своего терма, чтобы
@@ -1166,11 +1173,12 @@ func (cm *ConsensusModule) nextIndexArgsEntries(peerID, savedCurrentTerm int) (i
 	ni := cm.nextIndex[peerID]
 	prevLogIndex := ni - 1
 	prevLogTerm := -1
-	if 0 <= prevLogIndex && prevLogIndex < len(cm.log) {
-		prevLogTerm = cm.log[prevLogIndex].Term
+	if 0 <= prevLogIndex && prevLogIndex <= cm.lastLogIndex {
+		prevLogTerm = cm.lookupTerm(prevLogIndex)
 	}
 	var entries []LogEntry
-	if ni < len(cm.log) {
+	if ni <= cm.lastLogIndex {
+		// FIXME(compact): cm.log[ni:] предполагает, что ni == позиция в срезе.
 		entries = append([]LogEntry{}, cm.log[ni:]...)
 	} else {
 		entries = nil
@@ -1282,20 +1290,55 @@ func (cm *ConsensusModule) leaderSendAEs() {
 
 // lookupTerm возвращает терм записи журнала по индексу.
 // Используется commitmentTracker для проверки Raft safety.
+// lookupTerm возвращает терм для записи с указанным index.
+// Использует бинарный поиск: после внедрения снэпшотов позиция
+// записи в cm.log может не совпадать с её индексом.
+// Требует удержания cm.mu (RLock или Lock).
 func (cm *ConsensusModule) lookupTerm(index int) int {
-	if index < 0 || index >= len(cm.log) {
-		return -1
+	lo, hi := 0, len(cm.log)-1
+	for lo <= hi {
+		mid := (lo + hi) / 2
+		if cm.log[mid].Index == index {
+			return cm.log[mid].Term
+		} else if cm.log[mid].Index < index {
+			lo = mid + 1
+		} else {
+			hi = mid - 1
+		}
 	}
-	return cm.log[index].Term
+	return -1
 }
 
-// lastLogIndexAndTerm возвращает индекс и терм последней записи журнала.
+// lastLogIndexAndTerm возвращает кэшированный индекс и терм
+// последней записи в журнале. Не вычисляет из len(cm.log).
+// Требует удержания cm.mu (RLock или Lock).
 func (cm *ConsensusModule) lastLogIndexAndTerm() (int, int) {
+	return cm.lastLogIndex, cm.lastLogTerm
+}
+
+// setLastLog обновляет кэш lastLogIndex/lastLogTerm.
+// Вызывается после любого изменения журнала (добавление записей,
+// удаление при конфликте, восстановление из storage).
+// Требует удержания cm.mu (Lock).
+func (cm *ConsensusModule) setLastLog(index, term int) {
+	cm.lastLogIndex = index
+	cm.lastLogTerm = term
+}
+
+// rebuildLastLog восстанавливает кэш lastLogIndex/lastLogTerm
+// из текущего содержимого cm.log.
+// Вызывается из restoreFromStorage() и других мест, где журнал
+// мог измениться без вызова setLastLog.
+// Требует удержания cm.mu (Lock).
+func (cm *ConsensusModule) rebuildLastLog() {
 	if len(cm.log) > 0 {
-		lastIndex := len(cm.log) - 1
-		return lastIndex, cm.log[lastIndex].Term
+		last := cm.log[len(cm.log)-1]
+		cm.lastLogIndex = last.Index
+		cm.lastLogTerm = last.Term
+	} else {
+		cm.lastLogIndex = -1
+		cm.lastLogTerm = -1
 	}
-	return -1, -1
 }
 
 // Apply отправляет команду в Raft и возвращает ApplyFuture.
@@ -1309,8 +1352,8 @@ func (cm *ConsensusModule) Apply(command any, timeout time.Duration) ApplyFuture
 
 	future := &logFuture{
 		log: LogEntry{
-			Type:    LogCommand,
-			Command: command,
+			Type: LogCommand,
+			Data: command,
 		},
 	}
 	future.init(cm.shutdownCh)
@@ -1467,7 +1510,7 @@ func (cm *ConsensusModule) handleLeadershipTransfer(future *leadershipTransferFu
 		future.respond(ErrLeadershipLost)
 		return
 	}
-	lastIdx := len(cm.log) - 1
+	lastIdx := cm.lastLogIndex
 	targetNextIdx := cm.nextIndex[targetID]
 	savedCurrentTerm := cm.currentTerm
 	cm.mu.Unlock()
@@ -1670,9 +1713,10 @@ func (cm *ConsensusModule) sendBatch(start, end int) {
 				break
 			}
 		}
-		if idx >= len(cm.log) {
+		if idx > cm.lastLogIndex {
 			continue
 		}
+		// FIXME(compact): cm.log[idx] по позиции, не по индексу.
 		log := &cm.log[idx]
 		batch = append(batch, &commitTuple{log: log, future: future})
 	}
@@ -1699,7 +1743,7 @@ func (cm *ConsensusModule) dispatchLogs(applyLogs []*logFuture) {
 	// Продвигаем commitIndex через commitmentTracker.
 	// Для single-node кластера это приводит к немедленному коммиту.
 	// Для multi-node кластера учитываются matchIndex всех peer-ов.
-	cm.commitmentTracker.commit(len(cm.log)-1, cm.lookupTerm)
+	cm.commitmentTracker.commit(cm.lastLogIndex, cm.lookupTerm)
 	savedCommitIndex := cm.commitIndex
 	if newCommitIndex := cm.commitmentTracker.getCommitIndex(); newCommitIndex > cm.commitIndex {
 		cm.dLogf("leader sets commitIndex := %d", newCommitIndex)
@@ -1717,7 +1761,7 @@ func (cm *ConsensusModule) dispatchLogs(applyLogs []*logFuture) {
 // Вызывающий должен удерживать cm.mu.
 func (cm *ConsensusModule) dispatchLogsUnsafe(applyLogs []*logFuture) {
 	term := cm.currentTerm
-	lastIndex := len(cm.log) - 1
+	lastIndex := cm.lastLogIndex
 	now := time.Now()
 	for _, f := range applyLogs {
 		f.dispatch = now
@@ -1726,6 +1770,7 @@ func (cm *ConsensusModule) dispatchLogsUnsafe(applyLogs []*logFuture) {
 		f.log.Term = term
 		cm.log = append(cm.log, f.log)
 	}
+	cm.setLastLog(lastIndex, term)
 	cm.persistToStorage()
 	cm.matchIndex[cm.id] = lastIndex
 
@@ -2016,14 +2061,14 @@ func (cm *ConsensusModule) appendConfigurationEntry(future *configurationChangeF
 
 	entry := &logFuture{
 		log: LogEntry{
-			Type:    LogConfiguration,
-			Command: data,
+			Type: LogConfiguration,
+			Data: data,
 		},
 	}
 	entry.init(cm.shutdownCh)
 
 	cm.configurations.latest = nextCfg
-	cm.configurations.latestIndex = len(cm.log)
+	cm.configurations.latestIndex = cm.lastLogIndex + 1
 
 	cm.dispatchLogsUnsafe([]*logFuture{entry})
 	cm.configurations.latestIndex = entry.log.Index
@@ -2031,7 +2076,7 @@ func (cm *ConsensusModule) appendConfigurationEntry(future *configurationChangeF
 
 	cm.commitmentTracker.setConfiguration(voterIDs(nextCfg), cm.lookupTerm)
 
-	cm.commitmentTracker.commit(len(cm.log)-1, cm.lookupTerm)
+	cm.commitmentTracker.commit(cm.lastLogIndex, cm.lookupTerm)
 	savedCommitIndex := cm.commitIndex
 	if newCI := cm.commitmentTracker.getCommitIndex(); newCI > cm.commitIndex {
 		cm.dLogf("leader sets commitIndex := %d", newCI)
@@ -2083,7 +2128,7 @@ func (cm *ConsensusModule) startStopReplication(cfg Configuration) {
 			continue
 		}
 		if _, ok := cm.nextIndex[peerID]; !ok {
-			cm.nextIndex[peerID] = len(cm.log)
+			cm.nextIndex[peerID] = cm.lastLogIndex + 1
 			cm.matchIndex[peerID] = -1
 		}
 	}
@@ -2095,11 +2140,11 @@ func (cm *ConsensusModule) rebuildConfigurations() {
 	cm.setInitialConfiguration()
 	for i, entry := range cm.log {
 		if entry.Type == LogConfiguration {
-			entryCmd, ok := entry.Command.([]byte)
+			entryData, ok := entry.Data.([]byte)
 			if !ok {
 				continue
 			}
-			cfg, err := DecodeConfiguration(entryCmd)
+			cfg, err := DecodeConfiguration(entryData)
 			if err != nil {
 				continue
 			}
@@ -2114,11 +2159,11 @@ func (cm *ConsensusModule) rebuildConfigurations() {
 // processConfigurationLogEntry обрабатывает LogConfiguration запись
 // на follower при репликации.
 func (cm *ConsensusModule) processConfigurationLogEntry(entry *LogEntry) {
-	entryCmd, ok := entry.Command.([]byte)
+	entryData, ok := entry.Data.([]byte)
 	if !ok {
 		return
 	}
-	cfg, err := DecodeConfiguration(entryCmd)
+	cfg, err := DecodeConfiguration(entryData)
 	if err != nil {
 		return
 	}

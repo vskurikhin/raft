@@ -21,9 +21,9 @@ func (f *CommitChannelFSM) Apply(log *LogEntry) any {
 		return nil
 	}
 	f.commitChan <- CommitEntry{
-		Command: log.Command,
-		Index:   log.Index,
-		Term:    log.Term,
+		Data:  log.Data,
+		Index: log.Index,
+		Term:  log.Term,
 	}
 	return nil
 }
