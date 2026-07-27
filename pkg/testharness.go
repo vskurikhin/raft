@@ -334,6 +334,24 @@ func (h *Harness) CheckGetTimesOut(c *kvclient.KVClient, key string) {
 	}
 }
 
+// WaitForKeyValue ждёт, пока Get(key) не вернется с ожидаемым значением
+// expectedValue или до истечения таймаута 2s. При таймауте вызывает
+// h.CheckGet, который завершит тест с Fatal.
+func (h *Harness) WaitForKeyValue(c *kvclient.KVClient, key, expectedValue string) {
+	h.t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		ctx, cancel := context.WithTimeout(h.ctx, 500*raft.Quantum*time.Millisecond)
+		val, _, err := c.Get(ctx, key)
+		cancel()
+		if err == nil && val == expectedValue {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	h.CheckGet(c, key, expectedValue)
+}
+
 func tlog(format string, a ...any) {
 	format = "[TEST] " + format
 	log.Printf(format, a...)

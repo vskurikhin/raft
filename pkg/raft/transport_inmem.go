@@ -128,9 +128,44 @@ func (t *InmemTransport) RequestVote(peerID ServerID, args RequestVoteArgs) (Req
 	}
 }
 
-// RequestPreVote отправляет PreVote RPC. Не реализован.
-func (t *InmemTransport) RequestPreVote(_ ServerID, _ RequestPreVoteArgs) (RequestPreVoteReply, error) {
-	return RequestPreVoteReply{}, ErrNotImplemented
+// RequestPreVote отправляет PreVote RPC узлу peerID.
+// Семантика ошибок и таймаут аналогичны RequestVote.
+func (t *InmemTransport) RequestPreVote(peerID ServerID, args RequestPreVoteArgs) (RequestPreVoteReply, error) {
+	var zero RequestPreVoteReply
+	select {
+	case <-t.shutdownCh:
+		return zero, ErrRaftShutdown
+	default:
+	}
+	peer, err := t.getPeer(peerID)
+	if err != nil {
+		return zero, err
+	}
+	respCh := make(chan RPCResponse, 1)
+	select {
+	case peer.consumerCh <- RPC{Command: &args, RespChan: respCh}:
+	case <-t.shutdownCh:
+		return zero, ErrRaftShutdown
+	case <-peer.shutdownCh:
+		return zero, ErrRaftShutdown
+	}
+	select {
+	case resp := <-respCh:
+		if resp.Error != nil {
+			return zero, resp.Error
+		}
+		reply, ok := resp.Reply.(*RequestPreVoteReply)
+		if !ok {
+			return zero, fmt.Errorf("raft: unexpected reply type %T", resp.Reply)
+		}
+		return *reply, nil
+	case <-peer.shutdownCh:
+		return zero, ErrRaftShutdown
+	case <-t.shutdownCh:
+		return zero, ErrRaftShutdown
+	case <-time.After(t.timeout):
+		return zero, ErrEnqueueTimeout
+	}
 }
 
 // TimeoutNow отправляет TimeoutNow RPC. Не реализован.

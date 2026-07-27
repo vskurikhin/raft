@@ -432,18 +432,12 @@ func TestInmemCloseConsumerDrain(t *testing.T) {
 }
 
 // TestInmemStubsReturnNotImplemented проверяет, что stub-методы
-// возвращают ErrNotImplemented.
+// возвращают ErrNotImplemented. RequestPreVote не проверяется —
+// он реализован для InmemTransport.
 func TestInmemStubsReturnNotImplemented(t *testing.T) {
 	defer leaktest.CheckTimeout(t, time.Second)()
 	trans := NewInmemTransport("test")
 	defer trans.Close()
-
-	t.Run("RequestPreVote", func(t *testing.T) {
-		_, err := trans.RequestPreVote(1, RequestPreVoteArgs{})
-		if err != ErrNotImplemented {
-			t.Fatalf("want ErrNotImplemented, got %v", err)
-		}
-	})
 	t.Run("TimeoutNow", func(t *testing.T) {
 		_, err := trans.TimeoutNow(1, TimeoutNowArgs{})
 		if err != ErrNotImplemented {

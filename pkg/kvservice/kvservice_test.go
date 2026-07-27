@@ -3,7 +3,6 @@ package kvservice
 import (
 	"net"
 	"testing"
-	"time"
 
 	"github.com/vskurikhin/raft/pkg/raft"
 )
@@ -77,14 +76,5 @@ func TestConnectToRaftPeer(t *testing.T) {
 	// Повторное подключение не должно вызывать ошибку
 	if err := kvs0.ConnectToRaftPeer(1, addr1); err != nil {
 		t.Fatalf("re-connect should not fail: %v", err)
-	}
-}
-
-func TestConnectToRaftPeerWithTimeoutValue(t *testing.T) {
-	// Проверяем, что ConnectToRaftPeer использует ConnectToPeerWithTimeout
-	// с ожидаемым таймаутом 2*Quantum секунд
-	expectedTimeout := 2 * raft.Quantum * time.Second
-	if expectedTimeout != 4*time.Second {
-		t.Fatalf("expected timeout 4s, got %v", expectedTimeout)
 	}
 }

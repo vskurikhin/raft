@@ -3,6 +3,7 @@ package raft
 import (
 	"bytes"
 	"container/list"
+	"context"
 	"encoding/gob"
 	"fmt"
 	"log"
@@ -20,10 +21,10 @@ const (
 	// Значение 3. Совместимость с версиями 0, 1 и 2 не поддерживается.
 	ProtocolVersion = 3
 
-	Quantum             = 2
-	HeartbeatTimeoutMs  = 50 * Quantum
-	ReelectionTimeoutMs = 150 * Quantum
-	TickerTimeoutMs     = 10 * Quantum
+	Quantum             = 1
+	HeartbeatTimeoutMs  = 17 * Quantum
+	ReelectionTimeoutMs = 127 * Quantum
+	TickerTimeoutMs     = 11 * Quantum
 
 	DebugCM = 1
 )
@@ -46,6 +47,7 @@ type CMState int
 
 const (
 	Follower CMState = iota
+	PreCandidate
 	Candidate
 	Leader
 	Dead
@@ -55,6 +57,8 @@ func (s CMState) String() string {
 	switch s {
 	case Follower:
 		return "Follower"
+	case PreCandidate:
+		return "PreCandidate"
 	case Candidate:
 		return "Candidate"
 	case Leader:
@@ -146,6 +150,20 @@ type ConsensusModule struct {
 	matchIndex map[int]int
 
 	configurations configurations
+
+	// preVoteDisabled отключает механизм Pre-Vote.
+	// Если true, выборы начинаются сразу (как в классическом Raft).
+	// По умолчанию false — Pre-Vote включён.
+	preVoteDisabled bool
+
+	// leaderLastContact — время последнего успешного AppendEntries от лидера.
+	// Используется в RequestPreVote для проверки: если недавно был контакт с
+	// лидером, Pre-Vote отклоняется.
+	leaderLastContact time.Time
+
+	// leaderID — ID текущего лидера (если известен).
+	// Устанавливается при получении AppendEntries от лидера.
+	leaderID int
 }
 
 // NewConsensusModule создаёт новый экземпляр CM.
@@ -181,6 +199,9 @@ func NewConsensusModule(
 	cm.nextIndex = make(map[int]int)
 	cm.matchIndex = make(map[int]int)
 	cm.electionTimerDone = make(chan struct{})
+	cm.preVoteDisabled = false
+	cm.leaderLastContact = time.Time{}
+	cm.leaderID = -1
 
 	if cm.storage.HasData() {
 		cm.restoreFromStorage()
@@ -231,6 +252,10 @@ func (cm *ConsensusModule) runRPCReader() {
 			case *AppendEntriesArgs:
 				var reply AppendEntriesReply
 				err := cm.AppendEntries(*cmd, &reply)
+				rpc.RespChan <- RPCResponse{Reply: &reply, Error: err}
+			case *RequestPreVoteArgs:
+				var reply RequestPreVoteReply
+				err := cm.RequestPreVote(*cmd, &reply)
 				rpc.RespChan <- RPCResponse{Reply: &reply, Error: err}
 			default:
 				rpc.RespChan <- RPCResponse{Error: ErrNotImplemented}
@@ -339,6 +364,31 @@ func (r *RequestVoteReply) GetRPCHeader() RPCHeader {
 	return r.RPCHeader
 }
 
+// RequestPreVoteArgs — аргументы RPC предварительного голосования (§4 Pre-Vote).
+// PreVote НЕ увеличивает currentTerm, НЕ меняет votedFor, НЕ персистится.
+// Получатель проверяет только актуальность лога (log-safety) и наличие активного лидера.
+type RequestPreVoteArgs struct {
+	RPCHeader
+	Term         int
+	LastLogIndex int
+	LastLogTerm  int
+}
+
+func (r *RequestPreVoteArgs) GetRPCHeader() RPCHeader {
+	return r.RPCHeader
+}
+
+// RequestPreVoteReply — ответ на RequestPreVote RPC.
+type RequestPreVoteReply struct {
+	RPCHeader
+	Term        int
+	VoteGranted bool
+}
+
+func (r *RequestPreVoteReply) GetRPCHeader() RPCHeader {
+	return r.RPCHeader
+}
+
 // RequestVote RPC.
 func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
 	cm.mu.Lock()
@@ -379,6 +429,85 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 	reply.Term = cm.currentTerm
 	cm.persistToStorage()
 	cm.dLogf("... RequestVote reply: %+v", reply)
+	return nil
+}
+
+// RequestPreVote обрабатывает входящий PreVote RPC (§4 Pre-Vote).
+//
+// В отличие от RequestVote:
+//   - НЕ меняет votedFor, currentTerm
+//   - НЕ персистит состояние
+//   - НЕ переводит в Follower при args.Term > cm.currentTerm
+//   - Добавляет проверку: знает ли получатель о действующем лидере
+//
+// PreVote использует ту же log-safety проверку, что и RequestVote (§5.4.1).
+// Если получатель недавно получал heartbeat от лидера или отстаёт по логу —
+// PreVote отклоняется, чтобы предотвратить лишние выборы.
+func (cm *ConsensusModule) RequestPreVote(args RequestPreVoteArgs, reply *RequestPreVoteReply) error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	if cm.state == Dead {
+		return nil
+	}
+
+	if err := checkRPCHeader(&args); err != nil {
+		return err
+	}
+
+	lastLogIndex, lastLogTerm := cm.lastLogIndexAndTerm()
+	cm.dLogf(
+		"RequestPreVote: %+v [currentTerm=%d, log index/term=(%d, %d)]",
+		args, cm.currentTerm, lastLogIndex, lastLogTerm,
+	)
+
+	// Отклоняем PreVote, если отправитель не является voter'ом в текущей
+	// конфигурации. Это defense-in-depth: runPreCandidate уже фильтрует
+	// voter'ов на стороне отправителя, но получатель тоже должен проверять.
+	if !hasVote(cm.configurations.latest, args.GetRPCHeader().ServerID) {
+		cm.dLogf("... RequestPreVote denied: not a voter")
+		reply.RPCHeader = RPCHeader{
+			ProtocolVersion: ProtocolVersion,
+			ServerID:        cm.id,
+		}
+		reply.Term = cm.currentTerm
+		reply.VoteGranted = false
+		return nil
+	}
+
+	reply.RPCHeader = RPCHeader{
+		ProtocolVersion: ProtocolVersion,
+		ServerID:        cm.id,
+	}
+	reply.Term = cm.currentTerm
+	reply.VoteGranted = false
+
+	// Предлагаемый term должен быть не меньше текущего.
+	if args.Term < cm.currentTerm {
+		cm.dLogf("... RequestPreVote denied: older term")
+		return nil
+	}
+
+	// Отклоняем PreVote, если недавно был контакт с лидером (leaderLastContact
+	// обновлён в пределах election timeout). Это предотвращает выборы при
+	// кратковременных сетевых сбоях — кандидат явно не актуальный лидер.
+	if !cm.leaderLastContact.IsZero() {
+		leaderKnown := time.Since(cm.leaderLastContact) < cm.electionTimeout()
+		if leaderKnown && args.GetRPCHeader().ServerID != cm.leaderID {
+			cm.dLogf("... RequestPreVote denied: leader known")
+			return nil
+		}
+	}
+
+	// Log-safety: отклонить, если лог получателя новее лога кандидата.
+	if lastLogTerm > args.LastLogTerm ||
+		(lastLogTerm == args.LastLogTerm && lastLogIndex > args.LastLogIndex) {
+		cm.dLogf("... RequestPreVote denied: log is more up-to-date")
+		return nil
+	}
+
+	reply.VoteGranted = true
+	cm.dLogf("... RequestPreVote granted")
 	return nil
 }
 
@@ -437,6 +566,8 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 			cm.becomeFollower(args.Term)
 		}
 		cm.electionResetEvent = time.Now()
+		cm.leaderLastContact = time.Now()
+		cm.leaderID = args.LeaderID
 
 		// Проверяет, содержит ли наш журнал запись с индексом PrevLogIndex,
 		// у которой терм совпадает с PrevLogTerm.
@@ -570,16 +701,23 @@ func (cm *ConsensusModule) runElectionTimer() {
 				return
 			}
 
-			// Начать выборы, если в течение времени ожидания мы не получили
-			// сообщение от лидера или не проголосовали за кого-либо.
+			// Начать выборы (или Pre-Vote), если в течение времени ожидания мы
+			// не получили сообщение от лидера или не проголосовали за кого-либо.
 			if elapsed := time.Since(cm.electionResetEvent); elapsed >= timeoutDuration {
-				cm.startElection()
+				if cm.preVoteDisabled {
+					cm.startElection()
+					cm.mu.Unlock()
+					return
+				}
 				cm.mu.Unlock()
+				go cm.runPreCandidate()
 				return
 			}
 			cm.mu.Unlock()
 
 		case <-electionTimerDone:
+			return
+		case <-cm.shutdownCh:
 			return
 		}
 	}
@@ -652,7 +790,7 @@ func (cm *ConsensusModule) startElection() {
 				} else if reply.Term == cm.currentTerm {
 					if reply.VoteGranted {
 						votesReceived.Add(1)
-						if int(votesReceived.Load())*2 > voterCount {
+						if int(votesReceived.Load()) >= quorumSize(voterCount) {
 							// Выиграл выборы!
 							cm.dLogf("wins election with %d votes", votesReceived.Load())
 							cm.startLeader()
@@ -669,6 +807,177 @@ func (cm *ConsensusModule) startElection() {
 
 	// Запустить новый таймер выборов на случай, если текущие выборы не завершатся успешно.
 	go cm.runElectionTimer()
+}
+
+// runPreCandidate выполняет предварительное голосование (§4 Pre-Vote).
+//
+// Узел переходит в PreCandidate (не увеличивая currentTerm), отправляет
+// RequestPreVote всем voter'ам и собирает ответы. Если получен кворум
+// положительных ответов — вызывает startElection() для настоящих выборов.
+// Если кворум не получен или обнаружен более высокий term — возвращается
+// в Follower.
+//
+// Горутина завершается при:
+//   - получении кворума PreVote → вызов startElection()
+//   - истечении election timeout без кворума → becomeFollower()
+//   - обнаружении более высокого term от другого узла → becomeFollower()
+//
+// Вызывается из runElectionTimer(), когда preVoteDisabled == false.
+func (cm *ConsensusModule) runPreCandidate() {
+	cm.mu.Lock()
+	if cm.state != Follower && cm.state != PreCandidate {
+		cm.mu.Unlock()
+		return
+	}
+	cm.state = PreCandidate
+	cm.dLogf("becomes PreCandidate; term=%d, log=%v", cm.currentTerm, cm.log)
+
+	cfg := cm.configurations.latest
+	voters := voterIDs(cfg)
+	voterCount := len(voters)
+
+	// Одиночный узел: PreVote не нужен, сразу выборы.
+	if voterCount <= 1 {
+		cm.startElection()
+		cm.mu.Unlock()
+		return
+	}
+
+	proposedTerm := cm.currentTerm + 1
+	cm.mu.Unlock()
+
+	// Канал для сбора ответов.
+	preVoteRespCh := make(chan *RequestPreVoteReply, voterCount-1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Отправить RequestPreVote параллельно всем voter'ам (кроме себя).
+	for _, s := range cfg.ConfigServers {
+		peerID := int(s.ID)
+		if peerID == cm.id {
+			continue
+		}
+		if s.Suffrage != Voter {
+			continue
+		}
+		go func(peerID int) {
+			cm.mu.Lock()
+			lastLogIndex, lastLogTerm := cm.lastLogIndexAndTerm()
+			savedTerm := cm.currentTerm
+			cm.mu.Unlock()
+
+			args := RequestPreVoteArgs{
+				RPCHeader: RPCHeader{
+					ProtocolVersion: ProtocolVersion,
+					ServerID:        cm.id,
+				},
+				Term:         proposedTerm,
+				LastLogIndex: lastLogIndex,
+				LastLogTerm:  lastLogTerm,
+			}
+
+			cm.dLogf("sending RequestPreVote to %d: %+v", peerID, args)
+			reply, err := cm.transport.RequestPreVote(ServerID(peerID), args)
+			if err != nil {
+				cm.dLogf("RequestPreVote to %d failed: %v", peerID, err)
+				var resp *RequestPreVoteReply
+				if err == ErrNotImplemented {
+					// Если транспорт не поддерживает PreVote, считаем голос
+					// предоставленным (как в hashicorp/raft).
+					resp = &RequestPreVoteReply{
+						RPCHeader:   RPCHeader{ProtocolVersion: ProtocolVersion, ServerID: cm.id},
+						Term:        savedTerm,
+						VoteGranted: true,
+					}
+				} else {
+					resp = &RequestPreVoteReply{
+						RPCHeader:   RPCHeader{ProtocolVersion: ProtocolVersion, ServerID: cm.id},
+						Term:        savedTerm,
+						VoteGranted: false,
+					}
+				}
+				select {
+				case preVoteRespCh <- resp:
+				case <-ctx.Done():
+				}
+				return
+			}
+			select {
+			case preVoteRespCh <- &reply:
+			case <-ctx.Done():
+			}
+		}(peerID)
+	}
+
+	grantedVotes := 1 // голос за себя
+	neededVotes := quorumSize(voterCount)
+	votersResponded := 0
+	totalVoters := voterCount - 1
+
+	timeout := time.After(cm.electionTimeout())
+
+	// Собирать ответы от peer'ов.
+	for votersResponded < totalVoters {
+		select {
+		case reply := <-preVoteRespCh:
+			votersResponded++
+			cm.mu.Lock()
+			if cm.state != PreCandidate {
+				cm.dLogf("runPreCandidate: state changed to %s, bailing out", cm.state)
+				cm.mu.Unlock()
+				return
+			}
+			if reply.Term > cm.currentTerm {
+				cm.dLogf("runPreCandidate: found higher term %d", reply.Term)
+				cm.becomeFollower(reply.Term)
+				cm.mu.Unlock()
+				return
+			}
+			cm.mu.Unlock()
+			if reply.VoteGranted {
+				grantedVotes++
+				cm.dLogf("runPreCandidate: granted vote from peer, total=%d, needed=%d", grantedVotes, neededVotes)
+				if grantedVotes >= neededVotes {
+					// Jitter перед выборами, чтобы одновременно несколько узлов
+					// не перешли в Candidate с одинаковым term (split vote).
+					time.Sleep(time.Duration(rand.Intn(50)) * time.Millisecond)
+					cm.mu.Lock()
+					if cm.state == PreCandidate {
+						cm.dLogf("runPreCandidate: won pre-vote with %d votes, starting election", grantedVotes)
+						cm.startElection()
+					}
+					cm.mu.Unlock()
+					return
+				}
+			}
+		case <-timeout:
+			cm.mu.Lock()
+			if cm.state == PreCandidate {
+				cm.dLogf("runPreCandidate: pre-vote timeout, returning to follower")
+				cm.becomeFollower(cm.currentTerm)
+			}
+			cm.mu.Unlock()
+			return
+		case <-cm.shutdownCh:
+			return
+		}
+
+		// После обработки всех ответов пересчитать необходимые голоса.
+		if votersResponded >= totalVoters && grantedVotes < neededVotes {
+			cm.mu.Lock()
+			if cm.state == PreCandidate {
+				cm.dLogf("runPreCandidate: pre-vote lost (%d/%d), returning to follower", grantedVotes, neededVotes)
+				cm.becomeFollower(cm.currentTerm)
+			}
+			cm.mu.Unlock()
+			return
+		}
+	}
+}
+
+// quorumSize возвращает минимальное количество голосов для достижения кворума.
+func quorumSize(voterCount int) int {
+	return voterCount/2 + 1
 }
 
 // becomeFollower делает cm последователем и сбрасывает его состояние.
@@ -690,6 +999,8 @@ func (cm *ConsensusModule) becomeFollower(term int) {
 		cm.votedFor = -1
 		cm.persistToStorage()
 	}
+	cm.leaderLastContact = time.Time{}
+	cm.leaderID = -1
 	cm.electionResetEvent = time.Now()
 
 	select {
@@ -705,6 +1016,8 @@ func (cm *ConsensusModule) becomeFollower(term int) {
 // Ожидается, что cm.mu будет заблокирован.
 func (cm *ConsensusModule) startLeader() {
 	cm.state = Leader
+	cm.leaderLastContact = time.Now()
+	cm.leaderID = cm.id
 
 	cfg := cm.configurations.latest
 	for _, s := range cfg.ConfigServers {

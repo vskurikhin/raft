@@ -244,6 +244,16 @@ func (h *Harness) CheckSingleLeader() (int, int) {
 	return -1, -1
 }
 
+// GetTerm возвращает текущий term указанного сервера.
+// Используется в тестах для проверки стабильности term при Pre-Vote.
+func (h *Harness) GetTerm(serverID int) int {
+	id, term, _ := h.cluster[serverID].Report()
+	if id != serverID {
+		return -1
+	}
+	return term
+}
+
 // CheckNoLeader проверяет, что ни один из подключённых серверов
 // не считает себя лидером.
 func (h *Harness) CheckNoLeader() {
@@ -319,6 +329,33 @@ func (h *Harness) CheckCommittedN(cmd int, n int) {
 	if nc != n {
 		h.t.Errorf("CheckCommittedN got nc=%d, want %d", nc, n)
 	}
+}
+
+// WaitForCommit ждёт, пока команда cmd не будет зафиксирована
+// на n серверах (с таймаутом 500ms), затем проверяет фиксацию.
+func (h *Harness) WaitForCommit(cmd int, n int) {
+	h.t.Helper()
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		h.mu.Lock()
+		nc := 0
+		for i := 0; i < h.n; i++ {
+			if h.connected[i] {
+				for c := 0; c < len(h.commits[i]); c++ {
+					if h.commits[i][c].Command.(int) == cmd {
+						nc++
+						break
+					}
+				}
+			}
+		}
+		h.mu.Unlock()
+		if nc >= n {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	h.CheckCommittedN(cmd, n)
 }
 
 // CheckNotCommitted проверяет, что команда cmd ещё не зафиксирована.

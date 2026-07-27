@@ -6,7 +6,7 @@ import (
 )
 
 // ErrNotImplemented возвращается для RPC-методов, которые ещё не реализованы
-// (PreVote, TimeoutNow, InstallSnapshot, AppendEntriesPipeline).
+// (TimeoutNow, InstallSnapshot, AppendEntriesPipeline).
 var ErrNotImplemented = errors.New("raft: not implemented")
 
 // ErrNotReachable возвращается при попытке отправки RPC узлу, который не подключён
@@ -15,12 +15,6 @@ var ErrNotReachable = errors.New("raft: peer not reachable")
 
 // Заглушки для RPC-типов, которые будут реализованы в будущих фичах.
 // Определены здесь для компиляции Transport interface.
-
-// RequestPreVoteArgs — заглушка.
-type RequestPreVoteArgs struct{}
-
-// RequestPreVoteReply — заглушка.
-type RequestPreVoteReply struct{}
 
 // TimeoutNowArgs — заглушка.
 type TimeoutNowArgs struct{}

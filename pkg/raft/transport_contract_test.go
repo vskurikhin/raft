@@ -262,8 +262,15 @@ func TestTransportStubsReturnNotImplemented(t *testing.T) {
 			client, _, cleanup := tt.fn(t)
 			defer cleanup()
 
-			if _, err := client.RequestPreVote(1, RequestPreVoteArgs{}); err != ErrNotImplemented {
-				t.Fatalf("RequestPreVote: want ErrNotImplemented, got %v", err)
+			// RequestPreVote реализован только для InmemTransport.
+			if _, ok := client.(*InmemTransport); ok {
+				if _, err := client.RequestPreVote(1, RequestPreVoteArgs{}); err == nil || err == ErrNotImplemented {
+					t.Fatalf("RequestPreVote: want transport error, got %v", err)
+				}
+			} else {
+				if _, err := client.RequestPreVote(1, RequestPreVoteArgs{}); err != ErrNotImplemented {
+					t.Fatalf("RequestPreVote: want ErrNotImplemented, got %v", err)
+				}
 			}
 			if _, err := client.TimeoutNow(1, TimeoutNowArgs{}); err != ErrNotImplemented {
 				t.Fatalf("TimeoutNow: want ErrNotImplemented, got %v", err)

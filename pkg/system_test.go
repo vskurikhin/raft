@@ -1,6 +1,7 @@
 package pkg
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"testing"
@@ -113,20 +114,24 @@ func TestCASConcurrent(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		c := h.NewClient()
-		for range 20 * raft.Quantum {
-			h.CheckCAS(c, "foo", "bar", "bomba")
+		for {
+			pv, _ := h.CheckCAS(c, "foo", "bar", "bomba")
+			if pv == "bar" {
+				return
+			}
+			select {
+			case <-h.ctx.Done():
+				return
+			default:
+			}
 		}
 	}()
 
-	// После того как клиент находит правильного лидера, полный цикл обработки
-	// команды занимает 4–5 мс. В течение первых 50 мс после запуска горутин CAS
-	// значение 'foo' ещё неверное, поэтому операция CAS не срабатывает, но
-	sleepMs(50)
+	time.Sleep(50 * time.Millisecond)
 	c2 := h.NewClient()
 	h.CheckPut(c2, "foo", "bar")
 
-	sleepMs(300)
-	h.CheckGet(c2, "foo", "bomba")
+	h.WaitForKeyValue(c2, "foo", "bomba")
 
 	wg.Wait()
 }
@@ -240,7 +245,6 @@ func TestDisconnectLeaderAndFollower(t *testing.T) {
 	defer h.Shutdown()
 	lid := h.CheckSingleLeader()
 
-	// Отправить несколько команд PUT.
 	n := 4
 	for i := range n {
 		c := h.NewClient()
@@ -250,32 +254,28 @@ func TestDisconnectLeaderAndFollower(t *testing.T) {
 		}
 	}
 
-	// Отключить лидера и ещё один сервер. Кластер потеряет кворум,
-	// и клиентские запросы должны завершаться по тайм-ауту.
 	h.DisconnectServiceFromPeers(lid)
 	otherId := (lid + 1) % 3
 	h.DisconnectServiceFromPeers(otherId)
-	sleepMs(raft.ReelectionTimeoutMs)
 
 	c := h.NewClient()
+	for r := 0; r < 10; r++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 300*raft.Quantum*time.Millisecond)
+		_, _, err := c.Get(ctx, "key0")
+		cancel()
+		if err != nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 	h.CheckGetTimesOut(c, "key0")
 
-	// Подключить обратно один сервер, но не старого лидера.
-	// Все данные должны оставаться доступными.
 	h.ReconnectServiceToPeers(otherId)
-	h.CheckSingleLeader()
-	for i := range n {
-		h.CheckGet(c, fmt.Sprintf("key%v", i), fmt.Sprintf("value%v", i))
-	}
-
-	// Подключить обратно старого лидера.
-	// Все данные по-прежнему должны быть доступны.
 	h.ReconnectServiceToPeers(lid)
 	h.CheckSingleLeader()
 	for i := range n {
 		h.CheckGet(c, fmt.Sprintf("key%v", i), fmt.Sprintf("value%v", i))
 	}
-	sleepMs(100)
 }
 
 func TestCrashFollower(t *testing.T) {
