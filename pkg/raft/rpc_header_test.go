@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"io"
 	"testing"
 	"time"
 
@@ -11,6 +12,13 @@ import (
 type NoopFSM struct{}
 
 func (NoopFSM) Apply(*LogEntry) any { return nil }
+func (NoopFSM) Snapshot() (FSMSnapshot, error) {
+	return nil, ErrNotImplemented
+}
+
+func (NoopFSM) Restore(_ io.ReadCloser) error {
+	return ErrNotImplemented
+}
 
 // testWithHeader — вспомогательный тип для теста checkRPCHeader.
 type testWithHeader struct {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/gob"
 	"errors"
+	"io"
 	"sync"
 	"testing"
 	"time"
@@ -180,6 +181,14 @@ func (f *CaptureFSM) Entries() []LogEntry {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]LogEntry{}, f.entries...)
+}
+
+func (f *CaptureFSM) Snapshot() (FSMSnapshot, error) {
+	return nil, ErrNotImplemented
+}
+
+func (f *CaptureFSM) Restore(_ io.ReadCloser) error {
+	return ErrNotImplemented
 }
 
 // captureCommitFSM отправляет данные и в CaptureFSM, и в CommitChannelFSM.
@@ -446,7 +455,7 @@ func TestFutureNoGoroutineLeak(t *testing.T) {
 
 	waitForLeader(t, cm, 800*time.Millisecond)
 	future := cm.Apply("leaktest", 0)
-	future.Error()
+	_ = future.Error()
 }
 
 func TestFutureErrorNoLeak(t *testing.T) {
@@ -459,7 +468,7 @@ func TestFutureErrorNoLeak(t *testing.T) {
 	followerId := (leaderId + 1) % 3
 
 	future := h.cluster[followerId].Apply("leaktest", 0)
-	future.Error()
+	_ = future.Error()
 }
 
 func TestBatchApplyOrderAndIndices(t *testing.T) {
@@ -614,7 +623,7 @@ func BenchmarkApply(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		future := cm.Apply(i, 0)
-		future.Error()
+		_ = future.Error()
 	}
 }
 
@@ -629,7 +638,7 @@ func BenchmarkBatchApply(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			future := cm.Apply("cmd", 0)
-			future.Error()
+			_ = future.Error()
 		}
 	})
 }

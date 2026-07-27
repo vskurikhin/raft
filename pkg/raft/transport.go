@@ -26,11 +26,32 @@ type TimeoutNowResponse struct {
 	Term    int
 }
 
-// InstallSnapshotRequest — заглушка.
-type InstallSnapshotRequest struct{}
+// InstallSnapshotRequest — запрос на установку снэпшота от лидера.
+type InstallSnapshotRequest struct {
+	RPCHeader
+	Term          int
+	LeaderID      int
+	LastLogIndex  int
+	LastLogTerm   int
+	Configuration []byte
+	ConfigIndex   int
+	DataSize      int64
+}
 
-// InstallSnapshotResponse — заглушка.
-type InstallSnapshotResponse struct{}
+func (r *InstallSnapshotRequest) GetRPCHeader() RPCHeader {
+	return r.RPCHeader
+}
+
+// InstallSnapshotResponse — ответ на установку снэпшота.
+type InstallSnapshotResponse struct {
+	RPCHeader
+	Term    int
+	Success bool
+}
+
+func (r *InstallSnapshotResponse) GetRPCHeader() RPCHeader {
+	return r.RPCHeader
+}
 
 // ServerID — тип для идентификатора (ID) сервера в кластере Raft.
 type ServerID int

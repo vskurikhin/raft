@@ -2,6 +2,7 @@ package raft
 
 import (
 	"errors"
+	"io"
 	"sync"
 	"time"
 )
@@ -13,6 +14,14 @@ var (
 	ErrEnqueueTimeout               = errors.New("raft: timeout enqueuing operation")
 	ErrUnsupportedProtocol          = errors.New("raft: unsupported protocol version")
 	ErrLeadershipTransferInProgress = errors.New("raft: leadership transfer in progress")
+
+	// ErrNothingNewToSnapshot возвращается, когда нет новых закоммиченных
+	// записей для создания снэпшота.
+	ErrNothingNewToSnapshot = errors.New("raft: nothing new to snapshot")
+
+	// ErrAbortedByRestore возвращается лидером, когда операция прервана
+	// восстановлением из снэпшота.
+	ErrAbortedByRestore = errors.New("raft: snapshot restored while committing log")
 )
 
 // Future представляет асинхронную операцию Raft.
@@ -123,3 +132,24 @@ func (e errorFuture) Error() error                 { return e.err }
 func (e errorFuture) Index() int                   { return 0 }
 func (e errorFuture) Response() any                { return nil }
 func (e errorFuture) Configuration() Configuration { return Configuration{} }
+
+// reqSnapshotFuture — внутренний future для запроса снэпшота у runFSM.
+type reqSnapshotFuture struct {
+	deferError
+	index    int
+	term     int
+	snapshot FSMSnapshot
+}
+
+// restoreFuture — future для восстановления из снэпшота на runFSM.
+type restoreFuture struct {
+	deferError
+	meta   *SnapshotMeta
+	reader io.ReadCloser
+}
+
+// SnapshotFuture — публичный future для пользовательского Snapshot().
+type SnapshotFuture struct {
+	deferError
+	index int
+}

@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"io"
 	"testing"
 	"time"
 )
@@ -8,8 +9,16 @@ import (
 // NoOpFSM — пустая реализация FSM для тестов.
 type NoOpFSM struct{}
 
-func (f NoOpFSM) Apply(entry *LogEntry) any {
+func (f NoOpFSM) Apply(_ *LogEntry) any {
 	return nil
+}
+
+func (f NoOpFSM) Snapshot() (FSMSnapshot, error) {
+	return nil, ErrNotImplemented
+}
+
+func (f NoOpFSM) Restore(_ io.ReadCloser) error {
+	return ErrNotImplemented
 }
 
 // tcpHarness — минимальный тестовый стенд для TCP-кластера Raft.

@@ -80,7 +80,7 @@ func NewHarness(t *testing.T, n int) *Harness {
 	for i := range n {
 		for j := range n {
 			if i != j {
-				kvss[i].ConnectToRaftPeer(j, kvss[j].GetRaftListenAddr())
+				_ = kvss[i].ConnectToRaftPeer(j, kvss[j].GetRaftListenAddr())
 			}
 		}
 		connected[i] = true
@@ -117,7 +117,7 @@ func (h *Harness) DisconnectServiceFromPeers(id int) {
 	h.kvCluster[id].DisconnectFromAllRaftPeers()
 	for j := 0; j < h.n; j++ {
 		if j != id {
-			h.kvCluster[j].DisconnectFromRaftPeer(id)
+			_ = h.kvCluster[j].DisconnectFromRaftPeer(id)
 		}
 	}
 	h.connected[id] = false

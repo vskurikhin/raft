@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/gob"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -97,6 +98,39 @@ func (kvs *KVService) Apply(log *raft.LogEntry) any {
 
 	return cmd
 }
+
+// Snapshot реализует raft.FSM.Snapshot.
+// Возвращает снимок текущего состояния DataStore.
+func (kvs *KVService) Snapshot() (raft.FSMSnapshot, error) {
+	data, err := kvs.ds.Snapshot()
+	if err != nil {
+		return nil, err
+	}
+	return &kvSnapshot{data: data}, nil
+}
+
+// Restore реализует raft.FSM.Restore.
+// Восстанавливает состояние DataStore из снэпшота.
+func (kvs *KVService) Restore(reader io.ReadCloser) error {
+	defer reader.Close()
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return err
+	}
+	return kvs.ds.Restore(data)
+}
+
+// kvSnapshot — снимок состояния KVService для raft.FSMSnapshot.
+type kvSnapshot struct {
+	data []byte
+}
+
+func (s *kvSnapshot) Persist(sink raft.SnapshotSink) error {
+	_, err := sink.Write(s.data)
+	return err
+}
+
+func (s *kvSnapshot) Release() {}
 
 // ApplyBatch реализует интерфейс raft.BatchingFSM. Вызывается Raft'ом
 // для группового применения закоммиченных записей журнала. Каждая запись

@@ -6,11 +6,13 @@ import (
 	"context"
 	"encoding/gob"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"math/rand"
 	"os"
 	"slices"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -86,7 +88,25 @@ const (
 // собрать до 64 команд перед отправкой одного AppendEntries RPC,
 // что снижает количество RPC-вызовов без значительного увеличения
 // времени ожидания.
-var maxApplyBatchSize = 64
+var maxApplyBatchSize = 128
+
+// defaultSnapshotThreshold — минимальное количество записей после
+// последнего снэпшота, при котором создаётся новый снэпшот.
+// Значение 1024 выбрано как компромисс: частые снэпшоты создают
+// нагрузку на FSM.Snapshot(), редкие — увеличивают время восстановления
+// и объём журнала, который нужно передавать отстающим узлам.
+const defaultSnapshotThreshold = 1024
+
+// defaultSnapshotInterval — интервал проверки необходимости снэпшота.
+// Каждые 15 секунд runSnapshots проверяет, не превышен ли порог
+// defaultSnapshotThreshold.
+const defaultSnapshotInterval = 5 * time.Second
+
+// defaultTrailingLogs — количество записей журнала, сохраняемых
+// после самого свежего снэпшота. Нужно для поддержки репликации
+// без отправки полного снэпшота каждому новому follower.
+// Значение 128 — разумный минимум для большинства сценариев.
+const defaultTrailingLogs = 64
 
 type LogEntry struct {
 	Index int
@@ -189,11 +209,43 @@ type ConsensusModule struct {
 	//   — обработку RequestVote (голосуем даже при известном лидере)
 	//   — обработку AppendEntries (не step-down от старого лидера)
 	candidateFromLeadershipTransfer atomic.Bool
+
+	// snapshotStore — хранилище снэпшотов. Если nil, снэпшоты отключены.
+	snapshotStore SnapshotStore
+
+	// lastSnapshotIndex — индекс последнего созданного снэпшота.
+	// Инициализируется как -1 (нет снэпшота).
+	lastSnapshotIndex int
+
+	// lastSnapshotTerm — терм последнего созданного снэпшота.
+	lastSnapshotTerm int
+
+	// snapshotInterval — интервал проверки необходимости снэпшота.
+	snapshotInterval time.Duration
+
+	// snapshotThreshold — минимальное количество записей после
+	// последнего снэпшота для создания нового.
+	snapshotThreshold int
+
+	// trailingLogs — количество записей журнала, сохраняемых после
+	// последнего снэпшота.
+	trailingLogs int
+
+	// snapshotCh — канал для сигнала runSnapshots о необходимости
+	// проверки создания снэпшота. Буферизирован (cap=1).
+	snapshotCh chan struct{}
+
+	// fsmSnapshotCh — небуферизированный канал для запроса снэпшота у runFSM.
+	fsmSnapshotCh chan *reqSnapshotFuture
+
+	// restoreCh — канал для восстановления из снэпшота.
+	restoreCh chan *restoreFuture
 }
 
 // NewConsensusModule создаёт новый экземпляр CM.
 // fsm — машина состояний клиента, к которой применяются закоммиченные записи.
 // ready уведомляет CM, что все соседи подключены.
+// snapshots — хранилище снэпшотов; если nil, снэпшоты отключены.
 func NewConsensusModule(
 	id int,
 	peerIds []int,
@@ -201,6 +253,7 @@ func NewConsensusModule(
 	storage Storage,
 	fsm FSM,
 	ready <-chan any,
+	snapshots ...SnapshotStore,
 ) *ConsensusModule {
 	cm := new(ConsensusModule)
 	cm.id = id
@@ -231,6 +284,19 @@ func NewConsensusModule(
 	cm.leaderID = -1
 	cm.leadershipTransferCh = make(chan *leadershipTransferFuture, 1)
 
+	// Инициализация snapshot-полей.
+	cm.lastSnapshotIndex = -1
+	cm.lastSnapshotTerm = -1
+	if len(snapshots) > 0 && snapshots[0] != nil {
+		cm.snapshotStore = snapshots[0]
+		cm.snapshotThreshold = defaultSnapshotThreshold
+		cm.snapshotInterval = defaultSnapshotInterval
+		cm.trailingLogs = defaultTrailingLogs
+		cm.snapshotCh = make(chan struct{}, 1)
+		cm.fsmSnapshotCh = make(chan *reqSnapshotFuture)
+		cm.restoreCh = make(chan *restoreFuture)
+	}
+
 	if cm.storage.HasData() {
 		cm.restoreFromStorage()
 	}
@@ -243,6 +309,10 @@ func NewConsensusModule(
 
 	go cm.runFSM()
 	go cm.runRPCReader()
+
+	if cm.snapshotStore != nil {
+		go cm.runSnapshots()
+	}
 
 	go func() {
 		<-ready
@@ -287,6 +357,8 @@ func (cm *ConsensusModule) runRPCReader() {
 				rpc.RespChan <- RPCResponse{Reply: &reply, Error: err}
 			case *TimeoutNowRequest:
 				cm.timeoutNow(rpc, cmd)
+			case *InstallSnapshotRequest:
+				cm.handleInstallSnapshot(rpc, cmd)
 			default:
 				rpc.RespChan <- RPCResponse{Error: ErrNotImplemented}
 			}
@@ -296,14 +368,17 @@ func (cm *ConsensusModule) runRPCReader() {
 	}
 }
 
-// Stop останавливает этот CM.
+// Stop останавливает этот CM. Безопасен для многократного вызова.
 func (cm *ConsensusModule) Stop() {
-	cm.dLogf("CM.Stop called")
 	cm.mu.Lock()
+	if cm.state == Dead {
+		cm.mu.Unlock()
+		return
+	}
 	cm.state = Dead
 	cm.mu.Unlock()
-	cm.dLogf("becomes Dead")
 
+	cm.dLogf("CM.Stop called / becomes Dead")
 	close(cm.shutdownCh)
 }
 
@@ -338,6 +413,19 @@ func (cm *ConsensusModule) restoreFromStorage() {
 	cm.rebuildLastLog()
 
 	cm.rebuildConfigurations()
+
+	if snapIdxData, found := cm.storage.Get("lastSnapshotIndex"); found {
+		d := gob.NewDecoder(bytes.NewBuffer(snapIdxData))
+		if err := d.Decode(&cm.lastSnapshotIndex); err != nil {
+			log.Fatal(err)
+		}
+	}
+	if snapTermData, found := cm.storage.Get("lastSnapshotTerm"); found {
+		d := gob.NewDecoder(bytes.NewBuffer(snapTermData))
+		if err := d.Decode(&cm.lastSnapshotTerm); err != nil {
+			log.Fatal(err)
+		}
+	}
 }
 
 // dLogf выводит отладочное сообщение, если DebugCM > 0.
@@ -666,16 +754,18 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 			reply.Success = true
 
 			// Находит точку вставки — место, где происходит несовпадение термов
-			// между существующими записями журнала, начиная с PrevLogIndex+1,t
+			// между существующими записями журнала, начиная с PrevLogIndex+1,
 			// и новыми записями, отправленными лидером через RPC.
+			// Используем logPosition для поиска позиции в срезе после компактирования.
 			logInsertIndex := args.PrevLogIndex + 1
+			logInsertPos := cm.logPosition(logInsertIndex)
 			newEntriesIndex := 0
 
-			// FIXME(compact): cm.log[logInsertIndex] по позиции, не по индексу.
-			for logInsertIndex < len(cm.log) && newEntriesIndex < len(args.Entries) {
-				if cm.log[logInsertIndex].Term != args.Entries[newEntriesIndex].Term {
+			for logInsertPos < len(cm.log) && newEntriesIndex < len(args.Entries) {
+				if cm.log[logInsertPos].Term != args.Entries[newEntriesIndex].Term {
 					break
 				}
+				logInsertPos++
 				logInsertIndex++
 				newEntriesIndex++
 			}
@@ -686,7 +776,7 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 			//   или на индекс, где терм записи отличается от соответствующей записи журнала.
 			if newEntriesIndex < len(args.Entries) {
 				cm.dLogf("... inserting entries %v from index %d", args.Entries[newEntriesIndex:], logInsertIndex)
-				cm.log = append(cm.log[:logInsertIndex], args.Entries[newEntriesIndex:]...)
+				cm.log = append(cm.log[:logInsertPos], args.Entries[newEntriesIndex:]...)
 				cm.dLogf("... log is now: %v", cm.log)
 				cm.rebuildLastLog()
 				// Если перезапись затронула конфигурацию, откатываем latest.
@@ -717,14 +807,15 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 			} else {
 				reply.ConflictTerm = cm.lookupTerm(args.PrevLogIndex)
 
-				var i int
-				// FIXME(compact): искать по cm.log[i].Index, не по позиции.
-				for i = args.PrevLogIndex - 1; i >= 0; i-- {
-					if cm.log[i].Term != reply.ConflictTerm {
-						break
-					}
+				// Ищем первую запись с данным термом, двигаясь назад от PrevLogIndex.
+				// Используем бинарный поиск вместо линейного, так как лог может
+				// быть компактирован, и prevLogIndex может быть вне среза.
+				pos := cm.logPosition(args.PrevLogIndex)
+				i := pos - 1
+				for i >= 0 && cm.log[i].Term == reply.ConflictTerm {
+					i--
 				}
-				reply.ConflictIndex = i + 1
+				reply.ConflictIndex = cm.log[i+1].Index
 			}
 		}
 	}
@@ -1178,8 +1269,8 @@ func (cm *ConsensusModule) nextIndexArgsEntries(peerID, savedCurrentTerm int) (i
 	}
 	var entries []LogEntry
 	if ni <= cm.lastLogIndex {
-		// FIXME(compact): cm.log[ni:] предполагает, что ni == позиция в срезе.
-		entries = append([]LogEntry{}, cm.log[ni:]...)
+		pos := cm.logPosition(ni)
+		entries = append([]LogEntry{}, cm.log[pos:]...)
 	} else {
 		entries = nil
 	}
@@ -1205,6 +1296,16 @@ func (cm *ConsensusModule) nextIndexArgsEntries(peerID, savedCurrentTerm int) (i
 // peerID — идентификатор получателя, savedCurrentTerm — терм на момент
 // формирования запроса (для защиты от устаревших ответов).
 func (cm *ConsensusModule) leaderSendAEsToPeer(peerID, savedCurrentTerm int) {
+	cm.mu.Lock()
+	ni := cm.nextIndex[peerID]
+	// Если nextIndex отстаёт дальше последнего снэпшота — отправляем снэпшот.
+	if ni <= cm.lastSnapshotIndex && cm.snapshotStore != nil {
+		cm.mu.Unlock()
+		cm.leaderSendSnapshot(peerID, savedCurrentTerm)
+		return
+	}
+	cm.mu.Unlock()
+
 	ni, args, entries := cm.nextIndexArgsEntries(peerID, savedCurrentTerm)
 	cm.dLogf("sending AppendEntries to %v: ni=%d, args=%+v", peerID, ni, args)
 	reply, err := cm.transport.AppendEntries(ServerID(peerID), args)
@@ -1339,6 +1440,32 @@ func (cm *ConsensusModule) rebuildLastLog() {
 		cm.lastLogIndex = -1
 		cm.lastLogTerm = -1
 	}
+}
+
+// logPosition возвращает позицию в срезе cm.log для записи с данным Index.
+// Использует бинарный поиск. Если запись не найдена, возвращает
+// позицию первой записи с Index >= заданного (место для вставки).
+// Вызывается под cm.mu.Lock().
+func (cm *ConsensusModule) logPosition(index int) int {
+	return sort.Search(len(cm.log), func(i int) bool {
+		return cm.log[i].Index >= index
+	})
+}
+
+// compactLogs удаляет записи из cm.log с Index < compactIndex.
+// Оставляет как минимум trailingLogs записей.
+// Вызывается под cm.mu.Lock().
+func (cm *ConsensusModule) compactLogs(compactIndex int) {
+	if compactIndex <= 0 {
+		return
+	}
+	pos := cm.logPosition(compactIndex)
+	if pos <= 0 {
+		return
+	}
+	kept := make([]LogEntry, len(cm.log)-pos)
+	copy(kept, cm.log[pos:])
+	cm.log = kept
 }
 
 // Apply отправляет команду в Raft и возвращает ApplyFuture.
@@ -1605,6 +1732,8 @@ func (cm *ConsensusModule) runFSM() {
 			} else {
 				cm.applySingle(batch)
 			}
+		case req := <-cm.fsmSnapshotCh:
+			cm.handleFsmSnapshot(req)
 		case <-cm.shutdownCh:
 			return
 		}
@@ -1670,6 +1799,25 @@ func (cm *ConsensusModule) applyBatch(fsm BatchingFSM, batch []*commitTuple) {
 	}
 }
 
+// handleFsmSnapshot обрабатывает запрос на создание снэпшота от runFSM.
+// Вызывается из горутины runFSM при получении reqSnapshotFuture.
+// Захватывает текущий lastApplied и терм, вызывает fsm.Snapshot().
+func (cm *ConsensusModule) handleFsmSnapshot(req *reqSnapshotFuture) {
+	if cm.lastApplied < 0 {
+		req.respond(ErrNothingNewToSnapshot)
+		return
+	}
+	snap, err := cm.fsm.Snapshot()
+	if err != nil {
+		req.respond(err)
+		return
+	}
+	req.index = cm.lastApplied
+	req.term = cm.lookupTerm(cm.lastApplied)
+	req.snapshot = snap
+	req.respond(nil)
+}
+
 // processLogs собирает закоммиченные записи от lastApplied+1 до commitIndex
 // и отправляет их в FSM goroutine. Диапазон делится на под-батчи размером
 // не более maxApplyBatchSize, чтобы FSM goroutine не блокировалась на
@@ -1716,8 +1864,8 @@ func (cm *ConsensusModule) sendBatch(start, end int) {
 		if idx > cm.lastLogIndex {
 			continue
 		}
-		// FIXME(compact): cm.log[idx] по позиции, не по индексу.
-		log := &cm.log[idx]
+		pos := cm.logPosition(idx)
+		log := &cm.log[pos]
 		batch = append(batch, &commitTuple{log: log, future: future})
 	}
 	cm.mu.Unlock()
@@ -2183,6 +2331,254 @@ func (cm *ConsensusModule) processLogConflict(conflictIndex int) {
 	}
 }
 
+// SetSnapshotConfig обновляет параметры снэпшотов и сигнализирует
+// runSnapshots о необходимости проверить, нужно ли создать снэпшот.
+func (cm *ConsensusModule) SetSnapshotConfig(threshold int, interval time.Duration, trailing int) {
+	cm.mu.Lock()
+	cm.snapshotThreshold = threshold
+	cm.snapshotInterval = interval
+	cm.trailingLogs = trailing
+	cm.mu.Unlock()
+
+	select {
+	case cm.snapshotCh <- struct{}{}:
+	default:
+	}
+}
+
+// runSnapshots — фоновая горутина управления снэпшотами.
+// Запускается только если cm.snapshotStore != nil.
+// Проверяет необходимость снэпшота по таймеру или при сигнале из snapshotCh.
+// Завершается при закрытии shutdownCh.
+func (cm *ConsensusModule) runSnapshots() {
+	for {
+		cm.mu.Lock()
+		interval := cm.snapshotInterval
+		cm.mu.Unlock()
+
+		select {
+		case <-cm.snapshotCh:
+			if cm.shouldSnapshot() {
+				_ = cm.takeSnapshot()
+			}
+		case <-time.After(interval):
+			if cm.shouldSnapshot() {
+				_ = cm.takeSnapshot()
+			}
+		case <-cm.shutdownCh:
+			return
+		}
+	}
+}
+
+// shouldSnapshot проверяет, нужно ли создать снэпшот.
+// Снэпшот нужен, если с момента последнего снэпшота накопилось
+// больше snapshotThreshold записей.
+func (cm *ConsensusModule) shouldSnapshot() bool {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	if cm.lastLogIndex < 0 {
+		return false
+	}
+	if cm.snapshotStore == nil {
+		return false
+	}
+	delta := cm.lastLogIndex - cm.lastSnapshotIndex
+	return delta >= cm.snapshotThreshold
+}
+
+// takeSnapshot создаёт снэпшот и компактит лог.
+// Вызывается только из runSnapshots.
+func (cm *ConsensusModule) takeSnapshot() error {
+	snapReq := &reqSnapshotFuture{}
+	snapReq.init(cm.shutdownCh)
+
+	select {
+	case cm.fsmSnapshotCh <- snapReq:
+	case <-cm.shutdownCh:
+		return ErrRaftShutdown
+	}
+
+	if err := snapReq.Error(); err != nil {
+		if err == ErrNothingNewToSnapshot {
+			return nil
+		}
+		return err
+	}
+	defer snapReq.snapshot.Release()
+
+	cm.mu.Lock()
+	committed := cm.configurations.committed
+	committedIndex := cm.configurations.committedIndex
+	cm.mu.Unlock()
+
+	sink, err := cm.snapshotStore.Create(snapReq.index, snapReq.term, committed, committedIndex)
+	if err != nil {
+		return fmt.Errorf("failed to create snapshot: %w", err)
+	}
+
+	if err := snapReq.snapshot.Persist(sink); err != nil {
+		_ = sink.Cancel()
+		return fmt.Errorf("failed to persist snapshot: %w", err)
+	}
+
+	if err := sink.Close(); err != nil {
+		return fmt.Errorf("failed to close snapshot: %w", err)
+	}
+
+	cm.mu.Lock()
+	cm.lastSnapshotIndex = snapReq.index
+	cm.lastSnapshotTerm = snapReq.term
+	cm.compactLogs(snapReq.index - cm.trailingLogs)
+	cm.persistToStorage()
+	cm.mu.Unlock()
+
+	return nil
+}
+
+// leaderSendSnapshot отправляет последний снэпшот отстающему follower.
+// Вызывается, когда nextIndex[follower] <= lastSnapshotIndex.
+func (cm *ConsensusModule) leaderSendSnapshot(peerID int, term int) {
+	snapshots, err := cm.snapshotStore.List()
+	if err != nil || len(snapshots) == 0 {
+		return
+	}
+	meta, reader, err := cm.snapshotStore.Open(snapshots[0].ID)
+	if err != nil {
+		return
+	}
+	defer reader.Close()
+
+	cfgData, _ := EncodeConfiguration(meta.Configuration)
+
+	req := InstallSnapshotRequest{
+		RPCHeader: RPCHeader{
+			ProtocolVersion: ProtocolVersion,
+			ServerID:        cm.id,
+		},
+		Term:          term,
+		LeaderID:      cm.id,
+		LastLogIndex:  meta.Index,
+		LastLogTerm:   meta.Term,
+		Configuration: cfgData,
+		ConfigIndex:   meta.ConfigIndex,
+		DataSize:      meta.Size,
+	}
+
+	reply, err := cm.transport.InstallSnapshot(ServerID(peerID), req, reader)
+	if err != nil {
+		return
+	}
+	if reply.Term > term {
+		cm.becomeFollower(reply.Term)
+		return
+	}
+	if reply.Success {
+		cm.mu.Lock()
+		cm.nextIndex[peerID] = meta.Index + 1
+		cm.matchIndex[peerID] = meta.Index
+		cm.persistToStorage()
+		cm.mu.Unlock()
+	}
+}
+
+// handleInstallSnapshot обрабатывает входящий InstallSnapshot RPC.
+// Получает снэпшот от лидера, сохраняет в SnapshotStore,
+// восстанавливает FSM и заменяет журнал.
+func (cm *ConsensusModule) handleInstallSnapshot(rpc RPC, req *InstallSnapshotRequest) {
+	resp := &InstallSnapshotResponse{
+		RPCHeader: RPCHeader{
+			ProtocolVersion: ProtocolVersion,
+			ServerID:        cm.id,
+		},
+		Term:    cm.currentTerm,
+		Success: false,
+	}
+	var rpcErr error
+	defer func() {
+		_, _ = io.Copy(io.Discard, rpc.Reader)
+		rpc.RespChan <- RPCResponse{Reply: resp, Error: rpcErr}
+	}()
+
+	cm.mu.Lock()
+	if req.Term < cm.currentTerm {
+		cm.mu.Unlock()
+		return
+	}
+	if req.Term > cm.currentTerm {
+		cm.becomeFollower(req.Term)
+		resp.Term = req.Term
+	}
+	cm.electionResetEvent = time.Now()
+	cm.leaderLastContact = time.Now()
+	cm.leaderID = req.LeaderID
+	cm.mu.Unlock()
+
+	cfg, err := DecodeConfiguration(req.Configuration)
+	if err != nil {
+		rpcErr = err
+		return
+	}
+
+	sink, err := cm.snapshotStore.Create(req.LastLogIndex, req.LastLogTerm, cfg, req.ConfigIndex)
+	if err != nil {
+		rpcErr = err
+		return
+	}
+
+	n, err := io.Copy(sink, rpc.Reader)
+	if err != nil {
+		_ = sink.Cancel()
+		rpcErr = err
+		return
+	}
+	if req.DataSize > 0 && n != req.DataSize {
+		_ = sink.Cancel()
+		rpcErr = fmt.Errorf("snapshot size mismatch: got %d, expected %d", n, req.DataSize)
+		return
+	}
+
+	if err := sink.Close(); err != nil {
+		rpcErr = err
+		return
+	}
+
+	// Restore через прямой вызов fsm.Restore.
+	meta, snapReader, err := cm.snapshotStore.Open(sink.ID())
+	if err != nil {
+		rpcErr = err
+		return
+	}
+	defer snapReader.Close()
+
+	if err := cm.fsm.Restore(snapReader); err != nil {
+		rpcErr = err
+		return
+	}
+
+	cm.mu.Lock()
+	cm.lastLogIndex = meta.Index
+	cm.lastLogTerm = meta.Term
+	cm.lastSnapshotIndex = meta.Index
+	cm.lastSnapshotTerm = meta.Term
+	cm.lastApplied = meta.Index
+	cm.commitIndex = meta.Index
+	// Заменить журнал: удалить все записи <= LastLogIndex.
+	pos := cm.logPosition(meta.Index)
+	if pos < len(cm.log) && cm.log[pos].Index == meta.Index {
+		kept := make([]LogEntry, len(cm.log)-pos-1)
+		copy(kept, cm.log[pos+1:])
+		cm.log = kept
+	} else {
+		cm.log = nil
+	}
+	cm.rebuildLastLog()
+	cm.persistToStorage()
+	cm.mu.Unlock()
+
+	resp.Success = true
+}
+
 // persistToStorage сохраняет постоянное состояние CM в cm.storage.
 func (cm *ConsensusModule) persistToStorage() {
 	var termData bytes.Buffer
@@ -2202,4 +2598,16 @@ func (cm *ConsensusModule) persistToStorage() {
 		log.Fatal(err)
 	}
 	cm.storage.Set("log", logData.Bytes())
+
+	var snapIdxData bytes.Buffer
+	if err := gob.NewEncoder(&snapIdxData).Encode(cm.lastSnapshotIndex); err != nil {
+		log.Fatal(err)
+	}
+	cm.storage.Set("lastSnapshotIndex", snapIdxData.Bytes())
+
+	var snapTermData bytes.Buffer
+	if err := gob.NewEncoder(&snapTermData).Encode(cm.lastSnapshotTerm); err != nil {
+		log.Fatal(err)
+	}
+	cm.storage.Set("lastSnapshotTerm", snapTermData.Bytes())
 }

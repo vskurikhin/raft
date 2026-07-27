@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"container/list"
 	"encoding/gob"
+	"io"
 	"strings"
 	"sync"
 	"testing"
@@ -1643,7 +1644,7 @@ func TestRace_ApplyAndStepDown(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		future := h.cluster[lid].Apply(42, 0)
-		future.Error()
+		_ = future.Error()
 		close(done)
 	}()
 
@@ -1826,8 +1827,16 @@ func NewRecordingBatchingFSM() *RecordingBatchingFSM {
 	return &RecordingBatchingFSM{}
 }
 
-func (f *RecordingBatchingFSM) Apply(log *LogEntry) any {
+func (f *RecordingBatchingFSM) Apply(_ *LogEntry) any {
 	return nil
+}
+
+func (f *RecordingBatchingFSM) Snapshot() (FSMSnapshot, error) {
+	return nil, ErrNotImplemented
+}
+
+func (f *RecordingBatchingFSM) Restore(_ io.ReadCloser) error {
+	return ErrNotImplemented
 }
 
 func (f *RecordingBatchingFSM) ApplyBatch(logs []*LogEntry) []any {
@@ -1862,13 +1871,13 @@ func (f *RecordingBatchingFSM) TotalEntries() int {
 func (f *RecordingBatchingFSM) MaxBatchSize() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	max := 0
+	maxl := 0
 	for _, b := range f.batches {
-		if len(b.logs) > max {
-			max = len(b.logs)
+		if len(b.logs) > maxl {
+			maxl = len(b.logs)
 		}
 	}
-	return max
+	return maxl
 }
 
 // TestNonBatchingFSM_ProcessLogsSubBatching проверяет, что sub-batching

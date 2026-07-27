@@ -446,8 +446,9 @@ func TestInmemStubsReturnNotImplemented(t *testing.T) {
 	})
 	t.Run("InstallSnapshot", func(t *testing.T) {
 		_, err := trans.InstallSnapshot(1, InstallSnapshotRequest{}, nil)
-		if err != ErrNotImplemented {
-			t.Fatalf("want ErrNotImplemented, got %v", err)
+		// InstallSnapshot теперь реализован — peer не подключён, ошибка ErrNotReachable.
+		if err != ErrNotReachable {
+			t.Fatalf("want ErrNotReachable, got %v", err)
 		}
 	})
 }

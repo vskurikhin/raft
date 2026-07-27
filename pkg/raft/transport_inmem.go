@@ -209,9 +209,45 @@ func (t *InmemTransport) TimeoutNow(peerID ServerID, args TimeoutNowRequest) (Ti
 	}
 }
 
-// InstallSnapshot отправляет snapshot. Не реализован.
-func (t *InmemTransport) InstallSnapshot(_ ServerID, _ InstallSnapshotRequest, _ io.Reader) (InstallSnapshotResponse, error) {
-	return InstallSnapshotResponse{}, ErrNotImplemented
+// InstallSnapshot отправляет InstallSnapshot RPC узлу peerID.
+// В отличие от AppendEntries/RequestVote, данные снэпшота передаются
+// через поле RPC.Reader, а RespChan — через поле RPC.RespChan.
+func (t *InmemTransport) InstallSnapshot(peerID ServerID, req InstallSnapshotRequest, data io.Reader) (InstallSnapshotResponse, error) {
+	var zero InstallSnapshotResponse
+	select {
+	case <-t.shutdownCh:
+		return zero, ErrRaftShutdown
+	default:
+	}
+	peer, err := t.getPeer(peerID)
+	if err != nil {
+		return zero, err
+	}
+	respCh := make(chan RPCResponse, 1)
+	select {
+	case peer.consumerCh <- RPC{Command: &req, Reader: data, RespChan: respCh}:
+	case <-t.shutdownCh:
+		return zero, ErrRaftShutdown
+	case <-peer.shutdownCh:
+		return zero, ErrRaftShutdown
+	}
+	select {
+	case resp := <-respCh:
+		if resp.Error != nil {
+			return zero, resp.Error
+		}
+		reply, ok := resp.Reply.(*InstallSnapshotResponse)
+		if !ok {
+			return zero, fmt.Errorf("raft: unexpected reply type %T", resp.Reply)
+		}
+		return *reply, nil
+	case <-peer.shutdownCh:
+		return zero, ErrRaftShutdown
+	case <-t.shutdownCh:
+		return zero, ErrRaftShutdown
+	case <-time.After(t.timeout):
+		return zero, ErrEnqueueTimeout
+	}
 }
 
 // AppendEntriesPipeline возвращает конвейер. Не реализован.

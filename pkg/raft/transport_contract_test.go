@@ -268,8 +268,10 @@ func TestTransportStubsReturnNotImplemented(t *testing.T) {
 			if _, err := client.TimeoutNow(1, TimeoutNowRequest{}); err == nil || err == ErrNotImplemented {
 				t.Fatalf("TimeoutNow: want transport error, got %v", err)
 			}
-			if _, err := client.InstallSnapshot(1, InstallSnapshotRequest{}, nil); err != ErrNotImplemented {
-				t.Fatalf("InstallSnapshot: want ErrNotImplemented, got %v", err)
+			// InmemTransport реализует InstallSnapshot и возвращает ErrNotReachable
+			// (или другую транспортную ошибку), а TCPTransport — ErrNotImplemented.
+			if _, err := client.InstallSnapshot(1, InstallSnapshotRequest{}, nil); err == nil {
+				t.Fatalf("InstallSnapshot: want error, got nil")
 			}
 			if _, err := client.AppendEntriesPipeline(1); err != ErrNotImplemented {
 				t.Fatalf("AppendEntriesPipeline: want ErrNotImplemented, got %v", err)
