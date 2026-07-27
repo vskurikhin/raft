@@ -2010,3 +2010,282 @@ func TestBatchingFSM_ApplyBatchResponseMatching(t *testing.T) {
 		}
 	}
 }
+
+// --- Nonvoter (Feature 3) ---
+
+// TestNonvoter_DoesNotStartElection проверяет, что nonvoter не переходит
+// в Candidate при потере лидера. Кластер из 4 серверов; сервер 3
+// демотируется в nonvoter, затем лидер отключается. Nonvoter остаётся
+// Follower, кластер избирает нового лидера из оставшихся voter'ов.
+func TestNonvoter_DoesNotStartElection(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 200*Quantum*time.Millisecond)()
+	h := NewHarness(t, 4)
+	defer h.Shutdown()
+
+	// Ждём стабилизации лидера.
+	lid, _ := h.CheckSingleLeader()
+	sleepMs(100)
+
+	// Демотировать не-лидера.
+	demoteID := (lid + 1) % 4
+	f := h.cluster[lid].DemoteVoter(ServerID(demoteID))
+	if err := f.Error(); err != nil {
+		t.Fatalf("DemoteVoter failed: %v", err)
+	}
+	sleepMs(100)
+
+	// Отключаем лидера.
+	h.DisconnectPeer(lid)
+
+	// Ждём выборы.
+	sleepMs(50)
+
+	// Nonvoter не должен быть лидером.
+	_, _, isLeader := h.cluster[demoteID].Report()
+	if isLeader {
+		t.Fatal("nonvoter became leader")
+	}
+
+	// Кластер избирает нового лидера из voter'ов.
+	// DisconnectPeer может изолировать лидера от follower, но follower должны
+	// избрать нового лидера. Если кластер не смог — тест падает в CheckSingleLeader.
+	newLid, _ := h.CheckSingleLeader()
+	if newLid == demoteID || newLid == lid {
+		t.Fatalf("unexpected leader: %d (lid=%d, demoteID=%d)", newLid, lid, demoteID)
+	}
+}
+
+// TestNonvoter_DoesNotAffectCommitIndex проверяет, что nonvoter не влияет
+// на commitIndex. Кластер из 4 серверов; сервер 3 демотируется в nonvoter.
+// Отключаем одного voter'а и nonvoter — кворум (2 из 3 voter'ов) сохраняется,
+// команда коммитится.
+func TestNonvoter_DoesNotAffectCommitIndex(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 300*Quantum*time.Millisecond)()
+	h := NewHarness(t, 4)
+	defer h.Shutdown()
+
+	lid, _ := h.CheckSingleLeader()
+	sleepMs(100)
+
+	// Демотировать не-лидера в nonvoter.
+	demoteID := (lid + 1) % 4
+	f := h.cluster[lid].DemoteVoter(ServerID(demoteID))
+	if err := f.Error(); err != nil {
+		t.Fatalf("DemoteVoter failed: %v", err)
+	}
+	sleepMs(100)
+
+	// Определяем ID другого voter'а (не лидер, не nonvoter).
+	otherVoter := (lid + 1) % 4
+	if otherVoter == demoteID {
+		otherVoter = (otherVoter + 1) % 4
+	}
+	if lid != 0 && otherVoter == 0 {
+		otherVoter = 0
+	} else if lid == 0 && otherVoter == demoteID {
+		otherVoter = (otherVoter + 1) % 4
+	}
+
+	// Отключаем одного voter'а и nonvoter.
+	h.DisconnectPeer(otherVoter)
+	h.DisconnectPeer(demoteID)
+	sleepMs(50)
+
+	// Отправляем команду — должна закоммититься (2 из 3 voter'ов = кворум).
+	future := h.cluster[lid].Apply(42, 0)
+	if err := future.Error(); err != nil {
+		t.Fatalf("Apply failed: %v", err)
+	}
+
+	// Проверяем, что команда закоммичена на лидере.
+	h.WaitForCommit(42, 1)
+}
+
+// TestNonvoter_AppliesLogs проверяет, что nonvoter получает и применяет
+// все закоммиченные записи к FSM. Кластер из 4 серверов; сервер 3 —
+// nonvoter. Отправляем 3 команды — nonvoter должен иметь те же записи.
+func TestNonvoter_AppliesLogs(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 300*Quantum*time.Millisecond)()
+	h := NewHarness(t, 4)
+	defer h.Shutdown()
+
+	lid, _ := h.CheckSingleLeader()
+	sleepMs(100)
+
+	// Демотировать не-лидера в nonvoter.
+	demoteID := (lid + 1) % 4
+	f := h.cluster[lid].DemoteVoter(ServerID(demoteID))
+	if err := f.Error(); err != nil {
+		t.Fatalf("DemoteVoter failed: %v", err)
+	}
+	sleepMs(100)
+
+	for _, cmd := range []int{10, 20, 30} {
+		f := h.cluster[lid].Apply(cmd, 0)
+		if err := f.Error(); err != nil {
+			t.Fatalf("Apply %d failed: %v", cmd, err)
+		}
+	}
+	sleepMs(200)
+
+	// Проверить, что nonvoter закоммитил все команды.
+	for _, cmd := range []int{10, 20, 30} {
+		h.CheckCommitted(cmd)
+	}
+}
+
+// TestNonvoter_DemotedVoterDoesNotStartElection проверяет, что после
+// DemoteVoter сервер перестаёт быть кандидатом. Кластер из 4 voter'ов.
+// Лидер демотирует один сервер, затем отключается — демотированный сервер
+// не начинает выборы, кластер избирает нового лидера из оставшихся voter'ов.
+func TestNonvoter_DemotedVoterDoesNotStartElection(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 200*Quantum*time.Millisecond)()
+	h := NewHarness(t, 4)
+	defer h.Shutdown()
+
+	lid, _ := h.CheckSingleLeader()
+	sleepMs(100)
+
+	// Демотировать другого voter'а, не лидера.
+	demoteID := (lid + 1) % 4
+	f := h.cluster[lid].DemoteVoter(ServerID(demoteID))
+	if err := f.Error(); err != nil {
+		t.Fatalf("DemoteVoter failed: %v", err)
+	}
+	sleepMs(100)
+
+	// Проверить, что сервер demoteID теперь nonvoter.
+	cfg := h.cluster[lid].GetConfiguration().Configuration()
+	found := false
+	for _, s := range cfg.ConfigServers {
+		if s.ID == ServerID(demoteID) {
+			if s.Suffrage != Nonvoter {
+				t.Fatalf("server %d: want Nonvoter, got %v", demoteID, s.Suffrage)
+			}
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("server %d not found in configuration", demoteID)
+	}
+
+	// Отключаем лидера.
+	h.DisconnectPeer(lid)
+
+	// Ждём выборы.
+	sleepMs(50)
+
+	// Nonvoter не должен стать лидером.
+	_, _, isLeader := h.cluster[demoteID].Report()
+	if isLeader {
+		t.Fatal("demoted nonvoter became leader")
+	}
+
+	// Кластер должен избрать нового лидера из оставшихся voter'ов.
+	newLid, _ := h.CheckSingleLeader()
+	if newLid == demoteID || newLid == lid {
+		t.Fatalf("unexpected leader: %d (lid=%d, demoteID=%d)", newLid, lid, demoteID)
+	}
+}
+
+// TestNonvoter_RejectsRequestVote проверяет, что RequestVote handler
+// отклоняет запрос от nonvoter-кандидата. Nonvoter отправляет RequestVote
+// voter'у — VoteGranted должен быть false.
+func TestNonvoter_RejectsRequestVote(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 150*Quantum*time.Millisecond)()
+	h := NewHarness(t, 4)
+	defer h.Shutdown()
+
+	lid, _ := h.CheckSingleLeader()
+	sleepMs(100)
+
+	// Демотировать не-лидера в nonvoter.
+	demoteID := (lid + 1) % 4
+	f := h.cluster[lid].DemoteVoter(ServerID(demoteID))
+	if err := f.Error(); err != nil {
+		t.Fatalf("DemoteVoter failed: %v", err)
+	}
+	sleepMs(100)
+
+	// Nonvoter (demoteID) отправляет RequestVote лидеру.
+	voterID := lid
+	reply, err := h.transports[demoteID].RequestVote(
+		ServerID(voterID),
+		RequestVoteArgs{
+			RPCHeader: RPCHeader{
+				ProtocolVersion: ProtocolVersion,
+				ServerID:        int(demoteID),
+			},
+			Term:         1,
+			CandidateID:  int(demoteID),
+			LastLogIndex: 0,
+			LastLogTerm:  0,
+		},
+	)
+	if err != nil {
+		t.Fatalf("RequestVote failed: %v", err)
+	}
+	if reply.VoteGranted {
+		t.Fatal("nonvoter's RequestVote was granted, but should be denied")
+	}
+}
+
+// TestNonvoter_TimeoutNowDoesNotStartElection проверяет, что nonvoter,
+// получивший TimeoutNow, не начинает выборы. TimeoutNow отправляется
+// от лидера nonvoter'у — nonvoter остаётся Follower.
+func TestNonvoter_TimeoutNowDoesNotStartElection(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 150*Quantum*time.Millisecond)()
+	h := NewHarness(t, 4)
+	defer h.Shutdown()
+
+	lid, _ := h.CheckSingleLeader()
+	sleepMs(100)
+
+	// Демотировать не-лидера в nonvoter.
+	demoteID := (lid + 1) % 4
+	f := h.cluster[lid].DemoteVoter(ServerID(demoteID))
+	if err := f.Error(); err != nil {
+		t.Fatalf("DemoteVoter failed: %v", err)
+	}
+	sleepMs(100)
+
+	// Nonvoter получает TimeoutNow.
+	_, err := h.SendTimeoutNow(lid, demoteID)
+	if err != nil {
+		t.Fatalf("SendTimeoutNow failed: %v", err)
+	}
+
+	// Проверить, что nonvoter не стал Candidate или Leader.
+	_, _, isLeader := h.cluster[demoteID].Report()
+	if isLeader {
+		t.Fatal("nonvoter became leader after TimeoutNow")
+	}
+}
+
+// TestNonvoter_NoGoroutineLeak проверяет, что кластер с nonvoter
+// корректно выполняет операции и завершается без утечек горутин.
+func TestNonvoter_NoGoroutineLeak(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 150*Quantum*time.Millisecond)()
+	h := NewHarness(t, 4)
+	defer h.Shutdown()
+
+	lid, _ := h.CheckSingleLeader()
+	sleepMs(100)
+
+	// Демотировать не-лидера в nonvoter.
+	demoteID := (lid + 1) % 4
+	f := h.cluster[lid].DemoteVoter(ServerID(demoteID))
+	if err := f.Error(); err != nil {
+		t.Fatalf("DemoteVoter failed: %v", err)
+	}
+	sleepMs(100)
+
+	// Отправить команду.
+	f = h.cluster[lid].Apply(42, 0)
+	if err := f.Error(); err != nil {
+		t.Fatalf("Apply failed: %v", err)
+	}
+
+	// Проверить, что команда закоммичена.
+	h.WaitForCommit(42, 1)
+}

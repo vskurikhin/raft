@@ -414,7 +414,10 @@ func (r *RequestPreVoteReply) GetRPCHeader() RPCHeader {
 	return r.RPCHeader
 }
 
-// RequestVote RPC.
+// RequestVote обрабатывает входящий запрос голосования (§5.4.1).
+//
+// Кандидаты, не являющиеся voter'ами в текущей конфигурации, отклоняются.
+// Nonvoter не может быть избран лидером ни при каких обстоятельствах.
 func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
@@ -424,6 +427,18 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 
 	if err := checkRPCHeader(&args); err != nil {
 		return err
+	}
+
+	// Nonvoter не может быть избран лидером — отклоняем запрос.
+	if !hasVote(cm.configurations.latest, args.GetRPCHeader().ServerID) {
+		cm.dLogf("... RequestVote denied: not a voter")
+		reply.VoteGranted = false
+		reply.RPCHeader = RPCHeader{
+			ProtocolVersion: ProtocolVersion,
+			ServerID:        cm.id,
+		}
+		reply.Term = cm.currentTerm
+		return nil
 	}
 
 	lastLogIndex, lastLogTerm := cm.lastLogIndexAndTerm()
@@ -734,11 +749,21 @@ func (cm *ConsensusModule) electionTimeout() time.Duration {
 // Эта функция является блокирующей и должна запускаться в отдельной горутине;
 // она предназначена для работы с одним (одноразовым) таймером выборов, поскольку она завершается
 // всякий раз, когда состояние CM меняется с «ведомый/кандидат» или меняется срок полномочий.
+// runElectionTimer запускает таймер выборов для узла. Если узел не является
+// voter'ом (Suffrage == Nonvoter), таймер немедленно завершается — nonvoter
+// никогда не участвует в выборах и не может стать кандидатом.
 func (cm *ConsensusModule) runElectionTimer() {
 	timeoutDuration := cm.electionTimeout()
 	cm.mu.Lock()
 	termStarted := cm.currentTerm
 	electionTimerDone := cm.electionTimerDone
+
+	// Nonvoter не участвует в выборах — не запускаем таймер.
+	if !hasVote(cm.configurations.latest, cm.id) {
+		cm.mu.Unlock()
+		return
+	}
+
 	cm.mu.Unlock()
 	cm.dLogf("election timer started (%v), term=%d", timeoutDuration, termStarted)
 
@@ -794,6 +819,9 @@ func (cm *ConsensusModule) runElectionTimer() {
 // передаётся LeadershipTransfer=true, что bypass проверку наличия лидера
 // на узлах-получателях. Флаг сбрасывается после того, как все горутины
 // отправили RequestVote, чтобы последующие обычные выборы не имели этого флага.
+//
+// Nonvoter'ы исключаются из рассылки RequestVote — они не участвуют
+// в голосовании и не должны получать запросы на предоставление голоса.
 func (cm *ConsensusModule) startElection() {
 	cm.state = Candidate
 	cm.currentTerm += 1
@@ -822,10 +850,13 @@ func (cm *ConsensusModule) startElection() {
 	var votesReceived atomic.Int32
 	votesReceived.Store(1)
 
-	// Параллельно отправить RPC-запросы RequestVote всем серверам из конфигурации.
+	// Параллельно отправить RPC-запросы RequestVote всем voter'ам.
 	for _, s := range cfg.ConfigServers {
 		peerID := int(s.ID)
 		if peerID == cm.id {
+			continue
+		}
+		if s.Suffrage != Voter {
 			continue
 		}
 		go func(peerID int, lt bool) {
