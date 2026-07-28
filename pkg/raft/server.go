@@ -18,8 +18,9 @@ type Server struct {
 	peerIds  []int
 	maxPool  int
 
-	storage Storage
-	fsm     FSM
+	storage       Storage
+	fsm           FSM
+	snapshotStore SnapshotStore
 
 	transport *TCPTransport
 	cm        *ConsensusModule
@@ -27,6 +28,8 @@ type Server struct {
 	ready <-chan any
 	quit  chan any
 	wg    sync.WaitGroup
+
+	tcpRpcTimeout time.Duration
 }
 
 // Config — конфигурация для создания нового сервера Raft.
@@ -36,22 +39,33 @@ type Config struct {
 	RPCAddress    string
 	ServerID      int
 
+	Fsm FSM
+
 	// MaxPool — максимальное количество соединений в пуле на один целевой
 	// адрес (0 = defaultMaxPool).
 	MaxPool int
+
+	// SnapshotStore — хранилище снэпшотов. Если nil, снэпшоты отключены.
+	SnapshotStore SnapshotStore
+
+	Storage Storage
+
+	TcpRpcTimeout time.Duration
 }
 
 // New создаёт новый сервер Raft с заданной конфигурацией cfg, хранилищем storage,
 // каналом уведомления ready и FSM для применения зафиксированных записей журнала.
-func New(cfg Config, storage Storage, ready <-chan any, fsm FSM) *Server {
+func New(cfg Config, ready <-chan any) *Server {
 	s := &Server{
-		serverID: cfg.ServerID,
-		peerIds:  cfg.PeerIds,
-		maxPool:  cfg.MaxPool,
-		storage:  storage,
-		fsm:      fsm,
-		ready:    ready,
-		quit:     make(chan any),
+		fsm:           cfg.Fsm,
+		maxPool:       cfg.MaxPool,
+		peerIds:       cfg.PeerIds,
+		quit:          make(chan any),
+		ready:         ready,
+		serverID:      cfg.ServerID,
+		snapshotStore: cfg.SnapshotStore,
+		storage:       cfg.Storage,
+		tcpRpcTimeout: cfg.TcpRpcTimeout,
 	}
 	return s
 }
@@ -59,16 +73,19 @@ func New(cfg Config, storage Storage, ready <-chan any, fsm FSM) *Server {
 // NewServer создаёт новый сервер Raft с указанными идентификатором serverID,
 // списком идентификаторов узлов-соседей peerIds, хранилищем storage, каналом
 // уведомления ready и FSM для применения зафиксированных записей журнала.
-func NewServer(serverID int, peerIds []int, storage Storage, ready <-chan any, fsm FSM) *Server {
+func NewServer(serverID int, peerIds []int, fsm FSM, ready <-chan any) *Server {
 	return New(Config{
-		ServerID: serverID,
-		PeerIds:  peerIds,
-	}, storage, ready, fsm)
+		ServerID:      serverID,
+		Fsm:           fsm,
+		PeerIds:       peerIds,
+		Storage:       NewMapStorage(),
+		TcpRpcTimeout: time.Duration(TcpRpcTimeoutMs) * time.Millisecond,
+	}, ready)
 }
 
 // Serve запускает TCP-транспорт на указанном адресе и создаёт ConsensusModule.
 func (s *Server) Serve(address string) {
-	transport, err := NewTCPTransport(address, ReelectionTimeoutMs*time.Millisecond/3, s.maxPool)
+	transport, err := NewTCPTransport(address, time.Duration(TcpRpcTimeoutMs)*time.Millisecond, s.maxPool)
 	if err != nil {
 		log.Fatalf("raft: failed to create TCPTransport: %v", err)
 	}
@@ -76,7 +93,7 @@ func (s *Server) Serve(address string) {
 	s.transport = transport
 	s.mu.Unlock()
 
-	s.cm = NewConsensusModule(s.serverID, s.peerIds, transport, s.storage, s.fsm, s.ready)
+	s.cm = NewConsensusModule(s.serverID, s.peerIds, transport, s.storage, s.fsm, s.ready, s.snapshotStore)
 }
 
 // Apply отправляет команду в Raft-кластер и возвращает ApplyFuture.

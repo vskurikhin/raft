@@ -237,7 +237,7 @@ func (h *Harness) CheckSingleLeader() (int, int) {
 		if leaderId >= 0 {
 			return leaderId, leaderTerm
 		}
-		time.Sleep(150 * Quantum * time.Millisecond)
+		time.Sleep(50 * Quantum * time.Millisecond)
 	}
 
 	h.t.Fatalf("leader not found")
@@ -335,7 +335,7 @@ func (h *Harness) CheckCommittedN(cmd int, n int) {
 // на n серверах (с таймаутом 500ms), затем проверяет фиксацию.
 func (h *Harness) WaitForCommit(cmd int, n int) {
 	h.t.Helper()
-	deadline := time.Now().Add(500 * time.Millisecond)
+	deadline := time.Now().Add(300 * time.Millisecond)
 	for time.Now().Before(deadline) {
 		h.mu.Lock()
 		nc := 0

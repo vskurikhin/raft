@@ -59,7 +59,7 @@ type Config struct {
 //
 // KVService реализует raft.FSM: закоммиченные записи журнала применяются
 // непосредственно к DataStore через метод Apply.
-func New(cfg Config, storage raft.Storage, readyChan <-chan any) *KVService {
+func New(cfg Config, readyChan <-chan any) *KVService {
 	gob.Register(Command{})
 
 	kvs := &KVService{
@@ -67,11 +67,12 @@ func New(cfg Config, storage raft.Storage, readyChan <-chan any) *KVService {
 		ds:                   NewDataStore(),
 		httpResponsesEnabled: true,
 	}
+	cfg.Fsm = kvs
 
 	// raft.Server обрабатывает RPC-вызовы протокола Raft в кластере.
 	// KVService передаётся как FSM, поэтому Apply будет вызываться Raft'ом
 	// для каждой закоммиченной записи.
-	rs := raft.New(cfg.Config, storage, readyChan, kvs)
+	rs := raft.New(cfg.Config, readyChan)
 	rs.Serve(cfg.RPCAddress)
 	kvs.rs = rs
 
@@ -116,7 +117,7 @@ func (kvs *KVService) Snapshot() (raft.FSMSnapshot, error) {
 // Restore реализует raft.FSM.Restore.
 // Восстанавливает состояние DataStore из снэпшота.
 func (kvs *KVService) Restore(reader io.ReadCloser) error {
-	defer reader.Close()
+	defer func() { _ = reader.Close() }()
 	data, err := io.ReadAll(reader)
 	if err != nil {
 		return err
@@ -166,9 +167,8 @@ func NewKVService(address string, id int, peerIds []int, storage raft.Storage, r
 			RPCAddress: address,
 			ServerID:   id,
 			PeerIds:    peerIds,
-		},
-	},
-		storage, readyChan,
+			Storage:    storage,
+		}}, readyChan,
 	)
 }
 
@@ -243,7 +243,7 @@ func (kvs *KVService) sendHTTPResponse(w http.ResponseWriter, v any) {
 	}
 }
 
-func (kvs *KVService) handleVerifyLeader(w http.ResponseWriter, req *http.Request) {
+func (kvs *KVService) handleVerifyLeader(w http.ResponseWriter, _ *http.Request) {
 	// ReadIndex-проверка лидерства (Raft §8) без записи в журнал.
 	if err := kvs.rs.VerifyLeader().Error(); err != nil {
 		kvs.sendHTTPResponse(w, api.StatusResponse{RespStatus: api.StatusNotLeader})
@@ -253,12 +253,17 @@ func (kvs *KVService) handleVerifyLeader(w http.ResponseWriter, req *http.Reques
 }
 
 func (kvs *KVService) handlePut(w http.ResponseWriter, req *http.Request) {
+	start := time.Now()
 	pr := &api.PutRequest{}
+	defer func() {
+		elapsed := time.Since(start)
+		kvs.kvLogf("HTTP PUT %v took %v", pr, elapsed)
+	}()
+
 	if err := readRequestJSON(req, pr); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	kvs.kvLogf("HTTP PUT %v", pr)
 
 	// ReadIndex-проверка лидерства (Raft §8) без записи в журнал.
 	if err := kvs.rs.VerifyLeader().Error(); err != nil {
@@ -298,12 +303,17 @@ func (kvs *KVService) handlePut(w http.ResponseWriter, req *http.Request) {
 }
 
 func (kvs *KVService) handleGet(w http.ResponseWriter, req *http.Request) {
+	start := time.Now()
 	gr := &api.GetRequest{}
+	defer func() {
+		elapsed := time.Since(start)
+		kvs.kvLogf("HTTP GET %v took %v", gr, elapsed)
+	}()
+
 	if err := readRequestJSON(req, gr); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	kvs.kvLogf("HTTP GET %v", gr)
 
 	// ReadIndex: подтверждение лидерства без записи в raft-журнал (Raft §8).
 	future := kvs.rs.VerifyLeader()
@@ -330,12 +340,17 @@ func (kvs *KVService) handleGet(w http.ResponseWriter, req *http.Request) {
 }
 
 func (kvs *KVService) handleCAS(w http.ResponseWriter, req *http.Request) {
+	start := time.Now()
 	cr := &api.CASRequest{}
+	defer func() {
+		elapsed := time.Since(start)
+		kvs.kvLogf("HTTP CAS %v took %v", cr, elapsed)
+	}()
+
 	if err := readRequestJSON(req, cr); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	kvs.kvLogf("HTTP CAS %v", cr)
 
 	// ReadIndex-проверка лидерства (Raft §8) без записи в журнал.
 	if err := kvs.rs.VerifyLeader().Error(); err != nil {

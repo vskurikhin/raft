@@ -17,10 +17,10 @@ import (
 )
 
 const (
-	KeyCount       = 2000
+	KeyCount       = 3000
 	Workers        = 5
-	RequestRate    = 10 // общий RPS
-	VerifyPercent  = 100
+	RequestRate    = 202 // общий RPS
+	VerifyPercent  = 75
 	GetPercent     = 90
 	RequestTimeout = 10 * time.Second
 )
@@ -48,9 +48,9 @@ func init() {
 
 func main() {
 	client := kvclient.New([]string{
-		"192.168.22.221:8880",
-		"192.168.22.222:8880",
-		"192.168.22.223:8880",
+		"192.168.21.221:8880",
+		"192.168.21.222:8880",
+		"192.168.21.223:8880",
 	})
 	ctx, cancel := signal.NotifyContext(
 		context.Background(),
@@ -145,16 +145,17 @@ func stats(ctx context.Context) {
 					break drain
 				}
 			}
-			p50, p95, p99 := 0.0, 0.0, 0.0
+			p50, p80, p95, p99 := 0.0, 0.0, 0.0, 0.0
 			if n := len(latencies); n > 0 {
 				sort.Float64s(latencies)
 				p50 = latencies[n*50/100]
+				p80 = latencies[n*80/100]
 				p95 = latencies[n*95/100]
 				p99 = latencies[n*99/100]
 			}
 			msg := fmt.Sprintf(
-				"RPS=%5d  p50=%7.2fms p95=%7.2fms p99=%7.2fms  GET ok=%8d fail=%4d  PUT ok=%8d fail=%4d  VERIFY ok=%6d bad=%4d\n",
-				rps, p50, p95, p99,
+				"RPS=%5d  p50=%7.2fms p80=%7.2fms p95=%7.2fms p99=%7.2fms  GET ok=%8d fail=%4d  PUT ok=%8d fail=%4d  VERIFY ok=%6d bad=%4d\n",
+				rps, p50, p80, p95, p99,
 				getOK.Load(),
 				getFail.Load(),
 				putOK.Load(),

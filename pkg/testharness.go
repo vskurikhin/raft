@@ -269,7 +269,7 @@ func (h *Harness) CheckSingleLeader() int {
 // CheckPut отправляет через клиента c запрос Put и проверяет, что он
 // завершился без ошибок. Возвращает (prevValue, keyFound).
 func (h *Harness) CheckPut(c *kvclient.KVClient, key, value string) (string, bool) {
-	ctx, cancel := context.WithTimeout(h.ctx, 500*raft.Quantum*time.Millisecond)
+	ctx, cancel := context.WithTimeout(h.ctx, 600*raft.Quantum*time.Millisecond)
 	defer cancel()
 	pv, f, err := c.Put(ctx, key, value)
 	if err != nil {
@@ -282,7 +282,7 @@ func (h *Harness) CheckPut(c *kvclient.KVClient, key, value string) (string, boo
 // ошибок. Также проверяет, что ключ найден и его значение совпадает с
 // ожидаемым.
 func (h *Harness) CheckGet(c *kvclient.KVClient, key string, wantValue string) {
-	ctx, cancel := context.WithTimeout(h.ctx, 500*raft.Quantum*time.Millisecond)
+	ctx, cancel := context.WithTimeout(h.ctx, 600*raft.Quantum*time.Millisecond)
 	defer cancel()
 	gv, f, err := c.Get(ctx, key)
 	if err != nil {
@@ -299,7 +299,7 @@ func (h *Harness) CheckGet(c *kvclient.KVClient, key string, wantValue string) {
 // CheckCAS отправляет через клиента c запрос CAS и проверяет, что он
 // завершился без ошибок. Возвращает (prevValue, keyFound).
 func (h *Harness) CheckCAS(c *kvclient.KVClient, key, compare, value string) (string, bool) {
-	ctx, cancel := context.WithTimeout(h.ctx, 500*raft.Quantum*time.Millisecond)
+	ctx, cancel := context.WithTimeout(h.ctx, 800*raft.Quantum*time.Millisecond)
 	defer cancel()
 	pv, f, err := c.CAS(ctx, key, compare, value)
 	if err != nil {

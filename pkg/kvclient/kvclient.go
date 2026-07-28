@@ -22,7 +22,7 @@ const DebugClient = 0
 const (
 	// defaultRequestTimeout — таймаут на один HTTP-запрос.
 	// При недоступности лидера клиент переключается на другой адрес.
-	defaultRequestTimeout = 200 * time.Millisecond
+	defaultRequestTimeout = 500 * time.Millisecond
 )
 
 type KVClient struct {
