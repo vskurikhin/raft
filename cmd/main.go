@@ -42,10 +42,12 @@ func runWith(values config.Values) error {
 			PeerIds:       nums,
 			RPCAddress:    values.RPCAddress.String(),
 			ServerID:      values.Number,
+			SnapshotStore: raft.NewInmemSnapshotStore(),
+			Storage:       raft.NewMapStorage(),
+			TcpRpcTimeout: raft.TcpRpcTimeoutMs,
 		},
 	}
-	storage := raft.NewMapStorage()
-	kvs := kvservice.New(cfg, storage, ready)
+	kvs := kvservice.New(cfg, ready)
 	wg.Add(len(nums) / 2)
 	for _, num := range nums {
 		go connect(num, kvs, values, nums)

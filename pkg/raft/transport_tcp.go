@@ -52,12 +52,6 @@ type tcpRPCRequest struct {
 	Args any
 }
 
-// tcpRPCResponse — gob-структура RPC-ответа.
-type tcpRPCResponse struct {
-	Reply any
-	Error string
-}
-
 // tcpConn — обёртка над net.Conn с буферизированным writer и gob-кодеками.
 // Используется как для исходящих соединений (пул), так и для входящих
 // (handleConn). В исходящем случае буфер чтения не используется — декодирование
@@ -487,7 +481,7 @@ func (t *TCPTransport) handleConn(conn net.Conn) {
 		default:
 		}
 
-		if err := t.handleCommand(dec, enc); err != nil {
+		if err := t.handleCommand(r, dec, enc); err != nil {
 			if err != io.EOF {
 				log.Printf("raft: handle conn error: %v", err)
 			}
@@ -502,7 +496,9 @@ func (t *TCPTransport) handleConn(conn net.Conn) {
 
 // handleCommand декодирует и диспатчит один RPC-запрос из входящего потока.
 // Возвращает ошибку, если декодирование не удалось — вызывающий закрывает соединение.
-func (t *TCPTransport) handleCommand(dec *gob.Decoder, enc *gob.Encoder) error {
+// r — bufio.Reader, из которого был создан dec; нужен для чтения сырых данных
+// снэпшота при InstallSnapshot.
+func (t *TCPTransport) handleCommand(r *bufio.Reader, dec *gob.Decoder, enc *gob.Encoder) error {
 	var req tcpRPCRequest
 	if err := dec.Decode(&req); err != nil {
 		return err
@@ -524,6 +520,14 @@ func (t *TCPTransport) handleCommand(dec *gob.Decoder, enc *gob.Encoder) error {
 		cmd = &v
 	}
 
+	// Для InstallSnapshot читаем данные снэпшота из буферизированного ридера
+	// и передаём через rpc.Reader. Декларация ДО heartbeat fast-path,
+	// чтобы goto RESP не перепрыгивал через переменную.
+	var snapReader io.ReadCloser
+	if req, ok := cmd.(*InstallSnapshotRequest); ok && req.DataSize > 0 {
+		snapReader = io.NopCloser(io.LimitReader(r, req.DataSize))
+	}
+
 	// Heartbeat fast-path: если это heartbeat и установлен обработчик,
 	// вызываем его напрямую, минуя consumerCh.
 	if req.Type == rpcAppendEntries {
@@ -541,7 +545,7 @@ func (t *TCPTransport) handleCommand(dec *gob.Decoder, enc *gob.Encoder) error {
 	}
 
 	select {
-	case t.consumerCh <- RPC{Command: cmd, RespChan: respCh}:
+	case t.consumerCh <- RPC{Command: cmd, Reader: snapReader, RespChan: respCh}:
 	case <-t.shutdownCh:
 		return ErrRaftShutdown
 	}

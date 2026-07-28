@@ -15,7 +15,7 @@ const (
 )
 
 func main() {
-	client := kvclient.New([]string{"192.168.22.221:8880", "192.168.22.222:8880", "192.168.22.223:8880"})
+	client := kvclient.New([]string{"127.0.0.1:8881", "127.0.0.1:8882", "127.0.0.1:8883"})
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(MinimalDuration)*time.Millisecond)
 	defer cancel()
 	if len(os.Args) > 2 && os.Args[1] == "get" {

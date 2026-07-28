@@ -1,6 +1,8 @@
 package raft
 
 import (
+	"context"
+	"sync/atomic"
 	"time"
 )
 
@@ -9,10 +11,20 @@ const (
 	// Значение 3. Совместимость с версиями 0, 1 и 2 не поддерживается.
 	ProtocolVersion = 3
 
+	// Quantum — множитель для всех Raft-таймеров.
+	// TCP RPC timeout (TcpRpcTimeoutMs) задаётся независимо.
+	// Для тестового ускорения Quantum не меняется — используются
+	// test-only хуки (RAFT_FORCE_MORE_REELECTION и аналоги).
 	Quantum             = 2
 	HeartbeatTimeoutMs  = 23 * Quantum
 	ReelectionTimeoutMs = 127 * Quantum
 	TickerTimeoutMs     = 11 * Quantum
+
+	// TcpRpcTimeoutMs — таймаут TCP RPC (не зависит от Quantum), используется
+	// в production-транспорте. Исходное значение 85ms получено из 254/3 при
+	// Quantum=2. Вынесено в независимую константу, чтобы изменение Quantum
+	// для ускорения тестов не влияло на production-развёртывание.
+	TcpRpcTimeoutMs = 85
 
 	// leaderBatchSize — количество записей, которые лидер собирает из applyCh
 	// перед одним вызовом dispatchLogs. Компромисс между latency (одиночные
@@ -30,7 +42,7 @@ const (
 	// мелких коммитов в один батч.
 	applyBatchInterval = 50 * time.Millisecond
 
-	DebugCM = 1
+	TraceCM = 10
 )
 
 // CommitEntry — это данные, которые Raft отправляет в канал фиксации.
@@ -151,7 +163,7 @@ func NewConsensusModule(
 	// fsmMutateCh — канал для отправки закоммиченных записей в runFSM.
 	// Ёмкость 1024 обеспечивает burst-устойчивость: при массовом коммите
 	// processLogs отправляет все записи одним батчем без блокировки.
-	cm.fsmMutateCh = make(chan []*commitTuple, 1024)
+	cm.fsmMutateCh = make(chan []*commitTuple, batchApplyBuffer)
 	cm.shutdownCh = make(chan struct{})
 	cm.applyCh = make(chan *logFuture)
 	// verifyCh — канал для ReadIndex-подтверждения лидерства.
@@ -171,13 +183,14 @@ func NewConsensusModule(
 	cm.lastLogTerm = -1
 	cm.nextIndex = make(map[int]int)
 	cm.matchIndex = make(map[int]int)
-	cm.peerReplications = make(map[int]*peerReplication)
+	cm.inflightAE = make(map[int]*atomic.Bool)
 	cm.termIndexMap = make(map[int]int)
 	cm.electionTimerDone = make(chan struct{})
 	cm.preVoteDisabled = false
 	cm.leaderLastContact = time.Time{}
 	cm.leaderID = -1
 	cm.leadershipTransferCh = make(chan *leadershipTransferFuture, 1)
+	cm.logNeedsPersist = true
 
 	// Инициализация snapshot-полей.
 	cm.lastSnapshotIndex = -1
@@ -194,6 +207,7 @@ func NewConsensusModule(
 
 	if cm.storage.HasData() {
 		cm.restoreFromStorage()
+		cm.logNeedsPersist = false
 	}
 
 	// Установить начальную конфигурацию, если она ещё не задана
@@ -216,6 +230,7 @@ func NewConsensusModule(
 		cm.mu.Unlock()
 		cm.runElectionTimer()
 	}()
+	go cm.stats(context.Background())
 	return cm
 }
 

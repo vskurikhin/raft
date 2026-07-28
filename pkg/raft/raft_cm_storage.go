@@ -4,10 +4,19 @@ import (
 	"bytes"
 	"encoding/gob"
 	"log"
+	"time"
 )
 
 // persistToStorage сохраняет постоянное состояние CM в cm.storage.
+// Кодирование журнала выполняется только при cm.logNeedsPersist == true
+// (т.е. когда лог действительно изменился), что позволяет избежать
+// дорогого gob.Encode(cm.log) на каждом heartbeat или RPC.
 func (cm *ConsensusModule) persistToStorage() {
+	start := time.Now()
+	defer func() {
+		elapsed := time.Since(start)
+		cm.traceLogf(2, "persistToStorage elapsed %s", elapsed)
+	}()
 	var termData bytes.Buffer
 	if err := gob.NewEncoder(&termData).Encode(cm.currentTerm); err != nil {
 		log.Fatal(err)
@@ -20,11 +29,14 @@ func (cm *ConsensusModule) persistToStorage() {
 	}
 	cm.storage.Set("votedFor", votedData.Bytes())
 
-	var logData bytes.Buffer
-	if err := gob.NewEncoder(&logData).Encode(cm.log); err != nil {
-		log.Fatal(err)
+	if cm.logNeedsPersist {
+		var logData bytes.Buffer
+		if err := gob.NewEncoder(&logData).Encode(cm.log); err != nil {
+			log.Fatal(err)
+		}
+		cm.storage.Set("log", logData.Bytes())
+		cm.logNeedsPersist = false
 	}
-	cm.storage.Set("log", logData.Bytes())
 
 	var snapIdxData bytes.Buffer
 	if err := gob.NewEncoder(&snapIdxData).Encode(cm.lastSnapshotIndex); err != nil {

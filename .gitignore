@@ -215,5 +215,4 @@ target/
 
 .history
 .psql_history
-hashicorp/*
-uber-go/*
+.doc/*

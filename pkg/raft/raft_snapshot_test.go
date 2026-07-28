@@ -286,7 +286,7 @@ func TestSnapshot_NoSnapshotStore(t *testing.T) {
 			t.Fatalf("SubmitToServer(%d) failed", i)
 		}
 	}
-	sleepMs(500)
+	sleepMs(ReelectionTimeoutMs)
 
 	// Проверяем, что lastSnapshotIndex == -1 на всех узлах.
 	for i := 0; i < h.n; i++ {
@@ -341,7 +341,7 @@ func TestSnapshot_Install(t *testing.T) {
 	t.Log("reconnected follower")
 
 	// Ждём, пока follower получит снэпшот.
-	sleepMs(2000)
+	sleepMs(ReelectionTimeoutMs * 3)
 
 	// Проверяем, что follower догнал состояние.
 	followerSnapIdx := h.getSnapshotIndex(followerID)
@@ -350,7 +350,7 @@ func TestSnapshot_Install(t *testing.T) {
 	// Follower должен иметь снэпшот после InstallSnapshot.
 	if followerSnapIdx <= 0 {
 		// Иногда InstallSnapshot не срабатывает сразу — даём ещё время.
-		sleepMs(2000)
+		sleepMs(ReelectionTimeoutMs * 2)
 		followerSnapIdx = h.getSnapshotIndex(followerID)
 	}
 	if followerSnapIdx <= 0 {
@@ -546,7 +546,7 @@ func (h *snapshotHarness) waitForSingleLeader() int {
 				return i
 			}
 		}
-		time.Sleep(150 * time.Millisecond)
+		time.Sleep(HeartbeatTimeoutMs * time.Millisecond * 2)
 	}
 	return -1
 }
@@ -637,7 +637,7 @@ func TestSnapshot_MultipleSnapshots(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
-	defer reader.Close()
+	defer func() { _ = reader.Close() }()
 	data, _ := io.ReadAll(reader)
 	t.Logf("snapshot data: %d bytes, index=%d, term=%d", len(data), meta.Index, meta.Term)
 
@@ -647,7 +647,7 @@ func TestSnapshot_MultipleSnapshots(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
-	defer r2.Close()
+	defer func() { _ = r2.Close() }()
 	if err := fsm2.Restore(r2); err != nil {
 		t.Fatalf("Restore failed: %v", err)
 	}

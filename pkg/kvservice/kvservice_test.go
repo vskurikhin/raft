@@ -34,9 +34,10 @@ func TestNewKVService(t *testing.T) {
 			PeerIds:    []int{1, 2},
 			RPCAddress: ":0",
 			ServerID:   0,
+			Storage:    storage,
 		},
 		HTTPAddress: ":8080",
-	}, storage, ready)
+	}, ready)
 
 	if kvs.id != 0 {
 		t.Fatalf("expected id=0, got %d", kvs.id)

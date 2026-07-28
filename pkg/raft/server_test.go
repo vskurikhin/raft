@@ -26,10 +26,12 @@ func TestNewServer(t *testing.T) {
 	ready := make(chan any)
 
 	s := New(Config{
-		ServerID:   1,
+		Fsm:        NewCommitChannelFSM(commitChan),
 		PeerIds:    []int{2, 3},
 		RPCAddress: ":0",
-	}, storage, ready, NewCommitChannelFSM(commitChan))
+		ServerID:   1,
+		Storage:    storage,
+	}, ready)
 
 	if s.serverID != 1 {
 		t.Fatalf("expected serverID=1, got %d", s.serverID)
@@ -40,11 +42,10 @@ func TestNewServer(t *testing.T) {
 }
 
 func TestNewServerWrapper(t *testing.T) {
-	storage := NewMapStorage()
 	commitChan := make(chan CommitEntry, 10)
 	ready := make(chan any)
 
-	s := NewServer(2, []int{1, 3}, storage, ready, NewCommitChannelFSM(commitChan))
+	s := NewServer(2, []int{1, 3}, NewCommitChannelFSM(commitChan), ready)
 
 	if s.serverID != 2 {
 		t.Fatalf("expected serverID=2, got %d", s.serverID)

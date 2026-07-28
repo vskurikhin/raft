@@ -13,15 +13,16 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/vskurikhin/raft/internal/load/config"
 	"github.com/vskurikhin/raft/pkg/kvclient"
 )
 
 const (
-	KeyCount       = 2000
-	Workers        = 5
-	RequestRate    = 10 // общий RPS
-	VerifyPercent  = 100
-	GetPercent     = 90
+	// KeyCount       = 3000
+	Workers = 5
+	// RequestRate    = 202 // общий RPS
+	// VerifyPercent  = 75
+	// GetPercent     = 90
 	RequestTimeout = 10 * time.Second
 )
 
@@ -37,28 +38,31 @@ var (
 
 	reqCount  atomic.Uint64
 	latencyCh = make(chan time.Duration, 4096)
+
+	values config.Values
 )
 
 func init() {
-	keys = make([]string, KeyCount)
+	values = config.ParseFlags()
+	keys = make([]string, values.KeyCount)
 	for i := range keys {
 		keys[i] = fmt.Sprintf("key-%d", i)
 	}
 }
 
 func main() {
-	client := kvclient.New([]string{
-		"192.168.22.221:8880",
-		"192.168.22.222:8880",
-		"192.168.22.223:8880",
-	})
+	var peers []string
+	for _, peer := range values.Peers {
+		peers = append(peers, peer.String())
+	}
+	client := kvclient.New(peers)
 	ctx, cancel := signal.NotifyContext(
 		context.Background(),
 		os.Interrupt,
 		syscall.SIGTERM,
 	)
 	defer cancel()
-	interval := time.Second / RequestRate
+	interval := time.Second / time.Duration(values.RequestRate)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	var wg sync.WaitGroup
@@ -91,7 +95,7 @@ func run(client *kvclient.KVClient, rnd *rand.Rand) {
 	key := keys[rnd.Intn(len(keys))]
 	ctx, cancel := context.WithTimeout(context.Background(), RequestTimeout)
 	defer cancel()
-	if rnd.Intn(100) < GetPercent {
+	if rnd.Intn(100) < values.GetPercent {
 		_, _, err := client.Get(ctx, key)
 		if err != nil {
 			getFail.Add(1)
@@ -112,8 +116,9 @@ func run(client *kvclient.KVClient, rnd *rand.Rand) {
 		return
 	}
 	putOK.Add(1)
-	if rnd.Intn(100) < VerifyPercent {
+	if rnd.Intn(100) < values.VerifyPercent {
 		got, ok, err := client.Get(ctx, key)
+		reqCount.Add(1)
 		if err != nil || !ok || got != value {
 			verifyBad.Add(1)
 		} else {
@@ -145,16 +150,17 @@ func stats(ctx context.Context) {
 					break drain
 				}
 			}
-			p50, p95, p99 := 0.0, 0.0, 0.0
+			p50, p80, p95, p99 := 0.0, 0.0, 0.0, 0.0
 			if n := len(latencies); n > 0 {
 				sort.Float64s(latencies)
 				p50 = latencies[n*50/100]
+				p80 = latencies[n*80/100]
 				p95 = latencies[n*95/100]
 				p99 = latencies[n*99/100]
 			}
 			msg := fmt.Sprintf(
-				"RPS=%5d  p50=%7.2fms p95=%7.2fms p99=%7.2fms  GET ok=%8d fail=%4d  PUT ok=%8d fail=%4d  VERIFY ok=%6d bad=%4d\n",
-				rps, p50, p95, p99,
+				"RPS=%5d  p50=%7.2fms p80=%7.2fms p95=%7.2fms p99=%7.2fms  GET ok=%8d fail=%4d  PUT ok=%8d fail=%4d  VERIFY ok=%6d bad=%4d\n",
+				rps, p50, p80, p95, p99,
 				getOK.Load(),
 				getFail.Load(),
 				putOK.Load(),

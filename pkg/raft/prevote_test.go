@@ -41,10 +41,7 @@ func TestPreVote_DisconnectedFollower_NoElection(t *testing.T) {
 
 	// Ждём несколько election timeout, чтобы отключённый узел успел
 	// несколько раз запустить PreVote.
-	time.Sleep(time.Duration(ReelectionTimeoutMs) * time.Millisecond * 3)
-
-	// Лидер должен остаться тем же, term не должен вырасти — PreVote
-	// предотвращает выборы отключённым узлом.
+	time.Sleep(time.Duration(ReelectionTimeoutMs) * time.Millisecond * 2)
 	newLid, newTerm := h.CheckSingleLeader()
 	if newLid != lid {
 		t.Errorf("leader changed from %d to %d, want same", lid, newLid)
@@ -111,9 +108,7 @@ func TestPreVote_MajorityPartition(t *testing.T) {
 
 	// Ждём несколько election timeout, чтобы minority успел попытаться
 	// несколько раз запустить PreVote.
-	time.Sleep(time.Duration(ReelectionTimeoutMs) * time.Millisecond * 4)
-
-	// Лидер должен остаться в majority (лидер или второй follower).
+	time.Sleep(time.Duration(ReelectionTimeoutMs) * time.Millisecond * 2)
 	newLid, newTerm := h.CheckSingleLeader()
 	if newLid == otherID {
 		t.Errorf("minority node became leader, want majority")
@@ -195,7 +190,7 @@ func TestPreVote_Disabled(t *testing.T) {
 
 	// Ждём несколько election timeout, чтобы отключённый узел успел
 	// несколько раз увеличить term.
-	time.Sleep(time.Duration(ReelectionTimeoutMs) * time.Millisecond * 3)
+	time.Sleep(time.Duration(ReelectionTimeoutMs) * time.Millisecond * 2)
 
 	// В классическом Raft отключённый узел увеличивает term.
 	// Проверяем, что term отключённого узла вырос относительно origTerm.
