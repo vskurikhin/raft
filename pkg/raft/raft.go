@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	DebugCM = 1
+	DebugCM = 0
 	Quantum = 2
 
 	HeartbeatTimeoutMs  = 50 * Quantum
@@ -103,8 +103,9 @@ type ConsensusModule struct {
 
 	id      int
 	peerIds []int
-	server  *Server
 	storage Storage
+
+	transport Transport
 
 	fsm         FSM
 	fsmMutateCh chan []*commitTuple
@@ -135,7 +136,7 @@ type ConsensusModule struct {
 func NewConsensusModule(
 	id int,
 	peerIds []int,
-	server *Server,
+	transport Transport,
 	storage Storage,
 	fsm FSM,
 	ready <-chan any,
@@ -143,7 +144,7 @@ func NewConsensusModule(
 	cm := new(ConsensusModule)
 	cm.id = id
 	cm.peerIds = peerIds
-	cm.server = server
+	cm.transport = transport
 	cm.storage = storage
 	cm.fsm = fsm
 	cm.fsmMutateCh = make(chan []*commitTuple, 16)
@@ -164,6 +165,7 @@ func NewConsensusModule(
 	}
 
 	go cm.runFSM()
+	go cm.runRPCReader()
 
 	go func() {
 		<-ready
@@ -180,6 +182,35 @@ func (cm *ConsensusModule) Report() (id, term int, isLeader bool) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	return cm.id, cm.currentTerm, cm.state == Leader
+}
+
+// runRPCReader — горутина, читающая входящие RPC-запросы из транспорта
+// и диспатчащая их по типу команды. Ответ отправляется через RespChan.
+// Завершает работу при закрытии shutdownCh.
+func (cm *ConsensusModule) runRPCReader() {
+	consumer := cm.transport.Consumer()
+	for {
+		select {
+		case rpc, ok := <-consumer:
+			if !ok {
+				return
+			}
+			switch cmd := rpc.Command.(type) {
+			case *RequestVoteArgs:
+				var reply RequestVoteReply
+				err := cm.RequestVote(*cmd, &reply)
+				rpc.RespChan <- RPCResponse{Reply: &reply, Error: err}
+			case *AppendEntriesArgs:
+				var reply AppendEntriesReply
+				err := cm.AppendEntries(*cmd, &reply)
+				rpc.RespChan <- RPCResponse{Reply: &reply, Error: err}
+			default:
+				rpc.RespChan <- RPCResponse{Error: ErrNotImplemented}
+			}
+		case <-cm.shutdownCh:
+			return
+		}
+	}
 }
 
 // Stop останавливает этот CM.
@@ -253,6 +284,29 @@ func checkRPCHeader(rpc WithRPCHeader) error {
 	}
 
 	return nil
+}
+
+// RequestPreVoteArgs — аргументы RPC предварительного голосования (§4 Pre-Vote).
+type RequestPreVoteArgs struct {
+	RPCHeader
+	Term         int
+	LastLogIndex int
+	LastLogTerm  int
+}
+
+func (r *RequestPreVoteArgs) GetRPCHeader() RPCHeader {
+	return r.RPCHeader
+}
+
+// RequestPreVoteReply — ответ на RequestPreVote RPC.
+type RequestPreVoteReply struct {
+	RPCHeader
+	Term        int
+	VoteGranted bool
+}
+
+func (r *RequestPreVoteReply) GetRPCHeader() RPCHeader {
+	return r.RPCHeader
 }
 
 // RequestVoteArgs См. рисунок 2 в статье.
@@ -554,8 +608,8 @@ func (cm *ConsensusModule) startElection() {
 			}
 
 			cm.dLogf("sending RequestVote to %d: %+v", peerID, args)
-			var reply RequestVoteReply
-			if err := cm.server.Call(peerID, "ConsensusModule.RequestVote", args, &reply); err == nil {
+			reply, err := cm.transport.RequestVote(ServerID(peerID), args)
+			if err == nil {
 				cm.mu.Lock()
 				defer cm.mu.Unlock()
 				cm.dLogf("received RequestVoteReply %+v", reply)
@@ -723,8 +777,8 @@ func (cm *ConsensusModule) nextIndexArgsEntries(peerID, savedCurrentTerm int) (i
 func (cm *ConsensusModule) leaderSendAEsToPeer(peerID, savedCurrentTerm int) {
 	ni, args, entries := cm.nextIndexArgsEntries(peerID, savedCurrentTerm)
 	cm.dLogf("sending AppendEntries to %v: ni=%d, args=%+v", peerID, ni, args)
-	var reply AppendEntriesReply
-	if err := cm.server.Call(peerID, "ConsensusModule.AppendEntries", args, &reply); err == nil {
+	reply, err := cm.transport.AppendEntries(ServerID(peerID), args)
+	if err == nil {
 		cm.mu.Lock()
 		// К сожалению, здесь нельзя просто использовать
 		// defer cm.mu.Unlock(), поскольку в одной из ветвей
@@ -866,32 +920,6 @@ func (cm *ConsensusModule) Apply(command any, timeout time.Duration) ApplyFuture
 	case cm.applyCh <- future:
 		return future
 	}
-}
-
-// Submit отправляет команду напрямую в журнал (без future).
-// Возвращает индекс записи или -1, если не лидер.
-func (cm *ConsensusModule) Submit(command any) int {
-	cm.mu.Lock()
-	if cm.state != Leader {
-		cm.mu.Unlock()
-		return -1
-	}
-	cm.dLogf("Submit received by %v: %v", cm.state, command)
-	submitIndex := len(cm.log)
-	cm.log = append(cm.log, LogEntry{
-		Index:   submitIndex,
-		Term:    cm.currentTerm,
-		Type:    LogCommand,
-		Command: command,
-	})
-	cm.persistToStorage()
-	cm.dLogf("... log=%v", cm.log)
-	cm.mu.Unlock()
-	select {
-	case cm.triggerAEChan <- struct{}{}:
-	default:
-	}
-	return submitIndex
 }
 
 // runFSM — отдельная горутина, применяющая закоммиченные записи к FSM.

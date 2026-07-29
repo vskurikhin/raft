@@ -224,7 +224,8 @@ func testServerWithFSM(t testing.TB, fsm FSM) *ConsensusModule {
 	ready := make(chan any)
 	close(ready)
 
-	cm := NewConsensusModule(0, []int{}, nil, storage, fsm, ready)
+	transport := NewInmemTransport("single")
+	cm := NewConsensusModule(0, []int{}, transport, storage, fsm, ready)
 	return cm
 }
 
@@ -233,7 +234,8 @@ func testServerWithFSM(t testing.TB, fsm FSM) *ConsensusModule {
 func testFSMHarness(t *testing.T) (*Harness, *CaptureFSM) {
 	t.Helper()
 	n := 1
-	ns := make([]*Server, n)
+	cluster := make([]*ConsensusModule, n)
+	transports := make([]*InmemTransport, n)
 	storage := make([]*MapStorage, n)
 	commitChans := make([]chan CommitEntry, n)
 	commits := make([][]CommitEntry, n)
@@ -243,22 +245,21 @@ func testFSMHarness(t *testing.T) (*Harness, *CaptureFSM) {
 
 	capture := &CaptureFSM{}
 
+	transports[0] = NewInmemTransport("single-0")
 	storage[0] = NewMapStorage()
 	commitChans[0] = make(chan CommitEntry)
 	fsm := &captureCommitFSM{
 		CaptureFSM:    capture,
 		commitChanFSM: NewCommitChannelFSM(commitChans[0]),
 	}
-	ns[0] = New(Config{
-		ServerID: 0,
-	}, storage[0], ready, fsm)
-	ns[0].Serve(":0")
+	cluster[0] = NewConsensusModule(0, []int{}, transports[0], storage[0], fsm, ready)
 	alive[0] = true
 	connected[0] = true
 	close(ready)
 
 	h := &Harness{
-		cluster:     ns,
+		cluster:     cluster,
+		transports:  transports,
 		storage:     storage,
 		commitChans: commitChans,
 		commits:     commits,
@@ -340,7 +341,7 @@ func TestSingleNodeApplyResponse(t *testing.T) {
 	defer leaktest.CheckTimeout(t, 500*Quantum*time.Millisecond)()
 	h, capture := testFSMHarness(t)
 	defer h.Shutdown()
-	waitForLeader(t, h.cluster[0].cm, 800*time.Millisecond)
+	waitForLeader(t, h.cluster[0], 800*time.Millisecond)
 
 	future := h.cluster[0].Apply("cmd1", 0)
 	if err := future.Error(); err != nil {
@@ -465,7 +466,7 @@ func TestBatchApplyOrderAndIndices(t *testing.T) {
 	defer leaktest.CheckTimeout(t, 500*Quantum*time.Millisecond)()
 	h, capture := testFSMHarness(t)
 	defer h.Shutdown()
-	waitForLeader(t, h.cluster[0].cm, 800*time.Millisecond)
+	waitForLeader(t, h.cluster[0], 800*time.Millisecond)
 
 	values := []int{42, 55, 81}
 	futures := make([]ApplyFuture, len(values))
@@ -573,7 +574,7 @@ func TestApplyNoQuorumThenNewLeader(t *testing.T) {
 		Entries:      []LogEntry{},
 		LeaderCommit: -1,
 	}
-	if err := h.cluster[lid].cm.AppendEntries(args, &AppendEntriesReply{}); err != nil {
+	if err := h.cluster[lid].AppendEntries(args, &AppendEntriesReply{}); err != nil {
 		t.Fatal(err)
 	}
 	sleepMs(100)

@@ -1,5 +1,9 @@
 package raft
 
+import (
+	"io"
+)
+
 // FSM — интерфейс машины состояний клиента Raft.
 // Все закоммиченные записи журнала применяются к FSM через Apply.
 type FSM interface {
@@ -26,4 +30,28 @@ func (f *CommitChannelFSM) Apply(log *LogEntry) any {
 		Term:    log.Term,
 	}
 	return nil
+}
+
+// FSMSnapshot — заглушка (будет реализована в Snapshot feature).
+type FSMSnapshot interface {
+	Persist(SnapshotSink) error
+	Release()
+}
+
+// SnapshotSink — заглушка (будет реализована в Snapshot feature).
+type SnapshotSink interface {
+	io.WriteCloser
+	ID() string
+	Cancel() error
+}
+
+// SnapshotMeta — заглушка (будет реализована в Snapshot feature).
+type SnapshotMeta struct {
+	Version       int
+	ID            string
+	Index         int
+	Term          int
+	Configuration []byte
+	ConfigIndex   int
+	Size          int64
 }
