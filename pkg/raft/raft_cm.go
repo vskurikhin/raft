@@ -1037,7 +1037,10 @@ func (cm *ConsensusModule) handleInstallSnapshot(rpc RPC, req *InstallSnapshotRe
 	var rpcErr error
 	defer func() {
 		if rpc.Reader != nil {
-			_, _ = io.Copy(io.Discard, rpc.Reader)
+			// Drain остатка данных снэпшота с лимитом, чтобы не зависнуть
+			// при повреждённом соединении. Лимит maxSnapshotDataSize
+			// гарантирует завершение drain даже при некорректном DataSize.
+			_, _ = io.CopyN(io.Discard, rpc.Reader, maxSnapshotDataSize)
 		}
 		rpc.RespChan <- RPCResponse{Reply: resp, Error: rpcErr}
 	}()
@@ -1715,7 +1718,7 @@ func (cm *ConsensusModule) runPreCandidate() {
 				var resp *RequestPreVoteReply
 				if err == ErrNotImplemented {
 					// Если транспорт не поддерживает PreVote, считаем голос
-					// предоставленным (как в hashicorp/raft).
+					// предоставленным.
 					resp = &RequestPreVoteReply{
 						RPCHeader:   RPCHeader{ProtocolVersion: ProtocolVersion, ServerID: cm.id},
 						Term:        savedTerm,
