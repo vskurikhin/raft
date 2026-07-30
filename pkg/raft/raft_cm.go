@@ -1078,6 +1078,10 @@ func (cm *ConsensusModule) handleInstallSnapshot(rpc RPC, req *InstallSnapshotRe
 		rpcErr = err
 		return
 	}
+	if sink == nil {
+		rpcErr = fmt.Errorf("snapshotStore.Create returned nil sink without error")
+		return
+	}
 
 	if rpc.Reader == nil {
 		_ = sink.Cancel()
@@ -2193,6 +2197,9 @@ func (cm *ConsensusModule) takeSnapshot() error {
 	sink, err := cm.snapshotStore.Create(snapReq.index, snapReq.term, committed, committedIndex)
 	if err != nil {
 		return fmt.Errorf("failed to create snapshot: %w", err)
+	}
+	if sink == nil {
+		return fmt.Errorf("snapshotStore.Create returned nil sink without error")
 	}
 
 	if err := snapReq.snapshot.Persist(sink); err != nil {
