@@ -1946,6 +1946,10 @@ func (cm *ConsensusModule) sendBatch(start, end int) {
 			continue
 		}
 		pos := cm.logPosition(idx)
+		if pos >= len(cm.log) {
+			cm.traceLogf(0, "sendBatch: logPosition(%d) returned %d, len(log)=%d", idx, pos, len(cm.log))
+			continue
+		}
 		log := &cm.log[pos]
 		batch = append(batch, &commitTuple{log: log, future: future})
 	}
