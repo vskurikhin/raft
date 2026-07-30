@@ -1821,29 +1821,49 @@ func (cm *ConsensusModule) runRPCReader() {
 			if !ok {
 				return
 			}
-			switch cmd := rpc.Command.(type) {
-			case *RequestVoteArgs:
-				var reply RequestVoteReply
-				err := cm.RequestVote(*cmd, &reply)
-				rpc.RespChan <- RPCResponse{Reply: &reply, Error: err}
-			case *AppendEntriesArgs:
-				var reply AppendEntriesReply
-				err := cm.AppendEntries(*cmd, &reply)
-				rpc.RespChan <- RPCResponse{Reply: &reply, Error: err}
-			case *RequestPreVoteArgs:
-				var reply RequestPreVoteReply
-				err := cm.RequestPreVote(*cmd, &reply)
-				rpc.RespChan <- RPCResponse{Reply: &reply, Error: err}
-			case *TimeoutNowRequest:
-				cm.timeoutNow(rpc, cmd)
-			case *InstallSnapshotRequest:
-				cm.handleInstallSnapshot(rpc, cmd)
-			default:
-				rpc.RespChan <- RPCResponse{Error: ErrNotImplemented}
-			}
+			cm.handleRPC(rpc)
 		case <-cm.shutdownCh:
 			return
 		}
+	}
+}
+
+// handleRPC диспатчит один RPC-запрос по типу команды и отправляет ответ.
+// Ответ отправляется с защитой от закрытого канала (select/default).
+// timeoutNow и handleInstallSnapshot сами управляют RespChan.
+func (cm *ConsensusModule) handleRPC(rpc RPC) {
+	cm.traceLogf(8, "handleRPC: %T", rpc.Command)
+
+	switch cmd := rpc.Command.(type) {
+	case *RequestVoteArgs:
+		var reply RequestVoteReply
+		err := cm.RequestVote(*cmd, &reply)
+		cm.respondRPC(rpc, &reply, err)
+	case *AppendEntriesArgs:
+		var reply AppendEntriesReply
+		err := cm.AppendEntries(*cmd, &reply)
+		cm.respondRPC(rpc, &reply, err)
+	case *RequestPreVoteArgs:
+		var reply RequestPreVoteReply
+		err := cm.RequestPreVote(*cmd, &reply)
+		cm.respondRPC(rpc, &reply, err)
+	case *TimeoutNowRequest:
+		cm.timeoutNow(rpc, cmd)
+	case *InstallSnapshotRequest:
+		cm.handleInstallSnapshot(rpc, cmd)
+	default:
+		cm.respondRPC(rpc, nil, ErrNotImplemented)
+	}
+}
+
+// respondRPC отправляет ответ через rpc.RespChan с защитой от закрытого канала.
+// Если канал закрыт или получатель недоступен — ответ теряется, что допустимо
+// при разрыве соединения.
+func (cm *ConsensusModule) respondRPC(rpc RPC, reply any, err error) {
+	select {
+	case rpc.RespChan <- RPCResponse{Reply: reply, Error: err}:
+	default:
+		cm.traceLogf(1, "rpc.RespChan closed/unavailable for %T", rpc.Command)
 	}
 }
 
