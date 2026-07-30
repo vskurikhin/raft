@@ -2170,6 +2170,8 @@ func (cm *ConsensusModule) takeSnapshot() error {
 	case cm.fsmSnapshotCh <- snapReq:
 	case <-cm.shutdownCh:
 		return ErrRaftShutdown
+	case <-time.After(defaultTakeSnapshotTimeout):
+		return fmt.Errorf("takeSnapshot: timeout sending to fsmSnapshotCh")
 	}
 
 	if err := snapReq.Error(); err != nil {

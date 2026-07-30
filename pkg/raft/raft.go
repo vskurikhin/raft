@@ -119,6 +119,13 @@ const defaultSnapshotThreshold = 1024
 // defaultSnapshotThreshold.
 const defaultSnapshotInterval = 3 * time.Second
 
+// defaultTakeSnapshotTimeout — таймаут отправки запроса на снэпшот
+// в fsmSnapshotCh. Если runFSM не принимает запрос за это время,
+// takeSnapshot возвращает ошибку вместо вечной блокировки.
+// Значение 30 секунд выбрано как разумный максимум для создания
+// снэпшота в production (запись состояния + persist на диск).
+const defaultTakeSnapshotTimeout = 30 * time.Second
+
 // defaultTrailingLogs — количество записей журнала, сохраняемых
 // после самого свежего снэпшота. Нужно для поддержки репликации
 // без отправки полного снэпшота каждому новому follower.
