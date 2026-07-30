@@ -19,8 +19,8 @@ const (
 	connSendBufferSize = 256 * 1024
 
 	// defaultMaxPool — максимальное количество соединений в пуле на один
-	// целевой адрес. Значение 2 выбрано по аналогии с hashicorp/raft:
-	// позволяет переиспользовать соединения без избыточного удержания ресурсов.
+	// целевой адрес. Значение 2 позволяет переиспользовать соединения
+	// без избыточного удержания ресурсов.
 	defaultMaxPool = 2
 )
 
@@ -463,7 +463,7 @@ func (t *TCPTransport) untrackConn(conn net.Conn) {
 
 // handleConn обрабатывает входящее соединение в цикле, пока не возникнет
 // ошибка или соединение не будет закрыто. Переиспользует одно TCP-соединение
-// для множества RPC (аналог hashicorp/raft handleConn).
+// для множества RPC.
 func (t *TCPTransport) handleConn(conn net.Conn) {
 	defer t.wg.Done()
 	defer t.untrackConn(conn)
@@ -481,7 +481,7 @@ func (t *TCPTransport) handleConn(conn net.Conn) {
 		default:
 		}
 
-		if err := t.handleCommand(r, dec, enc); err != nil {
+		if err := t.handleCommand(r, conn, dec, enc); err != nil {
 			if err != io.EOF {
 				log.Printf("raft: handle conn error: %v", err)
 			}
@@ -496,9 +496,11 @@ func (t *TCPTransport) handleConn(conn net.Conn) {
 
 // handleCommand декодирует и диспатчит один RPC-запрос из входящего потока.
 // Возвращает ошибку, если декодирование не удалось — вызывающий закрывает соединение.
-// r — bufio.Reader, из которого был создан dec; нужен для чтения сырых данных
-// снэпшота при InstallSnapshot.
-func (t *TCPTransport) handleCommand(r *bufio.Reader, dec *gob.Decoder, enc *gob.Encoder) error {
+// r — bufio.Reader, из которого был создан dec.
+// conn — TCP-соединение, используется для чтения данных снэпшота напрямую
+// (минуя bufio), чтобы избежать повреждения внутреннего состояния bufio
+// после ошибок gob-декодирования.
+func (t *TCPTransport) handleCommand(r *bufio.Reader, conn net.Conn, dec *gob.Decoder, enc *gob.Encoder) error {
 	var req tcpRPCRequest
 	if err := dec.Decode(&req); err != nil {
 		return err
@@ -520,12 +522,15 @@ func (t *TCPTransport) handleCommand(r *bufio.Reader, dec *gob.Decoder, enc *gob
 		cmd = &v
 	}
 
-	// Для InstallSnapshot читаем данные снэпшота из буферизированного ридера
-	// и передаём через rpc.Reader. Декларация ДО heartbeat fast-path,
-	// чтобы goto RESP не перепрыгивал через переменную.
+	// Для InstallSnapshot читаем данные снэпшота напрямую из TCP-соединения,
+	// минуя bufio.Reader, который используется gob.Decoder. После ошибок
+	// декодирования gob внутреннее состояние bufio (b.r/b.w) может быть
+	// повреждено, поэтому разделяем источники данных.
+	// conn.Read безопасен — handleConn не вызывает conn.Read до следующей
+	// итерации цикла (flush + decode).
 	var snapReader io.ReadCloser
 	if req, ok := cmd.(*InstallSnapshotRequest); ok && req.DataSize > 0 {
-		snapReader = io.NopCloser(io.LimitReader(r, req.DataSize))
+		snapReader = io.NopCloser(io.LimitReader(conn, req.DataSize))
 	}
 
 	// Heartbeat fast-path: если это heartbeat и установлен обработчик,

@@ -42,6 +42,14 @@ const (
 	// мелких коммитов в один батч.
 	applyBatchInterval = 50 * time.Millisecond
 
+	// maxSnapshotDataSize — максимальный допустимый размер данных снэпшота
+	// в байтах. Значение 1 ГБ выбрано как разумный предел для production
+	// (больше типичного размера состояния, но достаточно для обнаружения
+	// некорректного DataSize в запросе InstallSnapshot). Установлено в
+	// 1 << 30 для согласованности с hashicorp/raft.
+	// Защита от паники io.Copy при повреждённом DataSize.
+	maxSnapshotDataSize = 1 << 30
+
 	TraceCM = 10
 )
 

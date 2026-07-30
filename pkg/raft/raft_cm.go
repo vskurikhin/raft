@@ -1062,6 +1062,14 @@ func (cm *ConsensusModule) handleInstallSnapshot(rpc RPC, req *InstallSnapshotRe
 		return
 	}
 
+	// Валидация DataSize перед созданием снепшота.
+	// Некорректный DataSize может привести к панике io.Copy
+	// при повреждённом bufio.Reader.
+	if req.DataSize <= 0 || req.DataSize > maxSnapshotDataSize {
+		rpcErr = fmt.Errorf("invalid DataSize %d", req.DataSize)
+		return
+	}
+
 	sink, err := cm.snapshotStore.Create(req.LastLogIndex, req.LastLogTerm, cfg, req.ConfigIndex)
 	if err != nil {
 		rpcErr = err
