@@ -500,7 +500,7 @@ func (t *TCPTransport) handleConn(conn net.Conn) {
 // conn — TCP-соединение, используется для чтения данных снэпшота напрямую
 // (минуя bufio), чтобы избежать повреждения внутреннего состояния bufio
 // после ошибок gob-декодирования.
-func (t *TCPTransport) handleCommand(r *bufio.Reader, conn net.Conn, dec *gob.Decoder, enc *gob.Encoder) error {
+func (t *TCPTransport) handleCommand(_ *bufio.Reader, conn net.Conn, dec *gob.Decoder, enc *gob.Encoder) error {
 	var req tcpRPCRequest
 	if err := dec.Decode(&req); err != nil {
 		return err

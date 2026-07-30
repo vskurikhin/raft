@@ -2180,6 +2180,9 @@ func (cm *ConsensusModule) takeSnapshot() error {
 		}
 		return err
 	}
+	if snapReq.snapshot == nil {
+		return fmt.Errorf("takeSnapshot: snapshot is nil after successful FSM response")
+	}
 	defer snapReq.snapshot.Release()
 
 	cm.mu.Lock()
