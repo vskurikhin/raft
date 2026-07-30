@@ -924,6 +924,17 @@ func (cm *ConsensusModule) dispatchLogs(applyLogs []*logFuture) {
 	cm.mu.Lock()
 	cm.dispatchLogsUnsafe(applyLogs)
 
+	// Защита от nil cm.log после dispatchLogsUnsafe. В нормальном состоянии
+	// append гарантирует non-nil срез, но defensive check предотвращает
+	// панику в commitmentTracker.commit при нарушении инварианта.
+	if cm.log == nil {
+		for _, f := range applyLogs {
+			f.respond(ErrLeadershipLost)
+		}
+		cm.mu.Unlock()
+		return
+	}
+
 	// Продвигаем commitIndex через commitmentTracker.
 	// Для single-node кластера это приводит к немедленному коммиту.
 	// Для multi-node кластера учитываются matchIndex всех peer-ов.
@@ -1714,6 +1725,19 @@ func (cm *ConsensusModule) runPreCandidate() {
 			lastLogIndex, lastLogTerm := cm.lastLogIndexAndTerm()
 			savedTerm := cm.currentTerm
 			cm.mu.Unlock()
+
+			if cm.transport == nil {
+				cm.traceLogf(0, "runPreCandidate: transport is nil, cannot send to %d", peerID)
+				select {
+				case preVoteRespCh <- &RequestPreVoteReply{
+					RPCHeader:   RPCHeader{ProtocolVersion: ProtocolVersion, ServerID: cm.id},
+					Term:        savedTerm,
+					VoteGranted: false,
+				}:
+				case <-ctx.Done():
+				}
+				return
+			}
 
 			args := RequestPreVoteArgs{
 				RPCHeader: RPCHeader{
