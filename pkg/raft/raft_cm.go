@@ -1105,8 +1105,18 @@ func (cm *ConsensusModule) handleInstallSnapshot(rpc RPC, req *InstallSnapshotRe
 		return
 	}
 
+	// Валидация ID снепшота перед Open.
+	// Некорректный ID (пустая строка) может вызвать панику
+	// в реализации SnapshotStore.
+	sinkID := sink.ID()
+	if sinkID == "" {
+		_ = sink.Cancel()
+		rpcErr = fmt.Errorf("sink.ID() is empty")
+		return
+	}
+
 	// Restore через прямой вызов fsm.Restore.
-	meta, snapReader, err := cm.snapshotStore.Open(sink.ID())
+	meta, snapReader, err := cm.snapshotStore.Open(sinkID)
 	if err != nil {
 		rpcErr = err
 		return
