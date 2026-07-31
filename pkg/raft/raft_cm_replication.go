@@ -49,7 +49,7 @@ func (cm *ConsensusModule) leaderSendAEsToPeer(peerID, savedCurrentTerm int) {
 
 	cm.mu.Lock()
 	ni := cm.nextIndex[peerID]
-	if ni <= cm.lastSnapshotIndex && cm.snapshotStore != nil {
+	if ni <= cm.lastSnapshotIndex && !isNilInterface(cm.snapshotStore) {
 		cm.mu.Unlock()
 		cm.leaderSendSnapshot(peerID, savedCurrentTerm)
 		return
@@ -62,7 +62,7 @@ func (cm *ConsensusModule) leaderSendAEsToPeer(peerID, savedCurrentTerm int) {
 	if err == nil {
 		cm.mu.Lock()
 		if reply.Term > cm.currentTerm {
-			cm.traceLogf(8, "term out of date in heartbeat reply")
+			cm.traceLogfLocked(8, "term out of date in heartbeat reply")
 			cm.becomeFollower(reply.Term)
 			cm.mu.Unlock()
 			return
@@ -73,7 +73,7 @@ func (cm *ConsensusModule) leaderSendAEsToPeer(peerID, savedCurrentTerm int) {
 				cm.matchIndex[peerID] = cm.nextIndex[peerID] - 1
 
 				cm.commitmentTracker.setMatch(peerID, cm.matchIndex[peerID], cm.lookupTerm)
-				cm.traceLogf(
+				cm.traceLogfLocked(
 					8, "AppendEntries reply from %d success: nextIndex := %v, matchIndex := %v; commitIndex := %d",
 					peerID, cm.nextIndex, cm.matchIndex, cm.commitmentTracker.getCommitIndex(),
 				)
@@ -104,7 +104,7 @@ func (cm *ConsensusModule) leaderSendAEsToPeer(peerID, savedCurrentTerm int) {
 				} else {
 					cm.nextIndex[peerID] = reply.ConflictIndex
 				}
-				cm.traceLogf(8, "AppendEntries reply from %d !success: nextIndex := %d", peerID, ni-1)
+				cm.traceLogfLocked(8, "AppendEntries reply from %d !success: nextIndex := %d", peerID, ni-1)
 				cm.mu.Unlock()
 			}
 		} else {
@@ -164,8 +164,27 @@ func (cm *ConsensusModule) leaderSendSnapshot(peerID int, term int) {
 		cm.traceLogf(4, "leaderSendSnapshot elapsed %s", elapsed)
 	}()
 	cm.traceLogf(4, "leaderSendSnapshot peer %d: term=%d", peerID, term)
+
+	// Защита от nil-хранилища. Инвариант проверяется и в вызывающем коде
+	// (leaderSendAEsToPeer), но при рефакторинге он может нарушиться,
+	// а паника здесь упала бы в отдельной горутине без recover().
+	if isNilInterface(cm.snapshotStore) {
+		cm.traceLogf(4, "leaderSendSnapshot: snapshotStore is nil, cannot send to %d", peerID)
+		return
+	}
+
 	snapshots, err := cm.snapshotStore.List()
 	if err != nil || len(snapshots) == 0 {
+		return
+	}
+	// List() может вернуть слайс с nil-элементом или пустым ID — оба
+	// случая приводят к панике или некорректной работе Open().
+	if snapshots[0] == nil {
+		cm.traceLogf(4, "leaderSendSnapshot: snapshots[0] is nil")
+		return
+	}
+	if snapshots[0].ID == "" {
+		cm.traceLogf(4, "leaderSendSnapshot: snapshots[0].ID is empty")
 		return
 	}
 	meta, reader, err := cm.snapshotStore.Open(snapshots[0].ID)
@@ -195,7 +214,11 @@ func (cm *ConsensusModule) leaderSendSnapshot(peerID int, term int) {
 		return
 	}
 	if reply.Term > term {
+		// becomeFollower требует удержания cm.mu; здесь блокировка
+		// не удерживается (RPC выполнялся без блокировки).
+		cm.mu.Lock()
 		cm.becomeFollower(reply.Term)
+		cm.mu.Unlock()
 		return
 	}
 	if reply.Success {

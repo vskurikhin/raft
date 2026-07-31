@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"time"
@@ -42,14 +41,22 @@ var (
 	defer func() { latencyHandleInstallSnapshotCh <- time.Since(startTimeNow) }()
 */
 
-func (cm *ConsensusModule) stats(ctx context.Context) {
+func (cm *ConsensusModule) stats(shutdownCh chan struct{}) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-ctx.Done():
+		case <-shutdownCh:
 			return
 		case <-ticker.C:
+			// Чтение состояния под cm.mu: поля cm.state/cm.id/cm.currentTerm
+			// изменяются под мутексом (в т.ч. в Stop), их чтение без
+			// блокировки — data race.
+			cm.mu.Lock()
+			state := cm.state
+			id := cm.id
+			currentTerm := cm.currentTerm
+			cm.mu.Unlock()
 			var (
 				appendEntriesLatencies     []float64
 				batchingFSMLatencies       []float64
@@ -108,7 +115,7 @@ func (cm *ConsensusModule) stats(ctx context.Context) {
 					" InstSnapShot=%5.2fms, ProcessLog=%5.2fms, RqPVt=%5.2fms, RqVote=%5.2fms,"+
 					" SendBatch=%5.2fms, TakeSnapshot=%5.2fms, TmOutNowRq=%5.2fms\n",
 				time.Now().Format("2006-01-02 15:04:05.0000"),
-				stateLetter(cm.state), cm.id, cm.currentTerm,
+				stateLetter(state), id, currentTerm,
 				ae, batchingFSM, election, fsmSnapsh,
 				installSnapshot, processLogs, requestPreVote, requestVote,
 				sendBatch, takeSnapshot, timeoutNowRequest,

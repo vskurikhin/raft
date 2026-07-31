@@ -10,12 +10,14 @@ import (
 )
 
 // mockTransportAE — минимальная реализация Transport для тестов,
-// подсчитывающая вызовы AppendEntries с возможностью задания задержки.
+// подсчитывающая вызовы AppendEntries и InstallSnapshot с возможностью
+// задания задержки AppendEntries.
 type mockTransportAE struct {
 	Transport
-	callCount atomic.Int32
-	delay     time.Duration
-	blockCh   chan struct{}
+	callCount        atomic.Int32
+	installCallCount atomic.Int32
+	delay            time.Duration
+	blockCh          chan struct{}
 }
 
 func (m *mockTransportAE) AppendEntries(_ ServerID, _ AppendEntriesArgs) (AppendEntriesReply, error) {
@@ -33,6 +35,7 @@ func (m *mockTransportAE) AppendEntries(_ ServerID, _ AppendEntriesArgs) (Append
 }
 
 func (m *mockTransportAE) InstallSnapshot(_ ServerID, _ InstallSnapshotRequest, _ io.Reader) (InstallSnapshotResponse, error) {
+	m.installCallCount.Add(1)
 	return InstallSnapshotResponse{
 		Success: true,
 	}, nil
@@ -292,6 +295,48 @@ func TestInflightAE_NilSafe(t *testing.T) {
 	cm.leaderSendAEsToPeer(1, 1)
 }
 
+// TestBecomeFollower_InflightAE_NilEntry проверяет, что becomeFollower
+// безопасна при наличии nil-элемента в inflightAE. Тот же защищённый
+// код используется и в defer блока runLeaderLoop при выходе из цикла
+// лидера, поэтому тест покрывает оба места сброса флагов.
+//
+// Сценарий:
+//  1. ConsensusModule в состоянии Leader, inflightAE = {1: nil, 2: true}.
+//     Элемент 1 (nil) имитирует peer, добавленного в конфигурацию, но
+//     не инициализированного через startStopReplication до момента
+//     завершения лидерства (реконфигурация не успела обработаться).
+//  2. Вызвать becomeFollower(1) — не должно быть panic: ранее вызов
+//     Store(false) на nil *atomic.Bool давал nil dereference.
+//  3. Проверить, что inflightAE[2] сброшен в false, а nil-элемент
+//     пропущен без паники.
+func TestBecomeFollower_InflightAE_NilEntry(t *testing.T) {
+	cm := &ConsensusModule{
+		id:                0,
+		state:             Leader,
+		stepDown:          make(chan struct{}, 1),
+		shutdownCh:        make(chan struct{}),
+		electionTimerDone: make(chan struct{}),
+		currentTerm:       1,
+		inflightAE: map[int]*atomic.Bool{
+			1: nil,              // peer вне конфигурации — элемент не инициализирован
+			2: new(atomic.Bool), // активный peer, флаг установлен
+		},
+	}
+	cm.inflightAE[2].Store(true)
+
+	// becomeFollower ожидает, что cm.mu заблокирован (по контракту).
+	cm.mu.Lock()
+	cm.becomeFollower(1)
+	cm.mu.Unlock()
+
+	if cm.state != Follower {
+		t.Errorf("state = %v, want Follower", cm.state)
+	}
+	if cm.inflightAE[2].Load() {
+		t.Error("inflightAE[2] should be reset to false")
+	}
+}
+
 // TestInflightAE_CASConcurrent проверяет, что atomic CAS
 // не вызывает data race при конкурентном доступе.
 //
@@ -329,4 +374,150 @@ func (m *mockSnapshotStore) List() ([]*SnapshotMeta, error) {
 
 func (m *mockSnapshotStore) Open(id string) (*SnapshotMeta, io.ReadCloser, error) {
 	return &SnapshotMeta{Index: 0, Term: 1, Size: 0}, io.NopCloser(bytes.NewReader(nil)), nil
+}
+
+// mockSnapshotStoreCfg — конфигурируемая реализация SnapshotStore для
+// тестов leaderSendSnapshot. Позволяет имитировать повреждённое хранилище:
+// nil-элемент в List(), пустой ID, ошибку List() и т.д.
+type mockSnapshotStoreCfg struct {
+	SnapshotStore
+	listResult []*SnapshotMeta // результат List(); nil означает «снэпшотов нет»
+	listErr    error           // ошибка, возвращаемая List()
+	openMeta   *SnapshotMeta   // метаданные, возвращаемые Open()
+}
+
+// List возвращает предзаданный список снэпшотов или ошибку.
+func (m *mockSnapshotStoreCfg) List() ([]*SnapshotMeta, error) {
+	return m.listResult, m.listErr
+}
+
+// Open возвращает предзаданные метаданные и пустой ридер — для проверки
+// корректности вызова важны лишь метаданные, содержимое не читается.
+func (m *mockSnapshotStoreCfg) Open(id string) (*SnapshotMeta, io.ReadCloser, error) {
+	return m.openMeta, io.NopCloser(bytes.NewReader(nil)), nil
+}
+
+// TestLeaderSendSnapshot_NilSnapshotStore проверяет, что leaderSendSnapshot
+// безопасна при nil-хранилище снэпшотов.
+//
+// Сценарий:
+//  1. ConsensusModule в состоянии Leader, snapshotStore == nil.
+//  2. Вызвать leaderSendSnapshot — не должно быть panic.
+//  3. Проверить, что InstallSnapshot НЕ вызван.
+//
+// Функция выполняется в отдельной горутине (через leaderSendAEsToPeer),
+// поэтому паника здесь без recover() убила бы весь процесс.
+func TestLeaderSendSnapshot_NilSnapshotStore(t *testing.T) {
+	transport := &mockTransportAE{}
+	cm := &ConsensusModule{
+		id:            0,
+		state:         Leader,
+		transport:     transport,
+		currentTerm:   1,
+		snapshotStore: nil,
+		nextIndex:     map[int]int{1: -1},
+		matchIndex:    map[int]int{1: -1},
+	}
+
+	// Никаких обращений к хранилищу не должно быть.
+	cm.leaderSendSnapshot(1, 1)
+
+	if n := transport.installCallCount.Load(); n != 0 {
+		t.Errorf("expected 0 InstallSnapshot calls, got %d", n)
+	}
+}
+
+// TestLeaderSendSnapshot_NilMetaInList проверяет, что leaderSendSnapshot
+// безопасна, когда List() возвращает слайс с nil-элементом.
+//
+// Сценарий:
+//  1. snapshotStore.List() возвращает []*SnapshotMeta{nil}.
+//  2. Вызвать leaderSendSnapshot — не должно быть panic, иначе обращение
+//     snapshots[0].ID привело бы к nil dereference.
+//  3. Проверить, что InstallSnapshot НЕ вызван.
+func TestLeaderSendSnapshot_NilMetaInList(t *testing.T) {
+	transport := &mockTransportAE{}
+	cm := &ConsensusModule{
+		id:          0,
+		state:       Leader,
+		transport:   transport,
+		currentTerm: 1,
+		snapshotStore: &mockSnapshotStoreCfg{
+			listResult: []*SnapshotMeta{nil},
+		},
+		nextIndex:  map[int]int{1: -1},
+		matchIndex: map[int]int{1: -1},
+	}
+
+	cm.leaderSendSnapshot(1, 1)
+
+	if n := transport.installCallCount.Load(); n != 0 {
+		t.Errorf("expected 0 InstallSnapshot calls, got %d", n)
+	}
+}
+
+// TestLeaderSendSnapshot_EmptyID проверяет, что leaderSendSnapshot
+// безопасна, когда snapshots[0].ID пуст.
+//
+// Сценарий:
+//  1. snapshotStore.List() возвращает снэпшот с пустым ID.
+//  2. Вызвать leaderSendSnapshot — не должно быть вызова snapshotStore.Open
+//     с некорректным ID (реализации хранилища могут паниковать на нём).
+//  3. Проверить, что InstallSnapshot НЕ вызван.
+func TestLeaderSendSnapshot_EmptyID(t *testing.T) {
+	transport := &mockTransportAE{}
+	cm := &ConsensusModule{
+		id:          0,
+		state:       Leader,
+		transport:   transport,
+		currentTerm: 1,
+		snapshotStore: &mockSnapshotStoreCfg{
+			listResult: []*SnapshotMeta{{ID: ""}},
+		},
+		nextIndex:  map[int]int{1: -1},
+		matchIndex: map[int]int{1: -1},
+	}
+
+	cm.leaderSendSnapshot(1, 1)
+
+	if n := transport.installCallCount.Load(); n != 0 {
+		t.Errorf("expected 0 InstallSnapshot calls, got %d", n)
+	}
+}
+
+// TestLeaderSendSnapshot_Success проверяет, что leaderSendSnapshot при
+// корректном хранилище отправляет InstallSnapshot и обновляет nextIndex
+// и matchIndex.
+//
+// Сценарий:
+//  1. snapshotStore.List() возвращает один снэпшот (Index=5, Term=2, Size=100).
+//  2. transport.InstallSnapshot возвращает Success=true, Term=0 (не выше term=1).
+//  3. Проверить, что InstallSnapshot вызван ровно один раз.
+//  4. Проверить, что nextIndex[1] == 6 и matchIndex[1] == 5.
+func TestLeaderSendSnapshot_Success(t *testing.T) {
+	transport := &mockTransportAE{}
+	cm := &ConsensusModule{
+		id:          0,
+		state:       Leader,
+		transport:   transport,
+		currentTerm: 1,
+		nextIndex:   map[int]int{1: -1},
+		matchIndex:  map[int]int{1: -1},
+		snapshotStore: &mockSnapshotStoreCfg{
+			listResult: []*SnapshotMeta{{ID: "snap-5", Index: 5, Term: 2, Size: 100}},
+			openMeta:   &SnapshotMeta{Index: 5, Term: 2, Size: 100},
+		},
+	}
+
+	cm.leaderSendSnapshot(1, 1)
+
+	if n := transport.installCallCount.Load(); n != 1 {
+		t.Fatalf("expected 1 InstallSnapshot call, got %d", n)
+	}
+	if cm.nextIndex[1] != 6 {
+		t.Errorf("nextIndex[1] = %d, want 6", cm.nextIndex[1])
+	}
+	if cm.matchIndex[1] != 5 {
+		t.Errorf("matchIndex[1] = %d, want 5", cm.matchIndex[1])
+	}
 }

@@ -461,7 +461,11 @@ func TestLeadershipTransfer_VoteBypass(t *testing.T) {
 	// leadership transfer increment term). follower должен проголосовать,
 	// несмотря на знание о лидере: в новом term votedFor = -1, а bypass
 	// пропускает проверку leaderID.
-	lastLogIndex, _ := h.cluster[followerID].lastLogIndexAndTerm()
+	// lastLogIndexAndTerm требует удержания cm.mu — читаем под блокировкой.
+	cm := h.cluster[followerID]
+	cm.mu.Lock()
+	lastLogIndex, _ := cm.lastLogIndexAndTerm()
+	cm.mu.Unlock()
 	candidateID := (origLeaderID + 2) % 3
 	args := RequestVoteArgs{
 		RPCHeader: RPCHeader{

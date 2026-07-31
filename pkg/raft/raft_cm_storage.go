@@ -15,7 +15,7 @@ func (cm *ConsensusModule) persistToStorage() {
 	start := time.Now()
 	defer func() {
 		elapsed := time.Since(start)
-		cm.traceLogf(2, "persistToStorage elapsed %s", elapsed)
+		cm.traceLogfLocked(2, "persistToStorage elapsed %s", elapsed)
 	}()
 	var termData bytes.Buffer
 	if err := gob.NewEncoder(&termData).Encode(cm.currentTerm); err != nil {

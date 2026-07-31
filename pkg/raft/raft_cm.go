@@ -221,7 +221,7 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 		return err
 	}
 
-	cm.traceLogf(8,
+	cm.traceLogfLocked(8,
 		"AppendEntries: %v, Term:%d LeaderID:%d PrevLogIndex:%d PrevLogTerm:%d len(Entries):%d",
 		args.RPCHeader, args.Term, args.LeaderID, args.PrevLogIndex, args.PrevLogTerm, len(args.Entries),
 	)
@@ -231,7 +231,7 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 	// текущему или на 1 меньше. Исключение: терм строго больше нашего.
 	if cm.state == Candidate && cm.candidateFromLeadershipTransfer.Load() {
 		if args.Term > cm.currentTerm {
-			cm.traceLogf(8, "... term out of date in AppendEntries (candidate from LT)")
+			cm.traceLogfLocked(8, "... term out of date in AppendEntries (candidate from LT)")
 			cm.becomeFollower(args.Term)
 			cm.candidateFromLeadershipTransfer.Store(false)
 		}
@@ -246,7 +246,7 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 	}
 
 	if args.Term > cm.currentTerm {
-		cm.traceLogf(8, "... term out of date in AppendEntries")
+		cm.traceLogfLocked(8, "... term out of date in AppendEntries")
 		cm.becomeFollower(args.Term)
 	}
 
@@ -289,9 +289,12 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 			// - newEntriesIndex указывает на конец массива Entries
 			//   или на индекс, где терм записи отличается от соответствующей записи журнала.
 			if newEntriesIndex < len(args.Entries) {
-				cm.traceLogf(8, "... inserting entries %v from index %d", args.Entries[newEntriesIndex:], logInsertIndex)
+				cm.traceLogfLocked(
+					8, "... inserting entries %v from index %d",
+					args.Entries[newEntriesIndex:], logInsertIndex,
+				)
 				cm.log = append(cm.log[:logInsertPos], args.Entries[newEntriesIndex:]...)
-				cm.traceLogf(16, "... log is now: %v", cm.log)
+				cm.traceLogfLocked(16, "... log is now: %v", cm.log)
 				cm.rebuildLastLog()
 				cm.rebuildTermIndexMap()
 				cm.logNeedsPersist = true
@@ -308,7 +311,7 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 
 			if args.LeaderCommit > cm.commitIndex {
 				cm.commitIndex = min(args.LeaderCommit, cm.lastLogIndex)
-				cm.traceLogf(8, "... setting commitIndex=%d", cm.commitIndex)
+				cm.traceLogfLocked(8, "... setting commitIndex=%d", cm.commitIndex)
 				cm.persistToStorage()
 				commitIdx := cm.commitIndex
 				cm.mu.Unlock()
@@ -346,7 +349,7 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 		ServerID:        cm.id,
 	}
 	reply.Term = cm.currentTerm
-	cm.traceLogf(8, "AppendEntries reply: %+v", *reply)
+	cm.traceLogfLocked(8, "AppendEntries reply: %+v", *reply)
 	return nil
 }
 
@@ -514,7 +517,7 @@ func (cm *ConsensusModule) RequestPreVote(args RequestPreVoteArgs, reply *Reques
 	}
 
 	lastLogIndex, lastLogTerm := cm.lastLogIndexAndTerm()
-	cm.traceLogf(
+	cm.traceLogfLocked(
 		4, "RequestPreVote: %+v [currentTerm=%d, log index/term=(%d, %d)]",
 		args, cm.currentTerm, lastLogIndex, lastLogTerm,
 	)
@@ -523,7 +526,7 @@ func (cm *ConsensusModule) RequestPreVote(args RequestPreVoteArgs, reply *Reques
 	// конфигурации. Это defense-in-depth: runPreCandidate уже фильтрует
 	// voter'ов на стороне отправителя, но получатель тоже должен проверять.
 	if !hasVote(cm.configurations.latest, args.GetRPCHeader().ServerID) {
-		cm.traceLogf(4, "... RequestPreVote denied: not a voter")
+		cm.traceLogfLocked(4, "... RequestPreVote denied: not a voter")
 		reply.RPCHeader = RPCHeader{
 			ProtocolVersion: ProtocolVersion,
 			ServerID:        cm.id,
@@ -542,7 +545,7 @@ func (cm *ConsensusModule) RequestPreVote(args RequestPreVoteArgs, reply *Reques
 
 	// Предлагаемый term должен быть не меньше текущего.
 	if args.Term < cm.currentTerm {
-		cm.traceLogf(4, "... RequestPreVote denied: older term")
+		cm.traceLogfLocked(4, "... RequestPreVote denied: older term")
 		return nil
 	}
 
@@ -552,7 +555,7 @@ func (cm *ConsensusModule) RequestPreVote(args RequestPreVoteArgs, reply *Reques
 	if !cm.leaderLastContact.IsZero() {
 		leaderKnown := time.Since(cm.leaderLastContact) < cm.electionTimeout()
 		if leaderKnown && args.GetRPCHeader().ServerID != cm.leaderID {
-			cm.traceLogf(4, "... RequestPreVote denied: leader known")
+			cm.traceLogfLocked(4, "... RequestPreVote denied: leader known")
 			return nil
 		}
 	}
@@ -560,12 +563,12 @@ func (cm *ConsensusModule) RequestPreVote(args RequestPreVoteArgs, reply *Reques
 	// Log-safety: отклонить, если лог получателя новее лога кандидата.
 	if lastLogTerm > args.LastLogTerm ||
 		(lastLogTerm == args.LastLogTerm && lastLogIndex > args.LastLogIndex) {
-		cm.traceLogf(4, "... RequestPreVote denied: log is more up-to-date")
+		cm.traceLogfLocked(4, "... RequestPreVote denied: log is more up-to-date")
 		return nil
 	}
 
 	reply.VoteGranted = true
-	cm.traceLogf(4, "... RequestPreVote granted")
+	cm.traceLogfLocked(4, "... RequestPreVote granted")
 	return nil
 }
 
@@ -588,7 +591,7 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 
 	// Nonvoter не может быть избран лидером — отклоняем запрос.
 	if !hasVote(cm.configurations.latest, args.GetRPCHeader().ServerID) {
-		cm.traceLogf(4, "... RequestVote denied: not a voter")
+		cm.traceLogfLocked(4, "... RequestVote denied: not a voter")
 		reply.VoteGranted = false
 		reply.RPCHeader = RPCHeader{
 			ProtocolVersion: ProtocolVersion,
@@ -599,20 +602,20 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 	}
 
 	lastLogIndex, lastLogTerm := cm.lastLogIndexAndTerm()
-	cm.traceLogf(
+	cm.traceLogfLocked(
 		4, "RequestVote: %+v [currentTerm=%d, votedFor=%d, log index/term=(%d, %d)]",
 		args, cm.currentTerm, cm.votedFor, lastLogIndex, lastLogTerm,
 	)
 
 	if args.Term > cm.currentTerm {
-		cm.traceLogf(4, "... term out of date in RequestVote")
+		cm.traceLogfLocked(4, "... term out of date in RequestVote")
 		cm.becomeFollower(args.Term)
 	}
 
 	// Проверка наличия известного лидера.
 	// Если есть лидер, но это leadership transfer — голосуем (bypass).
 	if cm.leaderID >= 0 && cm.leaderID != args.CandidateID && !args.LeadershipTransfer {
-		cm.traceLogf(4, "... leader known, denying vote for %d", args.CandidateID)
+		cm.traceLogfLocked(4, "... leader known, denying vote for %d", args.CandidateID)
 		reply.VoteGranted = false
 		reply.RPCHeader = RPCHeader{
 			ProtocolVersion: ProtocolVersion,
@@ -627,9 +630,10 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 	logOk := args.LastLogTerm > lastLogTerm ||
 		(args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)
 	if !termOk || !voteOk || !logOk {
-		cm.traceLogf(
+		cm.traceLogfLocked(
 			4,
-			"... vote denied: termOk=%v (cur=%d, args=%d), voteOk=%v (votedFor=%d, cand=%d), logOk=%v (args=(%d,%d), local=(%d,%d))",
+			"... vote denied: termOk=%v (cur=%d, args=%d), voteOk=%v (votedFor=%d, cand=%d),"+
+				" logOk=%v (args=(%d,%d), local=(%d,%d))",
 			termOk, cm.currentTerm, args.Term, voteOk, cm.votedFor, args.CandidateID,
 			logOk, args.LastLogTerm, args.LastLogIndex, lastLogTerm, lastLogIndex)
 	}
@@ -646,7 +650,7 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 	}
 	reply.Term = cm.currentTerm
 	cm.persistToStorage()
-	cm.traceLogf(4, "... RequestVote reply: %+v", reply)
+	cm.traceLogfLocked(4, "... RequestVote reply: %+v", reply)
 	return nil
 }
 
@@ -750,7 +754,7 @@ func (cm *ConsensusModule) appendConfigurationEntry(future *configurationChangeF
 	cm.commitmentTracker.commit(cm.lastLogIndex, cm.lookupTerm)
 	savedCommitIndex := cm.commitIndex
 	if newCI := cm.commitmentTracker.getCommitIndex(); newCI > cm.commitIndex {
-		cm.traceLogf(2, "leader sets commitIndex := %d", newCI)
+		cm.traceLogfLocked(2, "leader sets commitIndex := %d", newCI)
 		cm.commitIndex = newCI
 	}
 	cm.mu.Unlock()
@@ -839,12 +843,16 @@ func (cm *ConsensusModule) applySingle(batch []*commitTuple) {
 // Ожидается, что cm.mu будет заблокирован.
 func (cm *ConsensusModule) becomeFollower(term int) {
 	wasLeader := cm.state == Leader
-	cm.traceLogf(0, "becomes Follower with term=%d; len(log)=%v", term, len(cm.log))
+	cm.traceLogfLocked(0, "becomes Follower with term=%d; len(log)=%v", term, len(cm.log))
 
 	// Сбросить inflightAE для всех peer при потере лидерства.
 	// Это гарантирует, что новый лидер начнёт с "чистого листа".
+	// nil-проверка защищает от nil-элемента (peer вне конфигурации) —
+	// Store на nil *atomic.Bool паникует без recover().
 	for peerID := range cm.inflightAE {
-		cm.inflightAE[peerID].Store(false)
+		if cm.inflightAE[peerID] != nil {
+			cm.inflightAE[peerID].Store(false)
+		}
 	}
 
 	cm.state = Follower
@@ -941,7 +949,7 @@ func (cm *ConsensusModule) dispatchLogs(applyLogs []*logFuture) {
 	cm.commitmentTracker.commit(cm.lastLogIndex, cm.lookupTerm)
 	savedCommitIndex := cm.commitIndex
 	if newCommitIndex := cm.commitmentTracker.getCommitIndex(); newCommitIndex > cm.commitIndex {
-		cm.traceLogf(2, "leader sets commitIndex := %d", newCommitIndex)
+		cm.traceLogfLocked(2, "leader sets commitIndex := %d", newCommitIndex)
 		cm.commitIndex = newCommitIndex
 	}
 	newCommitIndex := cm.commitIndex
@@ -1016,17 +1024,28 @@ func (cm *ConsensusModule) enqueueConfigurationChange(future *configurationChang
 func (cm *ConsensusModule) handleFsmSnapshot(req *reqSnapshotFuture) {
 	startTimeNow := time.Now()
 	defer func() { latencyHandleFsmSnapshotCh <- time.Since(startTimeNow) }()
+
+	// Захватываем индекс и терм под cm.mu: cm.lastApplied и cm.log
+	// изменяются из других горутин (processLogs, restoreFromStorage),
+	// чтение без блокировки — data race. fsm.Snapshot() вызываем
+	// после снятия блокировки — это дорогая операция.
+	cm.mu.Lock()
 	if cm.lastApplied < 0 {
+		cm.mu.Unlock()
 		req.respond(ErrNothingNewToSnapshot)
 		return
 	}
+	index := cm.lastApplied
+	term := cm.lookupTerm(index)
+	cm.mu.Unlock()
+
 	snap, err := cm.fsm.Snapshot()
 	if err != nil {
 		req.respond(err)
 		return
 	}
-	req.index = cm.lastApplied
-	req.term = cm.lookupTerm(cm.lastApplied)
+	req.index = index
+	req.term = term
 	req.snapshot = snap
 	req.respond(nil)
 }
@@ -1448,13 +1467,16 @@ func (cm *ConsensusModule) runElectionTimer() {
 		case <-ticker.C:
 			cm.mu.Lock()
 			if cm.state != Candidate && cm.state != Follower {
-				cm.traceLogf(1, "in election timer state=%s, bailing out", cm.state)
+				cm.traceLogfLocked(1, "in election timer state=%s, bailing out", cm.state)
 				cm.mu.Unlock()
 				return
 			}
 
 			if termStarted != cm.currentTerm {
-				cm.traceLogf(1, "in election timer term changed from %d to %d, bailing out", termStarted, cm.currentTerm)
+				cm.traceLogfLocked(
+					1, "in election timer term changed from %d to %d, bailing out",
+					termStarted, cm.currentTerm,
+				)
 				cm.mu.Unlock()
 				return
 			}
@@ -1535,7 +1557,7 @@ func (cm *ConsensusModule) runLeaderLoop() {
 			cm.pendingVerify = nil
 		}
 		inflightCount := len(cm.inflight)
-		cm.traceLogf(1, "leaderLoop exit: responding to %d inflight futures", inflightCount)
+		cm.traceLogfLocked(1, "leaderLoop exit: responding to %d inflight futures", inflightCount)
 		for _, future := range cm.inflight {
 			future.respond(ErrLeadershipLost)
 		}
@@ -1545,8 +1567,15 @@ func (cm *ConsensusModule) runLeaderLoop() {
 		// Это гарантирует, что "зависшие" true флаги (CAS успешен,
 		// но горутина не стартовала из-за завершения цикла) не блокируют
 		// следующего лидера.
+		//
+		// nil-проверка защищает от nil-элемента: если конфигурация
+		// изменилась после старта лидера, а leader loop завершился до
+		// вызова startStopReplication для нового peer, inflightAE[peerID]
+		// может быть nil. Store на nil *atomic.Bool паникует без recover().
 		for peerID := range cm.inflightAE {
-			cm.inflightAE[peerID].Store(false)
+			if cm.inflightAE[peerID] != nil {
+				cm.inflightAE[peerID].Store(false)
+			}
 		}
 		cm.mu.Unlock()
 		elapsed := time.Since(startNow)
@@ -1590,7 +1619,7 @@ func (cm *ConsensusModule) runLeaderLoop() {
 		case newCommitIndex := <-cm.commitCh:
 			cm.mu.Lock()
 			if newCommitIndex > cm.commitIndex {
-				cm.traceLogf(2, "leader sets commitIndex := %d", newCommitIndex)
+				cm.traceLogfLocked(2, "leader sets commitIndex := %d", newCommitIndex)
 				cm.commitIndex = newCommitIndex
 
 				// Обновить committed конфигурацию, если latest был закоммичен.
@@ -1602,9 +1631,9 @@ func (cm *ConsensusModule) runLeaderLoop() {
 
 				// Проверить, остался ли лидер в committed конфигурации.
 				if !hasVote(cm.configurations.committed, cm.id) {
-					cm.traceLogf(1, "leader stepping down: not in committed configuration")
-					cm.mu.Unlock()
+					cm.traceLogfLocked(1, "leader stepping down: not in committed configuration")
 					cm.becomeFollower(cm.currentTerm)
+					cm.mu.Unlock()
 					return
 				}
 				cm.mu.Unlock()
@@ -1625,7 +1654,7 @@ func (cm *ConsensusModule) runLeaderLoop() {
 
 		case <-cm.stepDown:
 			cm.mu.Lock()
-			cm.traceLogf(1, "leader stepping down")
+			cm.traceLogfLocked(1, "leader stepping down")
 			if cm.leadershipTransferFuture != nil {
 				atomic.StoreInt32(&cm.leadershipTransferInProgress, 0)
 				cm.leadershipTransferFuture.respond(nil)
@@ -1690,7 +1719,7 @@ func (cm *ConsensusModule) runPreCandidate() {
 		return
 	}
 	cm.state = PreCandidate
-	cm.traceLogf(0, "becomes PreCandidate; term=%d, len(log)=%d", cm.currentTerm, len(cm.log))
+	cm.traceLogfLocked(0, "becomes PreCandidate; term=%d, len(log)=%d", cm.currentTerm, len(cm.log))
 
 	cfg := cm.configurations.latest
 	voters := voterIDs(cfg)
@@ -1796,12 +1825,12 @@ func (cm *ConsensusModule) runPreCandidate() {
 			votersResponded++
 			cm.mu.Lock()
 			if cm.state != PreCandidate {
-				cm.traceLogf(4, "runPreCandidate: state changed to %s, bailing out", cm.state)
+				cm.traceLogfLocked(4, "runPreCandidate: state changed to %s, bailing out", cm.state)
 				cm.mu.Unlock()
 				return
 			}
 			if reply.Term > cm.currentTerm {
-				cm.traceLogf(4, "runPreCandidate: found higher term %d", reply.Term)
+				cm.traceLogfLocked(4, "runPreCandidate: found higher term %d", reply.Term)
 				cm.becomeFollower(reply.Term)
 				cm.mu.Unlock()
 				return
@@ -1809,14 +1838,20 @@ func (cm *ConsensusModule) runPreCandidate() {
 			cm.mu.Unlock()
 			if reply.VoteGranted {
 				grantedVotes++
-				cm.traceLogf(4, "runPreCandidate: granted vote from peer, total=%d, needed=%d", grantedVotes, neededVotes)
+				cm.traceLogf(
+					4, "runPreCandidate: granted vote from peer, total=%d, needed=%d",
+					grantedVotes, neededVotes,
+				)
 				if grantedVotes >= neededVotes {
 					// Jitter перед выборами, чтобы одновременно несколько узлов
 					// не перешли в Candidate с одинаковым term (split vote).
 					time.Sleep(time.Duration(rand.Intn(50)) * time.Millisecond)
 					cm.mu.Lock()
 					if cm.state == PreCandidate {
-						cm.traceLogf(4, "runPreCandidate: won pre-vote with %d votes, starting election", grantedVotes)
+						cm.traceLogfLocked(
+							4, "runPreCandidate: won pre-vote with %d votes, starting election",
+							grantedVotes,
+						)
 						cm.startElection()
 					}
 					cm.mu.Unlock()
@@ -1826,7 +1861,7 @@ func (cm *ConsensusModule) runPreCandidate() {
 		case <-timeout:
 			cm.mu.Lock()
 			if cm.state == PreCandidate {
-				cm.traceLogf(4, "runPreCandidate: pre-vote timeout, returning to follower")
+				cm.traceLogfLocked(4, "runPreCandidate: pre-vote timeout, returning to follower")
 				cm.becomeFollower(cm.currentTerm)
 			}
 			cm.mu.Unlock()
@@ -1839,7 +1874,10 @@ func (cm *ConsensusModule) runPreCandidate() {
 		if votersResponded >= totalVoters && grantedVotes < neededVotes {
 			cm.mu.Lock()
 			if cm.state == PreCandidate {
-				cm.traceLogf(4, "runPreCandidate: pre-vote lost (%d/%d), returning to follower", grantedVotes, neededVotes)
+				cm.traceLogfLocked(
+					4, "runPreCandidate: pre-vote lost (%d/%d), returning to follower",
+					grantedVotes, neededVotes,
+				)
 				cm.becomeFollower(cm.currentTerm)
 			}
 			cm.mu.Unlock()
@@ -1947,7 +1985,10 @@ func (cm *ConsensusModule) sendBatch(start, end int) {
 		}
 		pos := cm.logPosition(idx)
 		if pos >= len(cm.log) {
-			cm.traceLogf(0, "sendBatch: logPosition(%d) returned %d, len(log)=%d", idx, pos, len(cm.log))
+			cm.traceLogfLocked(
+				0, "sendBatch: logPosition(%d) returned %d, len(log)=%d",
+				idx, pos, len(cm.log),
+			)
 			continue
 		}
 		log := &cm.log[pos]
@@ -2028,7 +2069,7 @@ func (cm *ConsensusModule) startElection() {
 	cm.electionResetEvent = time.Now()
 	cm.votedFor = cm.id
 	cm.persistToStorage()
-	cm.traceLogf(0, "becomes Candidate (currentTerm=%d); len(log)=%v", savedCurrentTerm, len(cm.log))
+	cm.traceLogfLocked(0, "becomes Candidate (currentTerm=%d); len(log)=%v", savedCurrentTerm, len(cm.log))
 
 	// Сохраняем флаг в локальную переменную до его сброса.
 	isLeadershipTransfer := cm.candidateFromLeadershipTransfer.Load()
@@ -2079,16 +2120,16 @@ func (cm *ConsensusModule) startElection() {
 			reply, err := cm.transport.RequestVote(ServerID(peerID), args)
 			if err == nil {
 				cm.mu.Lock()
-				cm.traceLogf(0, "received RequestVoteReply %+v", reply)
+				cm.traceLogfLocked(0, "received RequestVoteReply %+v", reply)
 
 				if cm.state != Candidate {
-					cm.traceLogf(0, "while waiting for reply, state = %v", cm.state)
+					cm.traceLogfLocked(0, "while waiting for reply, state = %v", cm.state)
 					cm.mu.Unlock()
 					return
 				}
 
 				if reply.Term > cm.currentTerm {
-					cm.traceLogf(0, "term out of date in RequestVoteReply")
+					cm.traceLogfLocked(0, "term out of date in RequestVoteReply")
 					cm.becomeFollower(reply.Term)
 					cm.mu.Unlock()
 					return
@@ -2097,7 +2138,7 @@ func (cm *ConsensusModule) startElection() {
 						votesReceived.Add(1)
 						if int(votesReceived.Load()) >= quorumSize(voterCount) {
 							// Выиграл выборы!
-							cm.traceLogf(2, "wins election with %d votes", votesReceived.Load())
+							cm.traceLogfLocked(2, "wins election with %d votes", votesReceived.Load())
 							cm.startLeader()
 							cm.mu.Unlock()
 							slog.Info("wins election", slog.Int("votes", int(votesReceived.Load())))
@@ -2136,7 +2177,7 @@ func (cm *ConsensusModule) startLeader() {
 		}
 		cm.inflightAE[peerID].Store(false)
 	}
-	cm.traceLogf(
+	cm.traceLogfLocked(
 		0, "becomes Leader; term=%d, nextIndex=%v, matchIndex=%v; len(log)=%d",
 		cm.currentTerm, cm.nextIndex, cm.matchIndex, len(cm.log),
 	)
@@ -2303,13 +2344,13 @@ func (cm *ConsensusModule) timeoutNow(rpc RPC, req *TimeoutNowRequest) {
 	}
 	cm.electionTimerDone = make(chan struct{})
 	cm.candidateFromLeadershipTransfer.Store(true)
-	cm.traceLogf(1, "candidateFromLeadershipTransfer set to true (cm.id=%d)", cm.id)
+	cm.traceLogfLocked(1, "candidateFromLeadershipTransfer set to true (cm.id=%d)", cm.id)
 
 	// Запускаем форсированные выборы немедленно, без ожидания election timeout.
 	// cm.mu удерживается, что гарантирует атомарность.
 	cm.startElection()
 	newTerm := cm.currentTerm
-	cm.traceLogf(1, "started immediate election after TimeoutNow, term=%d (cm.id=%d)", newTerm, cm.id)
+	cm.traceLogfLocked(1, "started immediate election after TimeoutNow, term=%d (cm.id=%d)", newTerm, cm.id)
 	cm.mu.Unlock()
 
 	rpc.RespChan <- RPCResponse{
@@ -2331,11 +2372,25 @@ func (cm *ConsensusModule) debugLogf(format string, args ...any) {
 	}
 }
 
-// traceLogf выводит отладочное сообщение, если TraceCM > level.
-func (cm *ConsensusModule) traceLogf(level int, format string, args ...any) {
+// traceLogfLocked выводит отладочное сообщение, если TraceCM > level.
+// Ожидается, что cm.mu уже заблокирован вызывающим кодом, поэтому
+// состояние (cm.state, cm.id, cm.currentTerm) читается напрямую.
+func (cm *ConsensusModule) traceLogfLocked(level int, format string, args ...any) {
 	if TraceCM > level {
 		format = fmt.Sprintf("[%c,N:%d,T:%03d] ", stateLetter(cm.state), cm.id, cm.currentTerm) + format
 		log.Printf(format, args...)
+	}
+}
+
+// traceLogf — потокобезопасная обёртка над traceLogfLocked для вызовов
+// БЕЗ удержания cm.mu: самостоятельно захватывает блокировку, чтобы
+// прочитать состояние без data race. Для вызовов из кода, который уже
+// держит cm.mu, используйте traceLogfLocked — иначе будет deadlock.
+func (cm *ConsensusModule) traceLogf(level int, format string, args ...any) {
+	if TraceCM > level {
+		cm.mu.Lock()
+		cm.traceLogfLocked(level, format, args...)
+		cm.mu.Unlock()
 	}
 }
 

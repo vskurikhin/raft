@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"context"
 	"log"
 	"sync/atomic"
 	"time"
@@ -263,7 +262,7 @@ func NewConsensusModule(
 		cm.mu.Unlock()
 		cm.runElectionTimer()
 	}()
-	go cm.stats(context.Background())
+	go cm.stats(cm.shutdownCh)
 	return cm
 }
 
