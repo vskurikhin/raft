@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"log"
 	"sync/atomic"
 	"time"
 )
@@ -160,6 +161,13 @@ func (f *configurationChangeFuture) Index() int {
 // fsm — машина состояний клиента, к которой применяются закоммиченные записи.
 // ready уведомляет CM, что все соседи подключены.
 // snapshots — хранилище снэпшотов; если nil, снэпшоты отключены.
+//
+// Предусловие: transport не должен быть nil. Нарушение контракта приводит к
+// panic при инициализации (fail-fast) — это единственное место, где проверка
+// выполняется до старта горутин. Паника допустима только здесь (исключение
+// для инициализации по AGENTS.md), а не в рабочих горутинах. Проверка
+// обнаруживает как «чистый» nil-интерфейс, так и типизированный nil-указатель
+// (например, (*InmemTransport)(nil)) — см. isNilInterface.
 func NewConsensusModule(
 	id int,
 	peerIds []int,
@@ -169,6 +177,16 @@ func NewConsensusModule(
 	ready <-chan any,
 	snapshots ...SnapshotStore,
 ) *ConsensusModule {
+	// Fail-fast проверка предусловия конструктора. Паника допустима в рамках
+	// исключения "инициализация программы": вызов происходит при старте узла,
+	// а не в горутине, поэтому распознать ошибку проще до создания объекта.
+	// isNilInterface дополнительно ловит типизированный nil: в Go интерфейс
+	// не равен nil, если в него положен nil-указатель (например,
+	// (*InmemTransport)(nil)) — прямое сравнение с nil такую ситуацию
+	// не обнаружило бы.
+	if isNilInterface(transport) {
+		log.Fatalln("raft: NewConsensusModule: transport is nil")
+	}
 	cm := new(ConsensusModule)
 	cm.id = id
 	cm.peerIds = peerIds

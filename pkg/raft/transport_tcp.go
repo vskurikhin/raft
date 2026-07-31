@@ -558,6 +558,13 @@ func (t *TCPTransport) handleCommand(_ *bufio.Reader, conn net.Conn, dec *gob.De
 RESP:
 	var respErr string
 	var respReply any
+	respTimeout := t.timeout
+	if req, ok := cmd.(*InstallSnapshotRequest); ok && req.DataSize > 0 {
+		scaled := t.timeout * time.Duration(req.DataSize/int64(connSendBufferSize))
+		if scaled > respTimeout {
+			respTimeout = scaled
+		}
+	}
 	select {
 	case resp := <-respCh:
 		if resp.Error != nil {
@@ -566,7 +573,7 @@ RESP:
 		respReply = resp.Reply
 	case <-t.shutdownCh:
 		return ErrRaftShutdown
-	case <-time.After(t.timeout):
+	case <-time.After(respTimeout):
 		respErr = ErrEnqueueTimeout.Error()
 	}
 
