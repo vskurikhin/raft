@@ -3,6 +3,7 @@ package raft
 import (
 	"bytes"
 	"encoding/gob"
+	"errors"
 	"io"
 	"strings"
 	"sync"
@@ -665,7 +666,79 @@ func TestBug_StartElectionMissingPersist(t *testing.T) {
 	}
 }
 
+// waitForNewLeaderExcept опрашивает все подключённые серверы до тех пор, пока
+// один из них не станет лидером, исключая сервер excludedID (в момент вызова
+// он изолирован и физически не может выиграть выборы).
+//
+// Возвращает (leaderID, term). В отличие от Harness.CheckSingleLeader, ждёт
+// появление лидера столько, сколько нужно, а не фиксированное окно: PreVote
+// (§4) может отклоняться получателем в течение нескольких раундов выборов,
+// поэтому длительность выборов недетерминирована и может превышать один
+// election timeout. При достижении timeout вызывает t.Fatalf.
+func waitForNewLeaderExcept(t *testing.T, h *Harness, excludedID int, timeout time.Duration) (int, int) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		for i := 0; i < h.n; i++ {
+			if i == excludedID || !h.connected[i] {
+				continue
+			}
+			_, term, isLeader := h.cluster[i].Report()
+			if isLeader {
+				return i, term
+			}
+		}
+		time.Sleep(50 * Quantum * time.Millisecond)
+	}
+	t.Fatalf("leader not found among servers != %d within %v", excludedID, timeout)
+	return -1, -1
+}
+
+// waitForStepDown опрашивает сервер id до тех пор, пока он не откажется от
+// лидерства и не перейдёт в терм wantTerm. Так как Report() захватывает
+// cm.mu, а becomeFollower (и startElection) персистят новый терм под той же
+// блокировкой, факт наблюдения терма wantTerm гарантирует, что терм уже
+// записан в постоянное хранилище. Это критично для проверки persist-бага:
+// сразу после возврата из функции сервер можно безопасно аварийно завершать
+// и перезапускать. При достижении timeout вызывает t.Fatalf.
+func waitForStepDown(t *testing.T, h *Harness, id, wantTerm int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		_, term, isLeader := h.cluster[id].Report()
+		if !isLeader && term == wantTerm {
+			return
+		}
+		time.Sleep(50 * Quantum * time.Millisecond)
+	}
+	t.Fatalf("server %d did not step down to term %d within %v", id, wantTerm, timeout)
+}
+
+// TestBug_BecomeFollowerMissingPersist проверяет, что отказ старого лидера от
+// лидерства (becomeFollower) в более высокий терм переживает перезапуск.
+//
+// Сценарий:
+//  1. Выбираем лидера и изолируем его от двух остальных серверов.
+//  2. Два оставшихся сервера выбирают нового лидера в более высоком терме
+//     (newTerm > origTerm). Выборы ждём через опрос, а не фиксированным сном:
+//     PreVote (§4) может отклоняться в течение нескольких раундов, поэтому
+//     длительность выборов недетерминирована.
+//  3. Переподключаем старого лидера. Он узнаёт о более высоком терме либо из
+//     RPC-ответа AppendEntries на собственные записи, либо из входящего
+//     heartbeat нового лидера — оба пути ведут в becomeFollower(newTerm),
+//     который персистит терм в постоянное хранилище. Ждём, пока сервер не
+//     откажется от лидерства и не перейдёт в терм newTerm.
+//  4. Аварийно завершаем и перезапускаем старого лидера: если изменение терма
+//     хранилось только в памяти, после перезапуска терм был бы потерян.
+//
+// Раньше тест полагался на PeerDropCallsAfterN/PeerDontDropCalls, чтобы старый
+// лидер узнавал новый терм только через RPC-ответ, но RPCProxy был удалён, и
+// эти методы стали no-op. Проверка остаётся корректной и без них: в кластере
+// терм нового лидера — максимальный, поэтому старый лидер не может перейти в
+// терм выше newTerm, а любой способ достижения терма newTerm персистит его.
 func TestBug_BecomeFollowerMissingPersist(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
@@ -674,31 +747,17 @@ func TestBug_BecomeFollowerMissingPersist(t *testing.T) {
 	// Изолируем лидера, чтобы два остальных сервера смогли выбрать нового
 	// лидера с более высоким термом.
 	h.DisconnectPeer(origLeaderId)
-	sleepMs(350 * Quantum)
 
-	newLeaderId, newTerm := h.CheckSingleLeader()
+	_, newTerm := waitForNewLeaderExcept(t, h, origLeaderId, 10*time.Second)
 	if newTerm <= origTerm {
 		t.Fatalf("got newTerm=%d, origTerm=%d; want newTerm > origTerm", newTerm, origTerm)
 	}
 
-	// Не позволяем новому лидеру отправлять сообщения старому лидеру после его
-	// повторного подключения. Благодаря этому старый лидер сможет обнаружить
-	// более новый терм и отказаться от роли лидера, но не получит позже новое
-	// сообщение heartbeat, которое могло бы обновить сохранённый терм до того,
-	// как мы аварийно завершим его работу.
-	h.PeerDropCallsAfterN(newLeaderId, 0)
-	defer h.PeerDontDropCalls(newLeaderId)
-
+	// Переподключаем старого лидера и ждём, пока он узнает о более высоком
+	// терме и откажется от лидерства. В этот момент терм newTerm уже
+	// персистентен, и сервер можно безопасно аварийно завершать.
 	h.ReconnectPeer(origLeaderId)
-	sleepMs(120 * Quantum)
-
-	_, steppedDownTerm, isLeader := h.cluster[origLeaderId].Report()
-	if isLeader {
-		t.Fatalf("server %d still thinks it's leader after reconnect", origLeaderId)
-	}
-	if steppedDownTerm != newTerm {
-		t.Fatalf("server %d has term %d after step-down; want %d", origLeaderId, steppedDownTerm, newTerm)
-	}
+	waitForStepDown(t, h, origLeaderId, newTerm, 5*time.Second)
 
 	// Аварийно завершаем работу сразу после того, как старый лидер обнаружил
 	// более высокий терм и отказался от лидерства. После перезапуска он должен
@@ -2022,6 +2081,99 @@ func TestBatchingFSM_ApplyBatchResponseMatching(t *testing.T) {
 		if respIdx != f.Index() {
 			t.Fatalf("future %d response = %d, want index %d", i, respIdx, f.Index())
 		}
+	}
+}
+
+// mismatchBatchingFSM нарушает контракт BatchingFSM: возвращает срез
+// ответов длины n-1 (на один меньше записей), чтобы спровоцировать
+// ветку ошибки в applyBatch. Обёртка над RecordingBatchingFSM: остальные
+// методы интерфейса FSM делегируются без изменений.
+type mismatchBatchingFSM struct {
+	inner *RecordingBatchingFSM
+}
+
+func (f *mismatchBatchingFSM) Apply(l *LogEntry) any {
+	return f.inner.Apply(l)
+}
+
+func (f *mismatchBatchingFSM) Restore(rc io.ReadCloser) error {
+	return f.inner.Restore(rc)
+}
+
+func (f *mismatchBatchingFSM) Snapshot() (FSMSnapshot, error) {
+	return f.inner.Snapshot()
+}
+
+// ApplyBatch возвращает срез ответов без последнего элемента. Для батча
+// из одной записи возвращает пустой срез — длина всё равно не совпадает
+// с числом записей, и applyBatch отвечает ошибкой.
+func (f *mismatchBatchingFSM) ApplyBatch(logs []*LogEntry) []any {
+	resp := f.inner.ApplyBatch(logs)
+	if len(resp) > 0 {
+		return resp[:len(resp)-1]
+	}
+	return resp
+}
+
+// TestBatchingFSM_ApplyBatchResponseMismatch проверяет, что нарушение
+// контракта BatchingFSM (неверное число ответов) НЕ роняет процесс и
+// НЕ паникует: все future батча получают ошибку ErrBatchFSMResponseMismatch,
+// а горутина runFSM продолжает работать.
+//
+// Сценарий:
+//  1. FSM, у которого ApplyBatch возвращает срез ответов неверной длины
+//     (обёртка над RecordingBatchingFSM).
+//  2. Отправить несколько команд cm.Apply(...).
+//  3. Проверить, что каждый future возвращает ErrBatchFSMResponseMismatch
+//     (через errors.Is), а не успешный ответ.
+//  4. Проверить, что узел жив: следующая команда снова обрабатывается —
+//     ошибка ErrBatchFSMResponseMismatch доставляется через future
+//     немедленно. Если бы runFSM упала при первом нарушении контракта,
+//     этот future остался бы без ответа (таймаут) или завершился бы
+//     ErrRaftShutdown только при Stop().
+//
+// Примечание: часть записей могла уйти отдельными батчами, поэтому на
+// ошибку проверяется каждый future из первоначальной пачки команд;
+// последующая команда после ошибки подтверждает живучесть runFSM.
+func TestBatchingFSM_ApplyBatchResponseMismatch(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 60*time.Second)()
+
+	fsm := &mismatchBatchingFSM{inner: NewRecordingBatchingFSM()}
+	cm := testServerWithFSM(t, fsm)
+	defer cm.Stop()
+
+	waitForLeader(t, cm, 800*time.Millisecond)
+
+	// Первая пачка команд должна завершиться ошибкой ErrBatchFSMResponseMismatch:
+	// хотя бы один батч, отправленный в ApplyBatch, вернёт неверное число ответов.
+	futures := make([]ApplyFuture, 3)
+	for i := range futures {
+		futures[i] = cm.Apply(i*100, 0)
+	}
+
+	for i, f := range futures {
+		err := f.Error()
+		if !errors.Is(err, ErrBatchFSMResponseMismatch) {
+			t.Fatalf("future %d error = %v, want ErrBatchFSMResponseMismatch", i, err)
+		}
+	}
+
+	// runFSM жив: следующая команда доходит до FSM. Ожидаем ответ за конечное
+	// время: если runFSM упала на первом нарушении контракта (баг — здесь
+	// должен был стоять panic), future остался бы без ответа и select упал бы
+	// по таймауту. Допустимы оба исхода: успех либо ErrBatchFSMResponseMismatch
+	// (мок всегда возвращает неверное число ответов).
+	f := cm.Apply(1000, 0)
+	select {
+	case err := <-f.ErrorCh():
+		if errors.Is(err, ErrRaftShutdown) {
+			t.Fatalf("runFSM appears dead after mismatch: got ErrRaftShutdown")
+		}
+		if err != nil && !errors.Is(err, ErrBatchFSMResponseMismatch) {
+			t.Fatalf("unexpected error after mismatch: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("future for Apply after mismatch was never answered")
 	}
 }
 

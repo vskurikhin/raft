@@ -21,6 +21,11 @@ type Values struct {
 	RPCAddress  net.Addr
 	Number      int
 	Peers       map[int]net.Addr
+
+	// TraceLogLevel — порог отладочных сообщений (raft.TraceCM, kvservice.TraceKV).
+	TraceLogLevel int
+	// TraceLogFile — путь к файлу трассировки; пустая строка — stderr.
+	TraceLogFile string
 }
 
 func ParseFlags() Values {
@@ -29,6 +34,8 @@ func ParseFlags() Values {
 	rpcAddressFlag := fs.String("rpc-addr", ":9990", "RPC server listen address")
 	numberFlag := fs.Int("number", -1, "")
 	peersFlag := fs.String("peers", "", "Comma-separated list of peers servers (id=host:port)")
+	traceLogLevelFlag := fs.Int("trace-log-level", 1, "Trace log level for raft.TraceCM and kvservice.TraceKV")
+	traceLogFileFlag := fs.String("trace-log-file", "", "Trace log file path (empty = stderr)")
 	err := fs.Parse(os.Args[1:])
 	if err != nil {
 		log.Fatal(err)
@@ -43,10 +50,12 @@ func ParseFlags() Values {
 	}
 
 	return Values{
-		HTTPAddress: httpAddress,
-		RPCAddress:  rpcAddress,
-		Number:      *numberFlag,
-		Peers:       peers,
+		HTTPAddress:   httpAddress,
+		RPCAddress:    rpcAddress,
+		Number:        *numberFlag,
+		Peers:         peers,
+		TraceLogLevel: *traceLogLevelFlag,
+		TraceLogFile:  *traceLogFileFlag,
 	}
 }
 

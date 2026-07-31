@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -16,7 +17,41 @@ import (
 	"github.com/vskurikhin/raft/pkg/raft"
 )
 
-const DebugKV = 1
+// TraceKV — порог детализации отладочных сообщений KV-сервиса (traceLogf).
+// Сообщение выводится, если TraceKV > 0. Значение задаётся флагом
+// --trace-log-level командной строки, по умолчанию 1.
+var TraceKV = 1
+
+// _traceLogger — логгер отладочных сообщений KV-сервиса (traceLogf).
+// По умолчанию выводит в стандартный логгер (stderr). Перенаправляется
+// в файл функцией SetTraceLogFile.
+var _traceLogger = log.Default()
+
+// _traceLogFile — открытый файл трассировки; nil, если вывод в stderr.
+var _traceLogFile *os.File
+
+// SetTraceLogFile перенаправляет отладочные сообщения (traceLogf) в файл
+// с указанным путём. Файл открывается в режиме добавления и создаётся
+// при необходимости. Пустая строка возвращает вывод в стандартный логгер.
+//
+// Должна вызываться до старта горутин, использующих трассировку.
+func SetTraceLogFile(path string) error {
+	if _traceLogFile != nil {
+		_ = _traceLogFile.Close()
+		_traceLogFile = nil
+	}
+	if path == "" {
+		_traceLogger = log.Default()
+		return nil
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return err
+	}
+	_traceLogFile = f
+	_traceLogger = log.New(f, "", log.LstdFlags|log.Lmicroseconds)
+	return nil
+}
 
 // requestTimeout — таймаут для Apply-операций (PUT, CAS).
 // Если за это время не удалось отправить команду в applyCh лидера,
@@ -85,7 +120,7 @@ func New(cfg Config, readyChan <-chan any) *KVService {
 func (kvs *KVService) Apply(log *raft.LogEntry) any {
 	cmd, ok := log.Data.(Command)
 	if !ok {
-		kvs.kvLogf("unknown command type %T", log.Data)
+		kvs.traceLogf("unknown command type %T", log.Data)
 		return nil
 	}
 
@@ -97,7 +132,7 @@ func (kvs *KVService) Apply(log *raft.LogEntry) any {
 	case CommandCAS:
 		cmd.ResultValue, cmd.ResultFound = kvs.ds.CAS(cmd.Key, cmd.CompareValue, cmd.Value)
 	default:
-		kvs.kvLogf("unknown command kind %v", cmd.Kind)
+		kvs.traceLogf("unknown command kind %v", cmd.Kind)
 		return nil
 	}
 
@@ -198,7 +233,7 @@ func (kvs *KVService) ServeHTTP(address string) {
 	}
 
 	go func() {
-		kvs.kvLogf("serving HTTP on %s", kvs.srv.Addr)
+		kvs.traceLogf("serving HTTP on %s", kvs.srv.Addr)
 		if err := kvs.srv.ListenAndServe(); err != http.ErrServerClosed {
 			log.Fatal(err)
 		}
@@ -213,15 +248,15 @@ func (kvs *KVService) ServeHTTP(address string) {
 // Примечание: перед вызовом Shutdown необходимо вызвать
 // DisconnectFromRaftPeers для всех узлов кластера.
 func (kvs *KVService) Shutdown() error {
-	kvs.kvLogf("shutting down Raft server")
+	kvs.traceLogf("shutting down Raft server")
 	kvs.rs.Shutdown()
 
 	if kvs.srv != nil {
-		kvs.kvLogf("shutting down HTTP server")
+		kvs.traceLogf("shutting down HTTP server")
 		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 		defer cancel()
 		_ = kvs.srv.Shutdown(ctx)
-		kvs.kvLogf("HTTP shutdown complete")
+		kvs.traceLogf("HTTP shutdown complete")
 		return nil
 	}
 
@@ -257,7 +292,7 @@ func (kvs *KVService) handlePut(w http.ResponseWriter, req *http.Request) {
 	pr := &api.PutRequest{}
 	defer func() {
 		elapsed := time.Since(start)
-		kvs.kvLogf("HTTP PUT %v took %v", pr, elapsed)
+		kvs.traceLogf("HTTP PUT %v took %v", pr, elapsed)
 	}()
 
 	if err := readRequestJSON(req, pr); err != nil {
@@ -307,7 +342,7 @@ func (kvs *KVService) handleGet(w http.ResponseWriter, req *http.Request) {
 	gr := &api.GetRequest{}
 	defer func() {
 		elapsed := time.Since(start)
-		kvs.kvLogf("HTTP GET %v took %v", gr, elapsed)
+		kvs.traceLogf("HTTP GET %v took %v", gr, elapsed)
 	}()
 
 	if err := readRequestJSON(req, gr); err != nil {
@@ -344,7 +379,7 @@ func (kvs *KVService) handleCAS(w http.ResponseWriter, req *http.Request) {
 	cr := &api.CASRequest{}
 	defer func() {
 		elapsed := time.Since(start)
-		kvs.kvLogf("HTTP CAS %v took %v", cr, elapsed)
+		kvs.traceLogf("HTTP CAS %v took %v", cr, elapsed)
 	}()
 
 	if err := readRequestJSON(req, cr); err != nil {
@@ -390,11 +425,11 @@ func (kvs *KVService) handleCAS(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
-// kvLogf выводит отладочное сообщение, если DebugKV > 0.
-func (kvs *KVService) kvLogf(format string, args ...any) {
-	if DebugKV > 0 {
+// traceLogf выводит отладочное сообщение, если TraceKV > 0.
+func (kvs *KVService) traceLogf(format string, args ...any) {
+	if TraceKV > 0 {
 		format = fmt.Sprintf("[kv %d] ", kvs.id) + format
-		log.Printf(format, args...)
+		_traceLogger.Printf(format, args...)
 	}
 }
 

@@ -14,7 +14,17 @@ func (cm *ConsensusModule) nextIndexArgsEntries(peerID, savedCurrentTerm int) (i
 	var entries []LogEntry
 	if ni <= cm.lastLogIndex {
 		pos := cm.logPosition(ni)
-		entries = append([]LogEntry{}, cm.log[pos:]...)
+		// Defensive check: если pos >= len(cm.log), инвариант
+		// cm.lastLogIndex == cm.log[last].Index нарушен (аномалия при
+		// компактировании между вычислениями). Слайсинг cm.log[pos:]
+		// паникует без recover() в горутине leaderSendAEsToPeer, поэтому
+		// вместо него логируем аномалию и отправляем пустой срез записей.
+		if pos < len(cm.log) {
+			entries = append([]LogEntry{}, cm.log[pos:]...)
+		} else {
+			cm.traceLogfLocked(1, "nextIndexArgsEntries: logPosition(%d) out of range (len=%d)", ni, len(cm.log))
+			entries = nil
+		}
 	} else {
 		entries = nil
 	}

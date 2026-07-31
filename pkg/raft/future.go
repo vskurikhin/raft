@@ -22,6 +22,12 @@ var (
 	// ErrAbortedByRestore возвращается лидером, когда операция прервана
 	// восстановлением из снэпшота.
 	ErrAbortedByRestore = errors.New("raft: snapshot restored while committing log")
+
+	// ErrBatchFSMResponseMismatch — нарушение контракта BatchingFSM:
+	// ApplyBatch вернул число ответов, не совпадающее с числом записей
+	// журнала в батче. Возвращается клиентам через ApplyFuture.Error();
+	// не роняет горутину runFSM.
+	ErrBatchFSMResponseMismatch = errors.New("raft: ApplyBatch response count mismatch")
 )
 
 // Future представляет асинхронную операцию Raft.

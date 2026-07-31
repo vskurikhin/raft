@@ -199,3 +199,89 @@ func TestPreVote_Disabled(t *testing.T) {
 		t.Errorf("disconnected node term = %d, want > %d", disconnectedTerm, origTerm)
 	}
 }
+
+// mockPreVoteGrant — минимальный транспорт для unit-теста retry-пути
+// кандидата. RequestPreVote всегда предоставляет голос с термом peer'а,
+// равным текущему терму кандидата (сценарий split vote), а RequestVote
+// возвращает пустой ответ, чтобы узел не выигрывал реальные выборы.
+type mockPreVoteGrant struct {
+	Transport
+	peerTerm int
+}
+
+func (m *mockPreVoteGrant) RequestPreVote(_ ServerID, _ RequestPreVoteArgs) (RequestPreVoteReply, error) {
+	return RequestPreVoteReply{
+		RPCHeader: RPCHeader{
+			ProtocolVersion: ProtocolVersion,
+			ServerID:        1,
+		},
+		Term:        m.peerTerm,
+		VoteGranted: true,
+	}, nil
+}
+
+func (m *mockPreVoteGrant) RequestVote(_ ServerID, _ RequestVoteArgs) (RequestVoteReply, error) {
+	return RequestVoteReply{}, nil
+}
+
+// TestPreVote_CandidateRetry проверяет, что кандидат, не набравший кворум
+// на реальных выборах (split vote), не «застревает» в состоянии Candidate,
+// а повторяет выборы через PreVote.
+//
+// Раньше runPreCandidate выходил сразу, если узел находился в состоянии
+// Candidate. Таймер выборов (runElectionTimer) передавал управление в
+// runPreCandidate и завершался, а тот возвращался, ничего не сделав — после
+// проигранных выборов кандидат навсегда оставался в Candidate, и кластер
+// мог навсегда остаться без лидера (livelock). На практике это проявлялось
+// как флаки-тесты вида «leader not found».
+//
+// Тест напрямую вызывает runPreCandidate на узле в состоянии Candidate с
+// транспортной заглушкой, предоставляющей PreVote. Если retry работает, узел
+// выигрывает PreVote, запускает настоящие выборы и увеличивает терм; если
+// runPreCandidate выходит сразу (старое поведение) — терм остаётся прежним.
+func TestPreVote_CandidateRetry(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 500*Quantum*time.Millisecond)()
+
+	cm := &ConsensusModule{
+		id:                 0,
+		state:              Candidate,
+		currentTerm:        2,
+		votedFor:           0,
+		transport:          &mockPreVoteGrant{peerTerm: 2},
+		storage:            NewMapStorage(),
+		electionResetEvent: time.Now(),
+		electionTimerDone:  make(chan struct{}),
+		shutdownCh:         make(chan struct{}),
+		configurations: configurations{
+			latest: Configuration{
+				ConfigServers: []ConfigServer{
+					{ID: 0, Suffrage: Voter},
+					{ID: 1, Suffrage: Voter},
+				},
+			},
+		},
+	}
+	cm.log = make([]LogEntry, 0)
+	defer close(cm.shutdownCh)
+
+	done := make(chan struct{})
+	go func() {
+		cm.runPreCandidate()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runPreCandidate did not return")
+	}
+
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	if cm.currentTerm != 3 {
+		t.Fatalf("candidate retry did not start new election: term=%d, want 3", cm.currentTerm)
+	}
+	if cm.state != Candidate {
+		t.Fatalf("state=%v after retry, want Candidate at new term", cm.state)
+	}
+}

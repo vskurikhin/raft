@@ -144,6 +144,36 @@ func TestParseFlagsDefaultAddr(t *testing.T) {
 	}
 }
 
+func TestParseFlagsTraceLogDefaults(t *testing.T) {
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
+
+	os.Args = []string{"raft", "-number", "1"}
+
+	v := ParseFlags()
+	if v.TraceLogLevel != 1 {
+		t.Errorf("TraceLogLevel = %d, want default 1", v.TraceLogLevel)
+	}
+	if v.TraceLogFile != "" {
+		t.Errorf("TraceLogFile = %q, want default empty", v.TraceLogFile)
+	}
+}
+
+func TestParseFlagsTraceLog(t *testing.T) {
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
+
+	os.Args = []string{"raft", "-number", "1", "--trace-log-level", "16", "--trace-log-file", "/tmp/raft-trace.log"}
+
+	v := ParseFlags()
+	if v.TraceLogLevel != 16 {
+		t.Errorf("TraceLogLevel = %d, want 16", v.TraceLogLevel)
+	}
+	if v.TraceLogFile != "/tmp/raft-trace.log" {
+		t.Errorf("TraceLogFile = %q, want /tmp/raft-trace.log", v.TraceLogFile)
+	}
+}
+
 func TestValuesImplements(t *testing.T) {
 	v := Values{
 		RPCAddress: mustParseAddr("127.0.0.1:9990"),

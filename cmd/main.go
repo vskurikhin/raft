@@ -30,7 +30,26 @@ func run() error {
 
 var wg sync.WaitGroup
 
+// configureTraceLogging применяет параметры трассировки командной строки:
+// --trace-log-level задаёт пороги raft.TraceCM и kvservice.TraceKV,
+// --trace-log-file — файл, в который пишутся отладочные сообщения
+// консенсус-модуля и KV-сервиса (пустая строка — stderr).
+func configureTraceLogging(values config.Values) error {
+	raft.TraceCM = values.TraceLogLevel
+	kvservice.TraceKV = values.TraceLogLevel
+	if values.TraceLogFile == "" {
+		return nil
+	}
+	if err := raft.SetTraceLogFile(values.TraceLogFile); err != nil {
+		return err
+	}
+	return kvservice.SetTraceLogFile(values.TraceLogFile)
+}
+
 func runWith(values config.Values) error {
+	if err := configureTraceLogging(values); err != nil {
+		return err
+	}
 	nums := slices.Collect(maps.Keys(values.Peers))
 	done := make(chan any)
 	ready := make(chan any)

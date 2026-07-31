@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 	"log/slog"
 	"math/rand"
 	"os"
@@ -780,8 +779,10 @@ func (cm *ConsensusModule) appendConfigurationEntry(future *configurationChangeF
 
 // applyBatch применяет все LogCommand записи из батча за один вызов
 // ApplyBatch переданного BatchingFSM. Non-command записи (noop)
-// разрешаются с nil-ответом без вызова FSM. Паникует при несовпадении
-// длины возвращаемого среза — это нарушение контракта BatchingFSM.
+// разрешаются с nil-ответом без вызова FSM. При несовпадении длины
+// возвращаемого среза с числом записей все future батча отвечают ошибкой
+// ErrBatchFSMResponseMismatch. Паника в этом месте недопустима (AGENTS.md):
+// она упала бы в горутине runFSM и убила бы весь процесс.
 func (cm *ConsensusModule) applyBatch(fsm BatchingFSM, batch []*commitTuple) {
 	var logs []*LogEntry
 	var futures []*logFuture
@@ -805,10 +806,20 @@ func (cm *ConsensusModule) applyBatch(fsm BatchingFSM, batch []*commitTuple) {
 	}
 	responses := fsm.ApplyBatch(logs)
 	if len(responses) != len(logs) {
-		panic(fmt.Sprintf(
-			"ApplyBatch returned %d responses, expected %d",
-			len(responses), len(logs),
-		))
+		// Внешний FSM нарушил контракт BatchingFSM: число ответов не
+		// совпадает с числом записей. Нельзя доверять частичному
+		// результату, поэтому FSM-ответы не интерпретируются. Отвечаем
+		// ошибкой во все future батча (они ещё не отвечены — noop/non-command
+		// записи обработаны раньше и в срез futures не входят) и выходим:
+		// runFSM продолжает жить, следующие батчи обрабатываются как обычно.
+		err := fmt.Errorf("%w: got %d, want %d",
+			ErrBatchFSMResponseMismatch, len(responses), len(logs))
+		for _, f := range futures {
+			if f != nil {
+				f.respond(err)
+			}
+		}
+		return
 	}
 	for i, f := range futures {
 		if f != nil {
@@ -1706,6 +1717,15 @@ func (cm *ConsensusModule) runLeaderLoop() {
 // Если кворум не получен или обнаружен более высокий term — возвращается
 // в Follower.
 //
+// Вызов из состояния Candidate допускается: это retry-путь кандидата,
+// проигравшего реальные выборы (split vote, когда два кандидата в одном
+// терме голосуют каждый за себя и не набирают кворум). Таймер выборов
+// (runElectionTimer) передаёт управление сюда независимо от состояния, и
+// без перехода Candidate → PreCandidate такой кандидат навсегда остался бы
+// в Candidate: runPreCandidate выходил бы сразу, а горутина таймера уже
+// завершилась, поэтому новые выборы больше никогда не запускались бы
+// (livelock без лидера).
+//
 // Горутина завершается при:
 //   - получении кворума PreVote → вызов startElection()
 //   - истечении election timeout без кворума → becomeFollower()
@@ -1714,7 +1734,7 @@ func (cm *ConsensusModule) runLeaderLoop() {
 // Вызывается из runElectionTimer(), когда preVoteDisabled == false.
 func (cm *ConsensusModule) runPreCandidate() {
 	cm.mu.Lock()
-	if cm.state != Follower && cm.state != PreCandidate {
+	if cm.state != Follower && cm.state != PreCandidate && cm.state != Candidate {
 		cm.mu.Unlock()
 		return
 	}
@@ -2378,7 +2398,7 @@ func (cm *ConsensusModule) debugLogf(format string, args ...any) {
 func (cm *ConsensusModule) traceLogfLocked(level int, format string, args ...any) {
 	if TraceCM > level {
 		format = fmt.Sprintf("[%c,N:%d,T:%03d] ", stateLetter(cm.state), cm.id, cm.currentTerm) + format
-		log.Printf(format, args...)
+		_traceLogger.Printf(format, args...)
 	}
 }
 
