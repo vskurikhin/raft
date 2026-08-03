@@ -64,6 +64,7 @@ func runWith(values config.Values) error {
 			SnapshotStore: raft.NewInmemSnapshotStore(),
 			Storage:       raft.NewMapStorage(),
 			TcpRpcTimeout: raft.TcpRpcTimeoutMs,
+			MaxPool:       4,
 		},
 	}
 	kvs := kvservice.New(cfg, ready)
