@@ -26,6 +26,9 @@ type Values struct {
 	TraceLogLevel int
 	// TraceLogFile — путь к файлу трассировки; пустая строка — stderr.
 	TraceLogFile string
+	// DataDir — директория для persistent-хранилища узла; пустая строка —
+	// вычисляется путь по умолчанию в cmd/main.go.
+	DataDir string
 }
 
 func ParseFlags() Values {
@@ -36,6 +39,7 @@ func ParseFlags() Values {
 	peersFlag := fs.String("peers", "", "Comma-separated list of peers servers (id=host:port)")
 	traceLogLevelFlag := fs.Int("trace-log-level", 1, "Trace log level for raft.TraceCM and kvservice.TraceKV")
 	traceLogFileFlag := fs.String("trace-log-file", "", "Trace log file path (empty = stderr)")
+	dataDirFlag := fs.String("data-dir", "", "Directory for persistent storage")
 	err := fs.Parse(os.Args[1:])
 	if err != nil {
 		log.Fatal(err)
@@ -56,6 +60,7 @@ func ParseFlags() Values {
 		Peers:         peers,
 		TraceLogLevel: *traceLogLevelFlag,
 		TraceLogFile:  *traceLogFileFlag,
+		DataDir:       *dataDirFlag,
 	}
 }
 

@@ -1,8 +1,10 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"maps"
+	"path/filepath"
 	"slices"
 	"sync"
 	"time"
@@ -54,6 +56,11 @@ func runWith(values config.Values) error {
 	done := make(chan any)
 	ready := make(chan any)
 
+	dataDir := values.DataDir
+	if dataDir == "" {
+		dataDir = filepath.Join("data", fmt.Sprintf("node-%d", values.Number))
+	}
+
 	cfg := kvservice.Config{
 		HTTPAddress: values.HTTPAddress.String(),
 		Config: raft.Config{
@@ -62,7 +69,7 @@ func runWith(values config.Values) error {
 			RPCAddress:    values.RPCAddress.String(),
 			ServerID:      values.Number,
 			SnapshotStore: raft.NewInmemSnapshotStore(),
-			Storage:       raft.NewMapStorage(),
+			Storage:       raft.NewFileStorage(dataDir),
 			TcpRpcTimeout: raft.TcpRpcTimeoutMs,
 			MaxPool:       4,
 		},

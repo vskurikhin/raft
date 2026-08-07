@@ -174,6 +174,33 @@ func TestParseFlagsTraceLog(t *testing.T) {
 	}
 }
 
+func TestParseFlagsDataDir(t *testing.T) {
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
+
+	os.Args = []string{"raft", "-number", "0", "--data-dir", "/tmp/raft-data-test"}
+
+	v := ParseFlags()
+	if v.Number != 0 {
+		t.Errorf("Number = %d, want 0", v.Number)
+	}
+	if v.DataDir != "/tmp/raft-data-test" {
+		t.Errorf("DataDir = %q, want /tmp/raft-data-test", v.DataDir)
+	}
+}
+
+func TestParseFlagsDataDirDefault(t *testing.T) {
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
+
+	os.Args = []string{"raft", "-number", "1"}
+
+	v := ParseFlags()
+	if v.DataDir != "" {
+		t.Errorf("DataDir = %q, want default empty", v.DataDir)
+	}
+}
+
 func TestValuesImplements(t *testing.T) {
 	v := Values{
 		RPCAddress: mustParseAddr("127.0.0.1:9990"),

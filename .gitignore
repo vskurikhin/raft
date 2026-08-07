@@ -201,6 +201,7 @@ venv/
 .pytest_cache
 
 # Translations
+.ai/*
 *.mo
 *.pot
 
