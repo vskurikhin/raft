@@ -500,7 +500,7 @@ func (t *TCPTransport) handleConn(conn net.Conn) {
 // conn — TCP-соединение, используется для чтения данных снэпшота напрямую
 // (минуя bufio), чтобы избежать повреждения внутреннего состояния bufio
 // после ошибок gob-декодирования.
-func (t *TCPTransport) handleCommand(_ *bufio.Reader, conn net.Conn, dec *gob.Decoder, enc *gob.Encoder) error {
+func (t *TCPTransport) handleCommand(r *bufio.Reader, conn net.Conn, dec *gob.Decoder, enc *gob.Encoder) error {
 	var req tcpRPCRequest
 	if err := dec.Decode(&req); err != nil {
 		return err
@@ -530,7 +530,7 @@ func (t *TCPTransport) handleCommand(_ *bufio.Reader, conn net.Conn, dec *gob.De
 	// итерации цикла (flush + decode).
 	var snapReader io.ReadCloser
 	if req, ok := cmd.(*InstallSnapshotRequest); ok && req.DataSize > 0 {
-		snapReader = io.NopCloser(io.LimitReader(conn, req.DataSize))
+		snapReader = io.NopCloser(io.LimitReader(r, req.DataSize))
 	}
 
 	// Heartbeat fast-path: если это heartbeat и установлен обработчик,

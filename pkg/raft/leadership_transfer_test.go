@@ -265,7 +265,7 @@ func TestLeadershipTransfer_ApplyBlocked(t *testing.T) {
 	// Ждём, пока leadershipTransferInProgress установится в leaderLoop.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if atomic.LoadInt32(&h.cluster[origLeaderID].leadershipTransferInProgress) != 0 {
+		if atomic.LoadInt32(&h.cluster[origLeaderID].leaderState.leadershipTransferInProgress) != 0 {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -636,7 +636,7 @@ func TestLeadershipTransfer_EnqueueConfigurationChangeBlocked(t *testing.T) {
 	// Ждём, пока leadershipTransferInProgress установится в leaderLoop.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if atomic.LoadInt32(&h.cluster[origLeaderID].leadershipTransferInProgress) != 0 {
+		if atomic.LoadInt32(&h.cluster[origLeaderID].leaderState.leadershipTransferInProgress) != 0 {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)

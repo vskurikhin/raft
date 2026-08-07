@@ -68,6 +68,12 @@ func (fs *FileStorage) Set(key string, value []byte) {
 		log.Fatalf("FileStorage.Set: rename %s -> %s: %v", tmpPath, path, err)
 	}
 
+	// fsync родительской директории, чтобы rename пережил крэш ОС
+	// (TASK-008; образец — .doc/hashicorp/raft/file_snapshot.go).
+	if err := syncDir(fs.dir); err != nil {
+		log.Fatalf("FileStorage.Set: sync dir %s: %v", fs.dir, err)
+	}
+
 	fs.data[key] = value
 	fs.hasData = true
 	fs.mu.Unlock()

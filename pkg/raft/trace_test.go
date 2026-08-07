@@ -13,15 +13,16 @@ import (
 // TestSetTraceLogFile проверяет, что отладочные сообщения traceLogf
 // записываются в файл, заданный SetTraceLogFile, и возвращаются
 // в стандартный логгер при пустом пути.
+//
+// Значение TraceCM не изменяется (по умолчанию 1): уровень 0
+// заведомо ниже порога, поэтому запись гарантированно происходит,
+// а сама глобальная переменная остаётся доступной только на чтение
+// из фоновых горутин — изменение её из теста породило бы data race.
 func TestSetTraceLogFile(t *testing.T) {
 	defer leaktest.CheckTimeout(t, Quantum*150*time.Millisecond)()
 
 	path := filepath.Join(t.TempDir(), "raft-trace.log")
 	cm := new(ConsensusModule)
-
-	oldLevel := TraceCM
-	defer func() { TraceCM = oldLevel }()
-	TraceCM = 1
 
 	if err := SetTraceLogFile(path); err != nil {
 		t.Fatalf("SetTraceLogFile: %v", err)

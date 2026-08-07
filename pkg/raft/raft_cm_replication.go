@@ -5,24 +5,24 @@ import "time"
 func (cm *ConsensusModule) nextIndexArgsEntries(peerID, savedCurrentTerm int) (int, AppendEntriesArgs, []LogEntry) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
-	ni := cm.nextIndex[peerID]
+	ni := cm.leaderState.nextIndex[peerID]
 	prevLogIndex := ni - 1
 	prevLogTerm := -1
-	if 0 <= prevLogIndex && prevLogIndex <= cm.lastLogIndex {
+	if 0 <= prevLogIndex && prevLogIndex <= cm.cmState.lastLogIndex {
 		prevLogTerm = cm.lookupTerm(prevLogIndex)
 	}
 	var entries []LogEntry
-	if ni <= cm.lastLogIndex {
+	if ni <= cm.cmState.lastLogIndex {
 		pos := cm.logPosition(ni)
-		// Defensive check: если pos >= len(cm.log), инвариант
-		// cm.lastLogIndex == cm.log[last].Index нарушен (аномалия при
-		// компактировании между вычислениями). Слайсинг cm.log[pos:]
+		// Defensive check: если pos >= len(cm.cmState.log), инвариант
+		// cm.cmState.lastLogIndex == cm.cmState.log[last].Index нарушен (аномалия при
+		// компактировании между вычислениями). Слайсинг cm.cmState.log[pos:]
 		// паникует без recover() в горутине leaderSendAEsToPeer, поэтому
 		// вместо него логируем аномалию и отправляем пустой срез записей.
-		if pos < len(cm.log) {
-			entries = append([]LogEntry{}, cm.log[pos:]...)
+		if pos < len(cm.cmState.log) {
+			entries = append([]LogEntry{}, cm.cmState.log[pos:]...)
 		} else {
-			cm.traceLogfLocked(1, "nextIndexArgsEntries: logPosition(%d) out of range (len=%d)", ni, len(cm.log))
+			cm.traceLockedLogf(1, "nextIndexArgsEntries: logPosition(%d) out of range (len=%d)", ni, len(cm.cmState.log))
 			entries = nil
 		}
 	} else {
@@ -38,7 +38,7 @@ func (cm *ConsensusModule) nextIndexArgsEntries(peerID, savedCurrentTerm int) (i
 		PrevLogIndex: prevLogIndex,
 		PrevLogTerm:  prevLogTerm,
 		Entries:      entries,
-		LeaderCommit: cm.commitIndex,
+		LeaderCommit: cm.cmState.commitIndex,
 	}, entries
 }
 
@@ -51,15 +51,15 @@ func (cm *ConsensusModule) nextIndexArgsEntries(peerID, savedCurrentTerm int) (i
 func (cm *ConsensusModule) leaderSendAEsToPeer(peerID, savedCurrentTerm int) {
 	defer func() {
 		cm.mu.Lock()
-		if cm.inflightAE != nil && cm.inflightAE[peerID] != nil {
-			cm.inflightAE[peerID].Store(false)
+		if cm.leaderState.inflightAE != nil && cm.leaderState.inflightAE[peerID] != nil {
+			cm.leaderState.inflightAE[peerID].Store(false)
 		}
 		cm.mu.Unlock()
 	}()
 
 	cm.mu.Lock()
-	ni := cm.nextIndex[peerID]
-	if ni <= cm.lastSnapshotIndex && !isNilInterface(cm.snapshotStore) {
+	ni := cm.leaderState.nextIndex[peerID]
+	if ni <= cm.cmState.lastSnapshotIndex && !isNilInterface(cm.snapshotStore) {
 		cm.mu.Unlock()
 		cm.leaderSendSnapshot(peerID, savedCurrentTerm)
 		return
@@ -71,50 +71,50 @@ func (cm *ConsensusModule) leaderSendAEsToPeer(peerID, savedCurrentTerm int) {
 	reply, err := cm.transport.AppendEntries(ServerID(peerID), args)
 	if err == nil {
 		cm.mu.Lock()
-		if reply.Term > cm.currentTerm {
-			cm.traceLogfLocked(8, "term out of date in heartbeat reply")
+		if reply.Term > cm.cmState.currentTerm {
+			cm.traceLockedLogf(8, "term out of date in heartbeat reply")
 			cm.becomeFollower(reply.Term)
 			cm.mu.Unlock()
 			return
 		}
-		if cm.state == Leader && savedCurrentTerm == reply.Term {
+		if cm.cmState.state == Leader && savedCurrentTerm == reply.Term {
 			if reply.Success {
-				cm.nextIndex[peerID] = ni + len(entries)
-				cm.matchIndex[peerID] = cm.nextIndex[peerID] - 1
+				cm.leaderState.nextIndex[peerID] = ni + len(entries)
+				cm.leaderState.matchIndex[peerID] = cm.leaderState.nextIndex[peerID] - 1
 
-				cm.commitmentTracker.setMatch(peerID, cm.matchIndex[peerID], cm.lookupTerm)
-				cm.traceLogfLocked(
+				cm.leaderState.commitmentTracker.setMatch(peerID, cm.leaderState.matchIndex[peerID], cm.lookupTerm)
+				cm.traceLockedLogf(
 					8, "AppendEntries reply from %d success: nextIndex := %v, matchIndex := %v; commitIndex := %d",
-					peerID, cm.nextIndex, cm.matchIndex, cm.commitmentTracker.getCommitIndex(),
+					peerID, cm.leaderState.nextIndex, cm.leaderState.matchIndex, cm.leaderState.commitmentTracker.getCommitIndex(),
 				)
 
-				if len(cm.pendingVerify) > 0 && cm.state == Leader {
-					for _, vf := range cm.pendingVerify {
+				if len(cm.leaderState.pendingVerify) > 0 && cm.cmState.state == Leader {
+					for _, vf := range cm.leaderState.pendingVerify {
 						vf.vote(true)
 					}
 					var remaining []*verifyFuture
-					for _, vf := range cm.pendingVerify {
+					for _, vf := range cm.leaderState.pendingVerify {
 						if vf.votes >= vf.quorumSize {
 							vf.respond(nil)
 						} else {
 							remaining = append(remaining, vf)
 						}
 					}
-					cm.pendingVerify = remaining
+					cm.leaderState.pendingVerify = remaining
 				}
 
 				cm.mu.Unlock()
 			} else {
 				if reply.ConflictTerm >= 0 {
-					if lastIndex, ok := cm.termIndexMap[reply.ConflictTerm]; ok {
-						cm.nextIndex[peerID] = lastIndex + 1
+					if lastIndex, ok := cm.cmState.termIndexMap[reply.ConflictTerm]; ok {
+						cm.leaderState.nextIndex[peerID] = lastIndex + 1
 					} else {
-						cm.nextIndex[peerID] = reply.ConflictIndex
+						cm.leaderState.nextIndex[peerID] = reply.ConflictIndex
 					}
 				} else {
-					cm.nextIndex[peerID] = reply.ConflictIndex
+					cm.leaderState.nextIndex[peerID] = reply.ConflictIndex
 				}
-				cm.traceLogfLocked(8, "AppendEntries reply from %d !success: nextIndex := %d", peerID, ni-1)
+				cm.traceLockedLogf(8, "AppendEntries reply from %d !success: nextIndex := %d", peerID, ni-1)
 				cm.mu.Unlock()
 			}
 		} else {
@@ -136,29 +136,29 @@ func (cm *ConsensusModule) leaderSendAEsToPeer(peerID, savedCurrentTerm int) {
 // heartbeatTicker и при pendingVerify.
 func (cm *ConsensusModule) leaderSendAEs() {
 	cm.mu.Lock()
-	if cm.state != Leader {
+	if cm.cmState.state != Leader {
 		cm.mu.Unlock()
 		return
 	}
-	savedCurrentTerm := cm.currentTerm
+	savedCurrentTerm := cm.cmState.currentTerm
 
 	peers := make(map[int]struct{})
-	for _, s := range cm.configurations.committed.ConfigServers {
+	for _, s := range cm.cmState.configurations.committed.ConfigServers {
 		if int(s.ID) != cm.id {
 			peers[int(s.ID)] = struct{}{}
 		}
 	}
-	for _, s := range cm.configurations.latest.ConfigServers {
+	for _, s := range cm.cmState.configurations.latest.ConfigServers {
 		if int(s.ID) != cm.id {
 			peers[int(s.ID)] = struct{}{}
 		}
 	}
 
 	for peerID := range peers {
-		if cm.inflightAE[peerID] == nil {
+		if cm.leaderState.inflightAE[peerID] == nil {
 			continue
 		}
-		if cm.inflightAE[peerID].CompareAndSwap(false, true) {
+		if cm.leaderState.inflightAE[peerID].CompareAndSwap(false, true) {
 			go cm.leaderSendAEsToPeer(peerID, savedCurrentTerm)
 		}
 	}
@@ -185,6 +185,19 @@ func (cm *ConsensusModule) leaderSendSnapshot(peerID int, term int) {
 
 	snapshots, err := cm.snapshotStore.List()
 	if err != nil || len(snapshots) == 0 {
+		// Пустой List у лидера с lastSnapshotIndex >= 0 — признак
+		// повреждения/удаления durable-стора (TASK-009): диагностика
+		// и best-effort восстановление форсированием нового снапшота.
+		cm.traceLogf(0, "leaderSendSnapshot: cannot send snapshot to %d: err=%v, snapshots=%d", peerID, err, len(snapshots))
+		cm.mu.Lock()
+		lastSnapshotIndex := cm.cmState.lastSnapshotIndex
+		cm.mu.Unlock()
+		if lastSnapshotIndex >= 0 && cm.snapshotCh != nil {
+			select {
+			case cm.snapshotCh <- struct{}{}:
+			default:
+			}
+		}
 		return
 	}
 	// List() может вернуть слайс с nil-элементом или пустым ID — оба
@@ -199,6 +212,7 @@ func (cm *ConsensusModule) leaderSendSnapshot(peerID int, term int) {
 	}
 	meta, reader, err := cm.snapshotStore.Open(snapshots[0].ID)
 	if err != nil {
+		cm.traceLogf(0, "leaderSendSnapshot: cannot open snapshot %s for peer %d: %v", snapshots[0].ID, peerID, err)
 		return
 	}
 	defer func() { _ = reader.Close() }()
@@ -233,8 +247,8 @@ func (cm *ConsensusModule) leaderSendSnapshot(peerID int, term int) {
 	}
 	if reply.Success {
 		cm.mu.Lock()
-		cm.nextIndex[peerID] = meta.Index + 1
-		cm.matchIndex[peerID] = meta.Index
+		cm.leaderState.nextIndex[peerID] = meta.Index + 1
+		cm.leaderState.matchIndex[peerID] = meta.Index
 		cm.mu.Unlock()
 	}
 }

@@ -210,3 +210,118 @@ func TestInmemSnapshotStore_OpenReturnsCopy(t *testing.T) {
 		t.Fatalf("data = %q, want %q", string(data), "original")
 	}
 }
+
+// TestInmemStore_VisibleOnlyAfterClose проверяет контракт: снапшот виден
+// в List/Open только после успешного Close.
+func TestInmemStore_VisibleOnlyAfterClose(t *testing.T) {
+	defer leaktest.CheckTimeout(t, time.Second)()
+
+	store := NewInmemSnapshotStore()
+	sink, err := store.Create(10, 3, Configuration{}, 0)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	if _, err := sink.Write([]byte("data")); err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+
+	// До Close снэпшот не виден.
+	snapshots, err := store.List()
+	if err != nil {
+		t.Fatalf("List failed: %v", err)
+	}
+	if len(snapshots) != 0 {
+		t.Fatalf("List before Close = %v, want empty", snapshots)
+	}
+	if _, _, err := store.Open(sink.ID()); err == nil {
+		t.Fatal("Open before Close: want error, got nil")
+	}
+
+	if err := sink.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	snapshots, err = store.List()
+	if err != nil {
+		t.Fatalf("List failed: %v", err)
+	}
+	if len(snapshots) != 1 {
+		t.Fatalf("List after Close = %d snapshots, want 1", len(snapshots))
+	}
+	if snapshots[0].Size != int64(len("data")) {
+		t.Fatalf("Size = %d, want %d", snapshots[0].Size, len("data"))
+	}
+}
+
+// TestInmemStore_CancelKeepsPrevious проверяет контракт: Cancel
+// незавершённого снапшота сохраняет предыдущий завершённый.
+func TestInmemStore_CancelKeepsPrevious(t *testing.T) {
+	defer leaktest.CheckTimeout(t, time.Second)()
+
+	store := NewInmemSnapshotStore()
+	sinkA, err := store.Create(10, 1, Configuration{}, 10)
+	if err != nil {
+		t.Fatalf("Create A failed: %v", err)
+	}
+	if _, err := sinkA.Write([]byte("data A")); err != nil {
+		t.Fatalf("Write A failed: %v", err)
+	}
+	if err := sinkA.Close(); err != nil {
+		t.Fatalf("Close A failed: %v", err)
+	}
+
+	sinkB, err := store.Create(11, 1, Configuration{}, 11)
+	if err != nil {
+		t.Fatalf("Create B failed: %v", err)
+	}
+	if _, err := sinkB.Write([]byte("data B")); err != nil {
+		t.Fatalf("Write B failed: %v", err)
+	}
+	if err := sinkB.Cancel(); err != nil {
+		t.Fatalf("Cancel B failed: %v", err)
+	}
+
+	snapshots, err := store.List()
+	if err != nil {
+		t.Fatalf("List failed: %v", err)
+	}
+	if len(snapshots) != 1 || snapshots[0].ID != sinkA.ID() {
+		t.Fatalf("List after Cancel = %v, want snapshot A", snapshots)
+	}
+	_, reader, err := store.Open(sinkA.ID())
+	if err != nil {
+		t.Fatalf("Open A failed: %v", err)
+	}
+	data, err := io.ReadAll(reader)
+	_ = reader.Close()
+	if err != nil {
+		t.Fatalf("ReadAll failed: %v", err)
+	}
+	if string(data) != "data A" {
+		t.Fatalf("data = %q, want %q", string(data), "data A")
+	}
+}
+
+// TestInmemStore_CloseIdempotent проверяет, что повторный Close не падает
+// и не создаёт дубликатов в List.
+func TestInmemStore_CloseIdempotent(t *testing.T) {
+	defer leaktest.CheckTimeout(t, time.Second)()
+
+	store := NewInmemSnapshotStore()
+	sink, err := store.Create(10, 3, Configuration{}, 0)
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	_ = sink.Close()
+	if err := sink.Close(); err != nil {
+		t.Fatalf("second Close failed: %v", err)
+	}
+
+	snapshots, err := store.List()
+	if err != nil {
+		t.Fatalf("List failed: %v", err)
+	}
+	if len(snapshots) != 1 {
+		t.Fatalf("List = %d snapshots, want 1", len(snapshots))
+	}
+}

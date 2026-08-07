@@ -61,6 +61,14 @@ func runWith(values config.Values) error {
 		dataDir = filepath.Join("data", fmt.Sprintf("node-%d", values.Number))
 	}
 
+	// Durable-хранилище снапшотов: log compaction усекает durable-лог,
+	// поэтому снапшот обязан переживать рестарт процесса. retain=2 —
+	// запас на случай повреждения последнего снапшота.
+	snapshotStore, err := raft.NewFileSnapshotStore(dataDir, 2)
+	if err != nil {
+		return fmt.Errorf("failed to create file snapshot store in %s: %w", dataDir, err)
+	}
+
 	cfg := kvservice.Config{
 		HTTPAddress: values.HTTPAddress.String(),
 		Config: raft.Config{
@@ -68,7 +76,7 @@ func runWith(values config.Values) error {
 			PeerIds:       nums,
 			RPCAddress:    values.RPCAddress.String(),
 			ServerID:      values.Number,
-			SnapshotStore: raft.NewInmemSnapshotStore(),
+			SnapshotStore: snapshotStore,
 			Storage:       raft.NewFileStorage(dataDir),
 			TcpRpcTimeout: raft.TcpRpcTimeoutMs,
 			MaxPool:       4,

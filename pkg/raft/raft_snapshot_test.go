@@ -155,11 +155,14 @@ func (h *snapshotHarness) RestartPeer(id int) {
 		}
 	}
 
-	// Создаём новый FSM и SnapshotStore.
+	// Создаём новый FSM, но ПЕРЕИСПОЛЬЗУЕМ store узла: Inmem-стор живёт
+	// в том же процессе и хранит последний снэпшот — это эмуляция
+	// durable-стора для in-memory кластера. Новый пустой store с
+	// lastSnapshotIndex > 0 в storage привёл бы к fail-fast в
+	// restoreFromSnapshotStore (пустой store при усечённом логе).
 	fsm := newSnapshotTestFSM()
 	h.fsms[id] = fsm
-	store := NewInmemSnapshotStore()
-	h.stores[id] = store
+	store := h.stores[id]
 
 	h.cluster[id] = NewConsensusModule(
 		id, peerIds, h.transports[id],
@@ -195,7 +198,7 @@ func (h *snapshotHarness) waitForSnapshot(serverID int, timeout time.Duration) b
 	deadline := time.After(timeout)
 	for {
 		h.cluster[serverID].mu.Lock()
-		idx := h.cluster[serverID].lastSnapshotIndex
+		idx := h.cluster[serverID].cmState.lastSnapshotIndex
 		h.cluster[serverID].mu.Unlock()
 		if idx > 0 {
 			return true
@@ -213,14 +216,14 @@ func (h *snapshotHarness) waitForSnapshot(serverID int, timeout time.Duration) b
 func (h *snapshotHarness) getSnapshotIndex(serverID int) int {
 	h.cluster[serverID].mu.Lock()
 	defer h.cluster[serverID].mu.Unlock()
-	return h.cluster[serverID].lastSnapshotIndex
+	return h.cluster[serverID].cmState.lastSnapshotIndex
 }
 
 // getLogLength возвращает длину журнала узла.
 func (h *snapshotHarness) getLogLength(serverID int) int {
 	h.cluster[serverID].mu.Lock()
 	defer h.cluster[serverID].mu.Unlock()
-	return len(h.cluster[serverID].log)
+	return len(h.cluster[serverID].cmState.log)
 }
 
 // ============================================================
@@ -291,7 +294,7 @@ func TestSnapshot_NoSnapshotStore(t *testing.T) {
 	// Проверяем, что lastSnapshotIndex == -1 на всех узлах.
 	for i := 0; i < h.n; i++ {
 		h.cluster[i].mu.Lock()
-		idx := h.cluster[i].lastSnapshotIndex
+		idx := h.cluster[i].cmState.lastSnapshotIndex
 		h.cluster[i].mu.Unlock()
 		if idx != -1 {
 			t.Fatalf("server %d: lastSnapshotIndex = %d, want -1", i, idx)
@@ -394,32 +397,32 @@ func TestCompactLog_Basic(t *testing.T) {
 	cm := NewConsensusModule(0, []int{}, NewInmemTransport("test"), storage, newSnapshotTestFSM(), ready)
 
 	cm.mu.Lock()
-	cm.log = []LogEntry{
+	cm.cmState.log = []LogEntry{
 		{Index: 1, Term: 1},
 		{Index: 2, Term: 1},
 		{Index: 3, Term: 1},
 		{Index: 4, Term: 1},
 		{Index: 5, Term: 1},
 	}
-	cm.lastLogIndex = 5
-	cm.lastLogTerm = 1
+	cm.cmState.lastLogIndex = 5
+	cm.cmState.lastLogTerm = 1
 
 	// компактируем записи с Index < 3.
 	cm.compactLogs(3)
 	cm.mu.Unlock()
 
 	// Проверяем, что остались записи с Index: 3, 4, 5.
-	if len(cm.log) != 3 {
-		t.Fatalf("log length = %d, want 3", len(cm.log))
+	if len(cm.cmState.log) != 3 {
+		t.Fatalf("log length = %d, want 3", len(cm.cmState.log))
 	}
-	if cm.log[0].Index != 3 {
-		t.Fatalf("first entry Index = %d, want 3", cm.log[0].Index)
+	if cm.cmState.log[0].Index != 3 {
+		t.Fatalf("first entry Index = %d, want 3", cm.cmState.log[0].Index)
 	}
-	if cm.log[1].Index != 4 {
-		t.Fatalf("second entry Index = %d, want 4", cm.log[1].Index)
+	if cm.cmState.log[1].Index != 4 {
+		t.Fatalf("second entry Index = %d, want 4", cm.cmState.log[1].Index)
 	}
-	if cm.log[2].Index != 5 {
-		t.Fatalf("third entry Index = %d, want 5", cm.log[2].Index)
+	if cm.cmState.log[2].Index != 5 {
+		t.Fatalf("third entry Index = %d, want 5", cm.cmState.log[2].Index)
 	}
 	cm.Stop()
 }
@@ -430,13 +433,13 @@ func TestCompactLog_All(t *testing.T) {
 
 	cm := &ConsensusModule{}
 	cm.shutdownCh = make(chan struct{})
-	cm.log = []LogEntry{
+	cm.cmState.log = []LogEntry{
 		{Index: 1, Term: 1},
 		{Index: 2, Term: 1},
 	}
 	cm.compactLogs(10)
-	if len(cm.log) != 0 {
-		t.Fatalf("log length = %d, want 0", len(cm.log))
+	if len(cm.cmState.log) != 0 {
+		t.Fatalf("log length = %d, want 0", len(cm.cmState.log))
 	}
 }
 
@@ -447,17 +450,17 @@ func TestCompactLog_Nothing(t *testing.T) {
 
 	cm := &ConsensusModule{}
 	cm.shutdownCh = make(chan struct{})
-	cm.log = []LogEntry{
+	cm.cmState.log = []LogEntry{
 		{Index: 5, Term: 1},
 		{Index: 6, Term: 1},
 		{Index: 7, Term: 1},
 	}
 	cm.compactLogs(3)
-	if len(cm.log) != 3 {
-		t.Fatalf("log length = %d, want 3", len(cm.log))
+	if len(cm.cmState.log) != 3 {
+		t.Fatalf("log length = %d, want 3", len(cm.cmState.log))
 	}
-	if cm.log[0].Index != 5 {
-		t.Fatalf("first entry Index = %d, want 5", cm.log[0].Index)
+	if cm.cmState.log[0].Index != 5 {
+		t.Fatalf("first entry Index = %d, want 5", cm.cmState.log[0].Index)
 	}
 }
 
@@ -468,15 +471,15 @@ func TestCompactLog_Empty(t *testing.T) {
 	cm := &ConsensusModule{}
 	cm.shutdownCh = make(chan struct{})
 	cm.compactLogs(5)
-	if len(cm.log) != 0 {
-		t.Fatalf("log length = %d, want 0", len(cm.log))
+	if len(cm.cmState.log) != 0 {
+		t.Fatalf("log length = %d, want 0", len(cm.cmState.log))
 	}
 }
 
 // TestLogPosition_Exact проверяет точное совпадение индекса.
 func TestLogPosition_Exact(t *testing.T) {
 	cm := &ConsensusModule{}
-	cm.log = []LogEntry{
+	cm.cmState.log = []LogEntry{
 		{Index: 5, Term: 1},
 		{Index: 10, Term: 1},
 		{Index: 15, Term: 1},
@@ -495,7 +498,7 @@ func TestLogPosition_Exact(t *testing.T) {
 // TestLogPosition_NotFound проверяет поиск отсутствующего индекса.
 func TestLogPosition_NotFound(t *testing.T) {
 	cm := &ConsensusModule{}
-	cm.log = []LogEntry{
+	cm.cmState.log = []LogEntry{
 		{Index: 5, Term: 1},
 		{Index: 10, Term: 1},
 		{Index: 15, Term: 1},
@@ -515,7 +518,7 @@ func TestLogPosition_NotFound(t *testing.T) {
 // после компактирования.
 func TestLogPosition_AfterCompact(t *testing.T) {
 	cm := &ConsensusModule{}
-	cm.log = []LogEntry{
+	cm.cmState.log = []LogEntry{
 		{Index: 1, Term: 1},
 		{Index: 2, Term: 1},
 		{Index: 3, Term: 1},
@@ -570,14 +573,14 @@ func TestSnapshot_MultipleSnapshots(t *testing.T) {
 	sleepMs(500)
 
 	cm.mu.Lock()
-	isLeader := cm.state == Leader
+	isLeader := cm.cmState.state == Leader
 	cm.mu.Unlock()
 	if !isLeader {
 		// Ждём выборов (одиночный узел становится лидером после election timeout).
 		for i := 0; i < 20; i++ {
 			sleepMs(100)
 			cm.mu.Lock()
-			isLeader = cm.state == Leader
+			isLeader = cm.cmState.state == Leader
 			cm.mu.Unlock()
 			if isLeader {
 				break
@@ -603,8 +606,8 @@ func TestSnapshot_MultipleSnapshots(t *testing.T) {
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		cm.mu.Lock()
-		snapIdx := cm.lastSnapshotIndex
-		logLen := len(cm.log)
+		snapIdx := cm.cmState.lastSnapshotIndex
+		logLen := len(cm.cmState.log)
 		cm.mu.Unlock()
 		if snapIdx > 0 && logLen <= 10 {
 			break
@@ -613,8 +616,8 @@ func TestSnapshot_MultipleSnapshots(t *testing.T) {
 	}
 
 	cm.mu.Lock()
-	snapIdx := cm.lastSnapshotIndex
-	logLen := len(cm.log)
+	snapIdx := cm.cmState.lastSnapshotIndex
+	logLen := len(cm.cmState.log)
 	cm.mu.Unlock()
 
 	t.Logf("snapshot index=%d, log length=%d", snapIdx, logLen)
@@ -658,40 +661,32 @@ func TestSnapshot_MultipleSnapshots(t *testing.T) {
 	}
 }
 
-// TestSnapshot_RestartWithSnapshot проверяет, что после перезапуска
-// узла снэпшот восстанавливается из storage.
-func TestSnapshot_RestartWithSnapshot(t *testing.T) {
+// TestSnapshot_RestartRestoresFSM — регрессионный тест P0-1: после
+// снапшота, компактирования durable-лога и полного рестарта узла FSM
+// обязан восстановиться из durable-снапшота (включая ключи до линии
+// компактирования), а суффикс лога — доиграться существующим механизмом.
+// Используются реальные FileStorage и FileSnapshotStore в одной директории.
+func TestSnapshot_RestartRestoresFSM(t *testing.T) {
 	defer leaktest.CheckTimeout(t, 60*time.Second)()
 
-	// Одноузловой кластер.
-	storage := NewMapStorage()
+	dir := t.TempDir()
+	storage := NewFileStorage(dir)
+	store, err := NewFileSnapshotStore(dir, 2)
+	if err != nil {
+		t.Fatalf("NewFileSnapshotStore failed: %v", err)
+	}
 	fsm := newSnapshotTestFSM()
-	store := NewInmemSnapshotStore()
 	ready := make(chan any)
 	close(ready)
-
 	transport := NewInmemTransport("single")
+
 	cm := NewConsensusModule(0, []int{}, transport, storage, fsm, ready, store)
-	defer cm.Stop()
+	waitForLeader(t, cm, 5*time.Second)
 
-	sleepMs(500)
-	cm.mu.Lock()
-	isLeader := cm.state == Leader
-	cm.mu.Unlock()
-	for i := 0; i < 20 && !isLeader; i++ {
-		sleepMs(100)
-		cm.mu.Lock()
-		isLeader = cm.state == Leader
-		cm.mu.Unlock()
-	}
-	if !isLeader {
-		t.Fatal("node did not become leader")
-	}
+	cm.SetSnapshotConfig(8, 50*time.Millisecond, 2)
 
-	cm.SetSnapshotConfig(10, 50*time.Millisecond, 4)
-
-	// Отправляем 25 команд и ждём снэпшота.
-	for i := 0; i < 25; i++ {
+	const numCommands = 30
+	for i := 0; i < numCommands; i++ {
 		cmd := fmt.Sprintf("k%d=v%d", i, i)
 		future := cm.Apply(cmd, 0)
 		if err := future.Error(); err != nil {
@@ -699,63 +694,70 @@ func TestSnapshot_RestartWithSnapshot(t *testing.T) {
 		}
 	}
 
-	deadline := time.Now().Add(10 * time.Second)
-	var snapIdx int
-	for time.Now().Before(deadline) {
-		cm.mu.Lock()
-		snapIdx = cm.lastSnapshotIndex
-		cm.mu.Unlock()
-		if snapIdx > 0 {
-			break
+	snapIdx := waitForSnapshotAndCompaction(t, cm, numCommands)
+	for i := 0; i < numCommands; i++ {
+		key := fmt.Sprintf("k%d", i)
+		want := fmt.Sprintf("v%d", i)
+		if v := fsm.getState(key); v != want {
+			t.Fatalf("before restart: %s = %q, want %q", key, v, want)
 		}
-		time.Sleep(50 * time.Millisecond)
 	}
 
-	cm.mu.Lock()
-	oldLogLen := len(cm.log)
-	cm.mu.Unlock()
-	t.Logf("initial: snapshot index=%d, log length=%d", snapIdx, oldLogLen)
+	waitForSnapshotQuiescence(t, cm, storage, 10*time.Second)
 
-	// Перезапускаем CM из того же storage (без store — будет загружен из storage).
 	cm.Stop()
 	transport.Close()
 
+	// Полный рестарт: новые инстансы хранилищ и FSM в той же директории.
+	storage2 := NewFileStorage(dir)
+	store2, err := NewFileSnapshotStore(dir, 2)
+	if err != nil {
+		t.Fatalf("NewFileSnapshotStore (restart) failed: %v", err)
+	}
 	fsm2 := newSnapshotTestFSM()
-	store2 := NewInmemSnapshotStore()
-	transport2 := NewInmemTransport("single-2")
 	ready2 := make(chan any)
 	close(ready2)
+	transport2 := NewInmemTransport("single-2")
 
-	cm2 := NewConsensusModule(0, []int{}, transport2, storage, fsm2, ready2, store2)
+	cm2 := NewConsensusModule(0, []int{}, transport2, storage2, fsm2, ready2, store2)
 	defer cm2.Stop()
 
+	// Главный регрессионный критерий P0-1: ключ до линии компактирования
+	// восстановлен из снапшота сразу после конструктора.
+	if v := fsm2.getState("k0"); v != "v0" {
+		t.Fatalf("k0 = %q after restart, want v0 (key below compaction line)", v)
+	}
+
 	cm2.mu.Lock()
-	restoredSnapIdx := cm2.lastSnapshotIndex
-	restoredLogLen := len(cm2.log)
+	lastApplied := cm2.cmState.lastApplied
+	lastSnapshotIndex := cm2.cmState.lastSnapshotIndex
 	cm2.mu.Unlock()
-
-	t.Logf("after restart: snapshot index=%d, log length=%d", restoredSnapIdx, restoredLogLen)
-
-	if restoredSnapIdx < 0 {
-		t.Fatal("lastSnapshotIndex not restored from storage")
+	if lastSnapshotIndex < snapIdx {
+		t.Fatalf("lastSnapshotIndex = %d after restart, want >= %d", lastSnapshotIndex, snapIdx)
+	}
+	if lastApplied != lastSnapshotIndex {
+		t.Fatalf("lastApplied = %d, want %d (snapshot index)", lastApplied, lastSnapshotIndex)
 	}
 
-	// Восстанавливаем FSM из снэпшота.
-	list, _ := store2.List()
-	if len(list) > 0 {
-		_, reader, err := store2.Open(list[0].ID)
-		if err == nil {
-			_ = fsm2.Restore(reader)
-			_ = reader.Close()
+	// Узел работоспособен после restore: новая команда проходит и
+	// продвижение commitIndex доигрывает суффикс лога (k29).
+	waitForLeader(t, cm2, 5*time.Second)
+	future := cm2.Apply("k30=v30", 0)
+	if err := future.Error(); err != nil {
+		t.Fatalf("Apply k30 after restart failed: %v", err)
+	}
+	if v := fsm2.getState("k30"); v != "v30" {
+		t.Fatalf("k30 = %q after restart, want v30", v)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if fsm2.getState("k29") == "v29" {
+			return
 		}
+		time.Sleep(20 * time.Millisecond)
 	}
-
-	// Проверяем состояние FSM.
-	if v := fsm2.getState("k24"); v != "v24" {
-		// Если FSM не был восстановлен через Restore, это ожидаемо,
-		// так как при старте мы не вызываем Restore автоматически.
-		t.Logf("k24 = %q (may need explicit restore)", v)
-	}
+	t.Fatal("k29 not applied after restart: log suffix replay failed")
 }
 
 // TestSnapshot_LeaderCrash проверяет, что снэпшот переживает смену лидера.

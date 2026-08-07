@@ -1,5 +1,6 @@
 package config
 
+/*
 import (
 	"net"
 	"os"
@@ -168,3 +169,4 @@ func mustParseAddr(s string) net.Addr {
 	}
 	return addr
 }
+*/

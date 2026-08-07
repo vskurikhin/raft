@@ -44,24 +44,29 @@ func TestTermIndexMap_AppendEntries(t *testing.T) {
 
 	storage := NewMapStorage()
 	cm := &ConsensusModule{
-		id:           0,
-		storage:      storage,
-		currentTerm:  1,
-		lastLogIndex: 0,
-		lastLogTerm:  0,
-		log:          make([]LogEntry, 0),
-		matchIndex:   map[int]int{0: 0},
-		inflight:     make(map[int]*logFuture),
-		termIndexMap: make(map[int]int),
-		shutdownCh:   make(chan struct{}),
-		configurations: configurations{
-			committed: Configuration{ConfigServers: []ConfigServer{{ID: 0, Suffrage: Voter}}},
-			latest:    Configuration{ConfigServers: []ConfigServer{{ID: 0, Suffrage: Voter}}},
+		leaderState: leaderState{
+			matchIndex: map[int]int{0: 0},
+			inflight:   make(map[int]*logFuture),
+		},
+
+		id:         0,
+		storage:    storage,
+		shutdownCh: make(chan struct{}),
+		cmState: cmState{
+			currentTerm:  1,
+			lastLogIndex: 0,
+			lastLogTerm:  0,
+			log:          make([]LogEntry, 0),
+			termIndexMap: make(map[int]int),
+			configurations: configurations{
+				committed: Configuration{ConfigServers: []ConfigServer{{ID: 0, Suffrage: Voter}}},
+				latest:    Configuration{ConfigServers: []ConfigServer{{ID: 0, Suffrage: Voter}}},
+			},
 		},
 	}
 	defer cm.Stop()
 
-	// Первая группа: 3 записи, все с Term=1 (cm.currentTerm=1).
+	// Первая группа: 3 записи, все с Term=1 (cm.cmState.currentTerm=1).
 	futures1 := make([]*logFuture, 3)
 	for i := range futures1 {
 		futures1[i] = &logFuture{
@@ -72,23 +77,23 @@ func TestTermIndexMap_AppendEntries(t *testing.T) {
 	cm.dispatchLogsUnsafe(futures1)
 
 	// После 3 записей с Term=1: termIndexMap[1] = 3.
-	if idx := cm.termIndexMap[1]; idx != 3 {
+	if idx := cm.cmState.termIndexMap[1]; idx != 3 {
 		t.Fatalf("termIndexMap[1] = %d, want 3", idx)
 	}
 
 	// Вторая группа: 1 запись с Term=2.
-	cm.currentTerm = 2
+	cm.cmState.currentTerm = 2
 	futures2 := []*logFuture{
 		{deferError: deferError{errCh: make(chan error, 1)}, log: LogEntry{Type: LogCommand, Data: []byte("y")}},
 	}
 	cm.dispatchLogsUnsafe(futures2)
 
 	// Проверяем termIndexMap после второй группы.
-	if idx := cm.termIndexMap[2]; idx != 4 {
+	if idx := cm.cmState.termIndexMap[2]; idx != 4 {
 		t.Fatalf("termIndexMap[2] = %d, want 4", idx)
 	}
 	// termIndexMap[1] не должен измениться.
-	if idx := cm.termIndexMap[1]; idx != 3 {
+	if idx := cm.cmState.termIndexMap[1]; idx != 3 {
 		t.Fatalf("termIndexMap[1] = %d, want 3 (unchanged)", idx)
 	}
 }
@@ -108,8 +113,8 @@ func TestTermIndexMap_CompactLogs(t *testing.T) {
 
 	cm := &ConsensusModule{}
 	cm.shutdownCh = make(chan struct{})
-	cm.termIndexMap = make(map[int]int)
-	cm.log = []LogEntry{
+	cm.cmState.termIndexMap = make(map[int]int)
+	cm.cmState.log = []LogEntry{
 		{Index: 1, Term: 1},
 		{Index: 2, Term: 1},
 		{Index: 3, Term: 2},
@@ -119,16 +124,16 @@ func TestTermIndexMap_CompactLogs(t *testing.T) {
 	cm.rebuildTermIndexMap()
 
 	// Проверяем начальное состояние.
-	if idx := cm.termIndexMap[1]; idx != 2 {
+	if idx := cm.cmState.termIndexMap[1]; idx != 2 {
 		t.Fatalf("before compact: termIndexMap[1] = %d, want 2", idx)
 	}
-	if idx := cm.termIndexMap[2]; idx != 3 {
+	if idx := cm.cmState.termIndexMap[2]; idx != 3 {
 		t.Fatalf("before compact: termIndexMap[2] = %d, want 3", idx)
 	}
-	if idx := cm.termIndexMap[3]; idx != 4 {
+	if idx := cm.cmState.termIndexMap[3]; idx != 4 {
 		t.Fatalf("before compact: termIndexMap[3] = %d, want 4", idx)
 	}
-	if idx := cm.termIndexMap[4]; idx != 5 {
+	if idx := cm.cmState.termIndexMap[4]; idx != 5 {
 		t.Fatalf("before compact: termIndexMap[4] = %d, want 5", idx)
 	}
 
@@ -136,16 +141,16 @@ func TestTermIndexMap_CompactLogs(t *testing.T) {
 	cm.compactLogs(3)
 
 	// Проверяем состояние после компактирования.
-	if _, ok := cm.termIndexMap[1]; ok {
+	if _, ok := cm.cmState.termIndexMap[1]; ok {
 		t.Fatal("termIndexMap[1] should be deleted after compact")
 	}
-	if idx := cm.termIndexMap[2]; idx != 3 {
+	if idx := cm.cmState.termIndexMap[2]; idx != 3 {
 		t.Fatalf("after compact: termIndexMap[2] = %d, want 3", idx)
 	}
-	if idx := cm.termIndexMap[3]; idx != 4 {
+	if idx := cm.cmState.termIndexMap[3]; idx != 4 {
 		t.Fatalf("after compact: termIndexMap[3] = %d, want 4", idx)
 	}
-	if idx := cm.termIndexMap[4]; idx != 5 {
+	if idx := cm.cmState.termIndexMap[4]; idx != 5 {
 		t.Fatalf("after compact: termIndexMap[4] = %d, want 5", idx)
 	}
 }
@@ -165,22 +170,24 @@ func TestTermIndexMap_AppendEntriesConflict(t *testing.T) {
 	defer leaktest.CheckTimeout(t, time.Second)()
 
 	cm := &ConsensusModule{
-		storage:      NewMapStorage(),
-		state:        Follower,
-		currentTerm:  1,
-		commitIndex:  -1,
-		lastApplied:  -1,
-		lastLogIndex: 3,
-		lastLogTerm:  2,
-		log:          make([]LogEntry, 0),
-		termIndexMap: make(map[int]int),
-		shutdownCh:   make(chan struct{}),
-		configurations: configurations{
-			committed: Configuration{ConfigServers: []ConfigServer{{ID: 0, Suffrage: Voter}}},
-			latest:    Configuration{ConfigServers: []ConfigServer{{ID: 0, Suffrage: Voter}}},
+		storage:    NewMapStorage(),
+		shutdownCh: make(chan struct{}),
+		cmState: cmState{
+			state:        Follower,
+			currentTerm:  1,
+			commitIndex:  -1,
+			lastApplied:  -1,
+			lastLogIndex: 3,
+			lastLogTerm:  2,
+			log:          make([]LogEntry, 0),
+			termIndexMap: make(map[int]int),
+			configurations: configurations{
+				committed: Configuration{ConfigServers: []ConfigServer{{ID: 0, Suffrage: Voter}}},
+				latest:    Configuration{ConfigServers: []ConfigServer{{ID: 0, Suffrage: Voter}}},
+			},
 		},
 	}
-	cm.log = []LogEntry{
+	cm.cmState.log = []LogEntry{
 		{Index: 1, Term: 1},
 		{Index: 2, Term: 1},
 		{Index: 3, Term: 2},
@@ -209,25 +216,25 @@ func TestTermIndexMap_AppendEntriesConflict(t *testing.T) {
 	}
 
 	// Проверяем длину и последнюю запись.
-	if len(cm.log) != 3 {
-		t.Fatalf("log length = %d, want 3", len(cm.log))
+	if len(cm.cmState.log) != 3 {
+		t.Fatalf("log length = %d, want 3", len(cm.cmState.log))
 	}
-	if cm.log[2].Term != 3 {
-		t.Fatalf("log[2].Term = %d, want 3", cm.log[2].Term)
+	if cm.cmState.log[2].Term != 3 {
+		t.Fatalf("log[2].Term = %d, want 3", cm.cmState.log[2].Term)
 	}
-	if cm.log[2].Index != 3 {
-		t.Fatalf("log[2].Index = %d, want 3", cm.log[2].Index)
+	if cm.cmState.log[2].Index != 3 {
+		t.Fatalf("log[2].Index = %d, want 3", cm.cmState.log[2].Index)
 	}
 
 	// Проверяем termIndexMap: T2 удалён, T3 добавлен.
-	if _, ok := cm.termIndexMap[2]; ok {
+	if _, ok := cm.cmState.termIndexMap[2]; ok {
 		t.Fatal("termIndexMap[2] should be deleted after conflict")
 	}
-	if idx := cm.termIndexMap[3]; idx != 3 {
+	if idx := cm.cmState.termIndexMap[3]; idx != 3 {
 		t.Fatalf("termIndexMap[3] = %d, want 3", idx)
 	}
 	// T1 должен остаться.
-	if idx := cm.termIndexMap[1]; idx != 2 {
+	if idx := cm.cmState.termIndexMap[1]; idx != 2 {
 		t.Fatalf("termIndexMap[1] = %d, want 2", idx)
 	}
 }
@@ -251,17 +258,17 @@ func TestTermIndexMap_RestoreFromStorage(t *testing.T) {
 
 	// Заполняем лог.
 	cm.mu.Lock()
-	cm.log = []LogEntry{
+	cm.cmState.log = []LogEntry{
 		{Index: 1, Term: 1},
 		{Index: 2, Term: 1},
 		{Index: 3, Term: 2},
 		{Index: 4, Term: 3},
 	}
-	cm.lastLogIndex = 4
-	cm.lastLogTerm = 3
+	cm.cmState.lastLogIndex = 4
+	cm.cmState.lastLogTerm = 3
 	cm.rebuildTermIndexMap()
-	cm.state = Follower
-	cm.currentTerm = 1
+	cm.cmState.state = Follower
+	cm.cmState.currentTerm = 1
 	cm.persistToStorage()
 	cm.mu.Unlock()
 	cm.Stop()
@@ -279,16 +286,16 @@ func TestTermIndexMap_RestoreFromStorage(t *testing.T) {
 	defer cm2.mu.Unlock()
 
 	// Проверяем termIndexMap.
-	if len(cm2.termIndexMap) != 3 {
-		t.Fatalf("termIndexMap length = %d, want 3", len(cm2.termIndexMap))
+	if len(cm2.cmState.termIndexMap) != 3 {
+		t.Fatalf("termIndexMap length = %d, want 3", len(cm2.cmState.termIndexMap))
 	}
-	if idx := cm2.termIndexMap[1]; idx != 2 {
+	if idx := cm2.cmState.termIndexMap[1]; idx != 2 {
 		t.Fatalf("termIndexMap[1] = %d, want 2", idx)
 	}
-	if idx := cm2.termIndexMap[2]; idx != 3 {
+	if idx := cm2.cmState.termIndexMap[2]; idx != 3 {
 		t.Fatalf("termIndexMap[2] = %d, want 3", idx)
 	}
-	if idx := cm2.termIndexMap[3]; idx != 4 {
+	if idx := cm2.cmState.termIndexMap[3]; idx != 4 {
 		t.Fatalf("termIndexMap[3] = %d, want 4", idx)
 	}
 }
@@ -309,34 +316,39 @@ func TestTermIndexMap_LeaderSendAEsConflictLookup(t *testing.T) {
 
 	mock := &mockTransportConflict{replyTerm: 2, success: false, conflictTerm: 2}
 	cm := &ConsensusModule{
-		id:           0,
-		state:        Leader,
-		currentTerm:  2,
-		transport:    mock,
-		log:          make([]LogEntry, 0),
-		nextIndex:    map[int]int{1: 3},
-		matchIndex:   map[int]int{1: -1},
-		lastLogIndex: 3,
-		lastLogTerm:  2,
-		commitIndex:  -1,
-		termIndexMap: make(map[int]int),
-		shutdownCh:   make(chan struct{}),
-		configurations: configurations{
-			committed: Configuration{
-				ConfigServers: []ConfigServer{
-					{ID: 0, Suffrage: Voter},
-					{ID: 1, Suffrage: Voter},
+		leaderState: leaderState{
+			nextIndex:  map[int]int{1: 3},
+			matchIndex: map[int]int{1: -1},
+		},
+
+		id:         0,
+		transport:  mock,
+		shutdownCh: make(chan struct{}),
+		cmState: cmState{
+			state:        Leader,
+			currentTerm:  2,
+			log:          make([]LogEntry, 0),
+			lastLogIndex: 3,
+			lastLogTerm:  2,
+			commitIndex:  -1,
+			termIndexMap: make(map[int]int),
+			configurations: configurations{
+				committed: Configuration{
+					ConfigServers: []ConfigServer{
+						{ID: 0, Suffrage: Voter},
+						{ID: 1, Suffrage: Voter},
+					},
 				},
-			},
-			latest: Configuration{
-				ConfigServers: []ConfigServer{
-					{ID: 0, Suffrage: Voter},
-					{ID: 1, Suffrage: Voter},
+				latest: Configuration{
+					ConfigServers: []ConfigServer{
+						{ID: 0, Suffrage: Voter},
+						{ID: 1, Suffrage: Voter},
+					},
 				},
 			},
 		},
 	}
-	cm.log = []LogEntry{
+	cm.cmState.log = []LogEntry{
 		{Index: 1, Term: 1},
 		{Index: 2, Term: 2},
 		{Index: 3, Term: 2},
@@ -344,7 +356,7 @@ func TestTermIndexMap_LeaderSendAEsConflictLookup(t *testing.T) {
 	cm.rebuildTermIndexMap()
 
 	// Проверяем pre-condition.
-	if idx := cm.termIndexMap[2]; idx != 3 {
+	if idx := cm.cmState.termIndexMap[2]; idx != 3 {
 		t.Fatalf("pre: termIndexMap[2] = %d, want 3", idx)
 	}
 
@@ -353,7 +365,7 @@ func TestTermIndexMap_LeaderSendAEsConflictLookup(t *testing.T) {
 
 	// Проверяем nextIndex: должен быть 4 (последний LogEntry.Index с term=2 это 3, +1).
 	cm.mu.Lock()
-	ni := cm.nextIndex[1]
+	ni := cm.leaderState.nextIndex[1]
 	cm.mu.Unlock()
 	if ni != 4 {
 		t.Fatalf("nextIndex[1] = %d, want 4 (LogEntry.Index 3 + 1)", ni)
@@ -365,7 +377,7 @@ func TestTermIndexMap_LeaderSendAEsConflictLookup(t *testing.T) {
 // LogEntry.Index, а не slice position.
 //
 // Старое поведение (slices.Backward):
-//   - cm.log = [{I100,T1}, {I200,T2}, {I300,T2}]
+//   - cm.cmState.log = [{I100,T1}, {I200,T2}, {I300,T2}]
 //   - compactLogs(100) → log не меняется (pos=0)
 //   - slices.Backward даёт i=2 для последней записи T2
 //   - nextIndex = 2+1 = 3 — НЕВЕРНО (должно быть 301)
@@ -380,35 +392,40 @@ func TestTermIndexMap_SlicePositionBug(t *testing.T) {
 
 	mock := &mockTransportConflict{replyTerm: 2, success: false, conflictTerm: 2}
 	cm := &ConsensusModule{
-		id:           0,
-		state:        Leader,
-		currentTerm:  2,
-		transport:    mock,
-		log:          make([]LogEntry, 0),
-		nextIndex:    map[int]int{1: 3},
-		matchIndex:   map[int]int{1: -1},
-		lastLogIndex: 300,
-		lastLogTerm:  2,
-		commitIndex:  -1,
-		termIndexMap: make(map[int]int),
-		shutdownCh:   make(chan struct{}),
-		configurations: configurations{
-			committed: Configuration{
-				ConfigServers: []ConfigServer{
-					{ID: 0, Suffrage: Voter},
-					{ID: 1, Suffrage: Voter},
+		leaderState: leaderState{
+			nextIndex:  map[int]int{1: 3},
+			matchIndex: map[int]int{1: -1},
+		},
+
+		id:         0,
+		transport:  mock,
+		shutdownCh: make(chan struct{}),
+		cmState: cmState{
+			state:        Leader,
+			currentTerm:  2,
+			log:          make([]LogEntry, 0),
+			lastLogIndex: 300,
+			lastLogTerm:  2,
+			commitIndex:  -1,
+			termIndexMap: make(map[int]int),
+			configurations: configurations{
+				committed: Configuration{
+					ConfigServers: []ConfigServer{
+						{ID: 0, Suffrage: Voter},
+						{ID: 1, Suffrage: Voter},
+					},
 				},
-			},
-			latest: Configuration{
-				ConfigServers: []ConfigServer{
-					{ID: 0, Suffrage: Voter},
-					{ID: 1, Suffrage: Voter},
+				latest: Configuration{
+					ConfigServers: []ConfigServer{
+						{ID: 0, Suffrage: Voter},
+						{ID: 1, Suffrage: Voter},
+					},
 				},
 			},
 		},
 	}
 	// Лог после компактирования: записи начинаются с Index=100.
-	cm.log = []LogEntry{
+	cm.cmState.log = []LogEntry{
 		{Index: 100, Term: 1},
 		{Index: 200, Term: 2},
 		{Index: 300, Term: 2},
@@ -416,7 +433,7 @@ func TestTermIndexMap_SlicePositionBug(t *testing.T) {
 	cm.rebuildTermIndexMap()
 
 	// Проверяем, что termIndexMap хранит LogEntry.Index, а не slice position.
-	if idx := cm.termIndexMap[2]; idx != 300 {
+	if idx := cm.cmState.termIndexMap[2]; idx != 300 {
 		t.Fatalf("termIndexMap[2] = %d, want 300 (LogEntry.Index, not slice position)", idx)
 	}
 
@@ -425,7 +442,7 @@ func TestTermIndexMap_SlicePositionBug(t *testing.T) {
 
 	// Проверяем nextIndex: должен быть 301 (LogEntry.Index 300 + 1).
 	cm.mu.Lock()
-	ni := cm.nextIndex[1]
+	ni := cm.leaderState.nextIndex[1]
 	cm.mu.Unlock()
 	if ni != 301 {
 		t.Fatalf("nextIndex[1] = %d, want 301 (LogEntry.Index 300 + 1). "+

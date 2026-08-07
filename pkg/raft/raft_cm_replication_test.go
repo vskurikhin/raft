@@ -94,35 +94,40 @@ func (m *mockTransportAE) DecodePeer(_ string) ServerAddress {
 func TestLeaderSendAEs_Deduplication(t *testing.T) {
 	mock := &mockTransportAE{}
 	cm := &ConsensusModule{
-		id:           0,
-		state:        Leader,
-		transport:    mock,
-		log:          make([]LogEntry, 0),
-		nextIndex:    map[int]int{1: 0},
-		matchIndex:   map[int]int{1: -1},
-		lastLogIndex: -1,
-		currentTerm:  1,
-		commitIndex:  -1,
-		inflightAE:   map[int]*atomic.Bool{1: new(atomic.Bool)},
-		configurations: configurations{
-			committed: Configuration{
-				ConfigServers: []ConfigServer{
-					{ID: 0, Suffrage: Voter},
-					{ID: 1, Suffrage: Voter},
+		leaderState: leaderState{
+			nextIndex:  map[int]int{1: 0},
+			matchIndex: map[int]int{1: -1},
+			inflightAE: map[int]*atomic.Bool{1: new(atomic.Bool)},
+		},
+		cmState: cmState{
+			state:        Leader,
+			log:          make([]LogEntry, 0),
+			lastLogIndex: -1,
+			currentTerm:  1,
+			commitIndex:  -1,
+			configurations: configurations{
+				committed: Configuration{
+					ConfigServers: []ConfigServer{
+						{ID: 0, Suffrage: Voter},
+						{ID: 1, Suffrage: Voter},
+					},
 				},
-			},
-			latest: Configuration{
-				ConfigServers: []ConfigServer{
-					{ID: 0, Suffrage: Voter},
-					{ID: 1, Suffrage: Voter},
+				latest: Configuration{
+					ConfigServers: []ConfigServer{
+						{ID: 0, Suffrage: Voter},
+						{ID: 1, Suffrage: Voter},
+					},
 				},
 			},
 		},
+
+		id:        0,
+		transport: mock,
 	}
-	cm.inflightAE[1].Store(false)
+	cm.leaderState.inflightAE[1].Store(false)
 
 	// Установить inflightAE[1] = true — имитация активной горутины.
-	cm.inflightAE[1].Store(true)
+	cm.leaderState.inflightAE[1].Store(true)
 	time.Sleep(10 * time.Millisecond)
 
 	// Вызвать leaderSendAEs — должен пропустить peer 1 (CAS=false).
@@ -135,7 +140,7 @@ func TestLeaderSendAEs_Deduplication(t *testing.T) {
 	}
 
 	// Сбросить флаг — теперь leaderSendAEs должен запустить горутину.
-	cm.inflightAE[1].Store(false)
+	cm.leaderState.inflightAE[1].Store(false)
 	cm.leaderSendAEs()
 	time.Sleep(30 * time.Millisecond)
 
@@ -155,40 +160,45 @@ func TestLeaderSendAEs_Deduplication(t *testing.T) {
 func TestInflightAE_DeferReset(t *testing.T) {
 	mock := &mockTransportAE{}
 	cm := &ConsensusModule{
-		id:           0,
-		state:        Leader,
-		transport:    mock,
-		log:          make([]LogEntry, 0),
-		nextIndex:    map[int]int{1: 0},
-		matchIndex:   map[int]int{1: -1},
-		lastLogIndex: -1,
-		currentTerm:  1,
-		commitIndex:  -1,
-		inflightAE:   map[int]*atomic.Bool{1: new(atomic.Bool)},
-		configurations: configurations{
-			committed: Configuration{
-				ConfigServers: []ConfigServer{
-					{ID: 0, Suffrage: Voter},
-					{ID: 1, Suffrage: Voter},
+		leaderState: leaderState{
+			nextIndex:  map[int]int{1: 0},
+			matchIndex: map[int]int{1: -1},
+			inflightAE: map[int]*atomic.Bool{1: new(atomic.Bool)},
+		},
+		cmState: cmState{
+			state:        Leader,
+			log:          make([]LogEntry, 0),
+			lastLogIndex: -1,
+			currentTerm:  1,
+			commitIndex:  -1,
+			configurations: configurations{
+				committed: Configuration{
+					ConfigServers: []ConfigServer{
+						{ID: 0, Suffrage: Voter},
+						{ID: 1, Suffrage: Voter},
+					},
 				},
-			},
-			latest: Configuration{
-				ConfigServers: []ConfigServer{
-					{ID: 0, Suffrage: Voter},
-					{ID: 1, Suffrage: Voter},
+				latest: Configuration{
+					ConfigServers: []ConfigServer{
+						{ID: 0, Suffrage: Voter},
+						{ID: 1, Suffrage: Voter},
+					},
 				},
 			},
 		},
+
+		id:        0,
+		transport: mock,
 	}
-	cm.inflightAE[1].Store(false)
+	cm.leaderState.inflightAE[1].Store(false)
 
 	// Установить флаг и вызвать leaderSendAEsToPeer.
-	cm.inflightAE[1].Store(true)
+	cm.leaderState.inflightAE[1].Store(true)
 	cm.leaderSendAEsToPeer(1, 1)
 	time.Sleep(20 * time.Millisecond)
 
 	// После завершения флаг должен быть сброшен.
-	if cm.inflightAE[1].Load() {
+	if cm.leaderState.inflightAE[1].Load() {
 		t.Error("inflightAE[1] should be false after leaderSendAEsToPeer completes")
 	}
 }
@@ -204,43 +214,48 @@ func TestInflightAE_DeferReset(t *testing.T) {
 //  4. После завершения inflightAE[1] == false.
 func TestInflightAE_DeferResetOnSnapshotPath(t *testing.T) {
 	cm := &ConsensusModule{
-		id:                0,
-		state:             Leader,
-		transport:         &mockTransportAE{},
-		log:               make([]LogEntry, 0),
-		nextIndex:         map[int]int{1: -1},
-		matchIndex:        map[int]int{1: -1},
-		lastLogIndex:      -1,
-		lastSnapshotIndex: -1,
-		currentTerm:       1,
-		commitIndex:       -1,
-		votedFor:          -1,
-		leaderStartIndex:  -1,
-		storage:           NewMapStorage(),
-		snapshotStore:     &mockSnapshotStore{},
-		inflightAE:        map[int]*atomic.Bool{1: new(atomic.Bool)},
-		configurations: configurations{
-			committed: Configuration{
-				ConfigServers: []ConfigServer{
-					{ID: 0, Suffrage: Voter},
-					{ID: 1, Suffrage: Voter},
+		leaderState: leaderState{
+			nextIndex:        map[int]int{1: -1},
+			matchIndex:       map[int]int{1: -1},
+			leaderStartIndex: -1,
+			inflightAE:       map[int]*atomic.Bool{1: new(atomic.Bool)},
+		},
+		cmState: cmState{
+			state:             Leader,
+			log:               make([]LogEntry, 0),
+			lastLogIndex:      -1,
+			lastSnapshotIndex: -1,
+			currentTerm:       1,
+			commitIndex:       -1,
+			votedFor:          -1,
+			configurations: configurations{
+				committed: Configuration{
+					ConfigServers: []ConfigServer{
+						{ID: 0, Suffrage: Voter},
+						{ID: 1, Suffrage: Voter},
+					},
 				},
-			},
-			latest: Configuration{
-				ConfigServers: []ConfigServer{
-					{ID: 0, Suffrage: Voter},
-					{ID: 1, Suffrage: Voter},
+				latest: Configuration{
+					ConfigServers: []ConfigServer{
+						{ID: 0, Suffrage: Voter},
+						{ID: 1, Suffrage: Voter},
+					},
 				},
 			},
 		},
-	}
-	cm.inflightAE[1].Store(false)
 
-	cm.inflightAE[1].Store(true)
+		id:            0,
+		transport:     &mockTransportAE{},
+		storage:       NewMapStorage(),
+		snapshotStore: &mockSnapshotStore{},
+	}
+	cm.leaderState.inflightAE[1].Store(false)
+
+	cm.leaderState.inflightAE[1].Store(true)
 	cm.leaderSendAEsToPeer(1, 1)
 	time.Sleep(20 * time.Millisecond)
 
-	if cm.inflightAE[1].Load() {
+	if cm.leaderState.inflightAE[1].Load() {
 		t.Error("inflightAE[1] should be false after snapshot path exit")
 	}
 }
@@ -255,10 +270,15 @@ func TestInflightAE_DeferResetOnSnapshotPath(t *testing.T) {
 func TestLeaderSendAEs_StateCheck(t *testing.T) {
 	mock := &mockTransportAE{}
 	cm := &ConsensusModule{
-		id:         0,
-		state:      Follower,
-		transport:  mock,
-		inflightAE: map[int]*atomic.Bool{1: new(atomic.Bool)},
+		leaderState: leaderState{
+			inflightAE: map[int]*atomic.Bool{1: new(atomic.Bool)},
+		},
+		cmState: cmState{
+			state: Follower,
+		},
+
+		id:        0,
+		transport: mock,
 	}
 
 	cm.leaderSendAEs()
@@ -278,16 +298,21 @@ func TestLeaderSendAEs_StateCheck(t *testing.T) {
 //  3. Вызвать leaderSendAEsToPeer — не должно быть panic.
 func TestInflightAE_NilSafe(t *testing.T) {
 	cm := &ConsensusModule{
-		id:           0,
-		state:        Leader,
-		transport:    &mockTransportAE{},
-		log:          make([]LogEntry, 0),
-		nextIndex:    map[int]int{1: 0},
-		matchIndex:   map[int]int{1: -1},
-		lastLogIndex: -1,
-		currentTerm:  1,
-		commitIndex:  -1,
-		inflightAE:   nil,
+		leaderState: leaderState{
+			nextIndex:  map[int]int{1: 0},
+			matchIndex: map[int]int{1: -1},
+			inflightAE: nil,
+		},
+		cmState: cmState{
+			state:        Leader,
+			log:          make([]LogEntry, 0),
+			lastLogIndex: -1,
+			currentTerm:  1,
+			commitIndex:  -1,
+		},
+
+		id:        0,
+		transport: &mockTransportAE{},
 	}
 
 	// Не должно быть panic.
@@ -311,28 +336,33 @@ func TestInflightAE_NilSafe(t *testing.T) {
 //     пропущен без паники.
 func TestBecomeFollower_InflightAE_NilEntry(t *testing.T) {
 	cm := &ConsensusModule{
-		id:                0,
-		state:             Leader,
-		stepDown:          make(chan struct{}, 1),
-		shutdownCh:        make(chan struct{}),
-		electionTimerDone: make(chan struct{}),
-		currentTerm:       1,
-		inflightAE: map[int]*atomic.Bool{
-			1: nil,              // peer вне конфигурации — элемент не инициализирован
-			2: new(atomic.Bool), // активный peer, флаг установлен
+		leaderState: leaderState{
+			inflightAE: map[int]*atomic.Bool{
+				1: nil,              // peer вне конфигурации — элемент не инициализирован
+				2: new(atomic.Bool), // активный peer, флаг установлен
+			},
 		},
+		cmState: cmState{
+			state:             Leader,
+			electionTimerDone: make(chan struct{}),
+			currentTerm:       1,
+		},
+
+		id:         0,
+		stepDown:   make(chan struct{}, 1),
+		shutdownCh: make(chan struct{}),
 	}
-	cm.inflightAE[2].Store(true)
+	cm.leaderState.inflightAE[2].Store(true)
 
 	// becomeFollower ожидает, что cm.mu заблокирован (по контракту).
 	cm.mu.Lock()
 	cm.becomeFollower(1)
 	cm.mu.Unlock()
 
-	if cm.state != Follower {
-		t.Errorf("state = %v, want Follower", cm.state)
+	if cm.cmState.state != Follower {
+		t.Errorf("state = %v, want Follower", cm.cmState.state)
 	}
-	if cm.inflightAE[2].Load() {
+	if cm.leaderState.inflightAE[2].Load() {
 		t.Error("inflightAE[2] should be reset to false")
 	}
 }
@@ -410,13 +440,18 @@ func (m *mockSnapshotStoreCfg) Open(id string) (*SnapshotMeta, io.ReadCloser, er
 func TestLeaderSendSnapshot_NilSnapshotStore(t *testing.T) {
 	transport := &mockTransportAE{}
 	cm := &ConsensusModule{
+		leaderState: leaderState{
+			nextIndex:  map[int]int{1: -1},
+			matchIndex: map[int]int{1: -1},
+		},
+		cmState: cmState{
+			state:       Leader,
+			currentTerm: 1,
+		},
+
 		id:            0,
-		state:         Leader,
 		transport:     transport,
-		currentTerm:   1,
 		snapshotStore: nil,
-		nextIndex:     map[int]int{1: -1},
-		matchIndex:    map[int]int{1: -1},
 	}
 
 	// Никаких обращений к хранилищу не должно быть.
@@ -438,15 +473,20 @@ func TestLeaderSendSnapshot_NilSnapshotStore(t *testing.T) {
 func TestLeaderSendSnapshot_NilMetaInList(t *testing.T) {
 	transport := &mockTransportAE{}
 	cm := &ConsensusModule{
-		id:          0,
-		state:       Leader,
-		transport:   transport,
-		currentTerm: 1,
+		leaderState: leaderState{
+			nextIndex:  map[int]int{1: -1},
+			matchIndex: map[int]int{1: -1},
+		},
+		cmState: cmState{
+			state:       Leader,
+			currentTerm: 1,
+		},
+
+		id:        0,
+		transport: transport,
 		snapshotStore: &mockSnapshotStoreCfg{
 			listResult: []*SnapshotMeta{nil},
 		},
-		nextIndex:  map[int]int{1: -1},
-		matchIndex: map[int]int{1: -1},
 	}
 
 	cm.leaderSendSnapshot(1, 1)
@@ -467,15 +507,20 @@ func TestLeaderSendSnapshot_NilMetaInList(t *testing.T) {
 func TestLeaderSendSnapshot_EmptyID(t *testing.T) {
 	transport := &mockTransportAE{}
 	cm := &ConsensusModule{
-		id:          0,
-		state:       Leader,
-		transport:   transport,
-		currentTerm: 1,
+		leaderState: leaderState{
+			nextIndex:  map[int]int{1: -1},
+			matchIndex: map[int]int{1: -1},
+		},
+		cmState: cmState{
+			state:       Leader,
+			currentTerm: 1,
+		},
+
+		id:        0,
+		transport: transport,
 		snapshotStore: &mockSnapshotStoreCfg{
 			listResult: []*SnapshotMeta{{ID: ""}},
 		},
-		nextIndex:  map[int]int{1: -1},
-		matchIndex: map[int]int{1: -1},
 	}
 
 	cm.leaderSendSnapshot(1, 1)
@@ -497,12 +542,17 @@ func TestLeaderSendSnapshot_EmptyID(t *testing.T) {
 func TestLeaderSendSnapshot_Success(t *testing.T) {
 	transport := &mockTransportAE{}
 	cm := &ConsensusModule{
-		id:          0,
-		state:       Leader,
-		transport:   transport,
-		currentTerm: 1,
-		nextIndex:   map[int]int{1: -1},
-		matchIndex:  map[int]int{1: -1},
+		leaderState: leaderState{
+			nextIndex:  map[int]int{1: -1},
+			matchIndex: map[int]int{1: -1},
+		},
+		cmState: cmState{
+			state:       Leader,
+			currentTerm: 1,
+		},
+
+		id:        0,
+		transport: transport,
 		snapshotStore: &mockSnapshotStoreCfg{
 			listResult: []*SnapshotMeta{{ID: "snap-5", Index: 5, Term: 2, Size: 100}},
 			openMeta:   &SnapshotMeta{Index: 5, Term: 2, Size: 100},
@@ -514,10 +564,10 @@ func TestLeaderSendSnapshot_Success(t *testing.T) {
 	if n := transport.installCallCount.Load(); n != 1 {
 		t.Fatalf("expected 1 InstallSnapshot call, got %d", n)
 	}
-	if cm.nextIndex[1] != 6 {
-		t.Errorf("nextIndex[1] = %d, want 6", cm.nextIndex[1])
+	if cm.leaderState.nextIndex[1] != 6 {
+		t.Errorf("nextIndex[1] = %d, want 6", cm.leaderState.nextIndex[1])
 	}
-	if cm.matchIndex[1] != 5 {
-		t.Errorf("matchIndex[1] = %d, want 5", cm.matchIndex[1])
+	if cm.leaderState.matchIndex[1] != 5 {
+		t.Errorf("matchIndex[1] = %d, want 5", cm.leaderState.matchIndex[1])
 	}
 }

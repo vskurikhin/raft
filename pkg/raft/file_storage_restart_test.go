@@ -40,10 +40,10 @@ func TestFileStorage_RestartRestoresState(t *testing.T) {
 
 	// Запоминаем состояние до рестарта.
 	cm1.mu.Lock()
-	prevTerm := cm1.currentTerm
-	prevVotedFor := cm1.votedFor
-	prevLogLen := len(cm1.log)
-	prevLastLogIndex := cm1.lastLogIndex
+	prevTerm := cm1.cmState.currentTerm
+	prevVotedFor := cm1.cmState.votedFor
+	prevLogLen := len(cm1.cmState.log)
+	prevLastLogIndex := cm1.cmState.lastLogIndex
 	cm1.mu.Unlock()
 
 	if prevLastLogIndex < 0 {
@@ -66,10 +66,10 @@ func TestFileStorage_RestartRestoresState(t *testing.T) {
 
 	// Проверяем восстановление состояния с диска.
 	cm2.mu.Lock()
-	restoredTerm := cm2.currentTerm
-	restoredVotedFor := cm2.votedFor
-	restoredLogLen := len(cm2.log)
-	restoredLastLogIndex := cm2.lastLogIndex
+	restoredTerm := cm2.cmState.currentTerm
+	restoredVotedFor := cm2.cmState.votedFor
+	restoredLogLen := len(cm2.cmState.log)
+	restoredLastLogIndex := cm2.cmState.lastLogIndex
 	cm2.mu.Unlock()
 
 	if !cm2.storage.HasData() {

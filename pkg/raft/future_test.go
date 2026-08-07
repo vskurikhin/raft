@@ -287,7 +287,7 @@ func waitForLeader(t testing.TB, cm *ConsensusModule, timeout time.Duration) {
 	deadline := time.After(timeout)
 	for {
 		cm.mu.Lock()
-		isLeader := cm.state == Leader
+		isLeader := cm.cmState.state == Leader
 		cm.mu.Unlock()
 		if isLeader {
 			return
@@ -600,7 +600,7 @@ func waitForLeaderB(t testing.TB, cm *ConsensusModule) {
 	deadline := time.After(800 * time.Millisecond)
 	for {
 		cm.mu.Lock()
-		isLeader := cm.state == Leader
+		isLeader := cm.cmState.state == Leader
 		cm.mu.Unlock()
 		if isLeader {
 			return

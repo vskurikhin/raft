@@ -243,25 +243,27 @@ func TestPreVote_CandidateRetry(t *testing.T) {
 	defer leaktest.CheckTimeout(t, 500*Quantum*time.Millisecond)()
 
 	cm := &ConsensusModule{
-		id:                 0,
-		state:              Candidate,
-		currentTerm:        2,
-		votedFor:           0,
-		transport:          &mockPreVoteGrant{peerTerm: 2},
-		storage:            NewMapStorage(),
-		electionResetEvent: time.Now(),
-		electionTimerDone:  make(chan struct{}),
-		shutdownCh:         make(chan struct{}),
-		configurations: configurations{
-			latest: Configuration{
-				ConfigServers: []ConfigServer{
-					{ID: 0, Suffrage: Voter},
-					{ID: 1, Suffrage: Voter},
+		id:         0,
+		transport:  &mockPreVoteGrant{peerTerm: 2},
+		storage:    NewMapStorage(),
+		shutdownCh: make(chan struct{}),
+		cmState: cmState{
+			state:              Candidate,
+			currentTerm:        2,
+			votedFor:           0,
+			electionResetEvent: time.Now(),
+			electionTimerDone:  make(chan struct{}),
+			configurations: configurations{
+				latest: Configuration{
+					ConfigServers: []ConfigServer{
+						{ID: 0, Suffrage: Voter},
+						{ID: 1, Suffrage: Voter},
+					},
 				},
 			},
 		},
 	}
-	cm.log = make([]LogEntry, 0)
+	cm.cmState.log = make([]LogEntry, 0)
 	defer close(cm.shutdownCh)
 
 	done := make(chan struct{})
@@ -278,10 +280,10 @@ func TestPreVote_CandidateRetry(t *testing.T) {
 
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
-	if cm.currentTerm != 3 {
-		t.Fatalf("candidate retry did not start new election: term=%d, want 3", cm.currentTerm)
+	if cm.cmState.currentTerm != 3 {
+		t.Fatalf("candidate retry did not start new election: term=%d, want 3", cm.cmState.currentTerm)
 	}
-	if cm.state != Candidate {
-		t.Fatalf("state=%v after retry, want Candidate at new term", cm.state)
+	if cm.cmState.state != Candidate {
+		t.Fatalf("state=%v after retry, want Candidate at new term", cm.cmState.state)
 	}
 }

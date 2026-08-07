@@ -49,13 +49,13 @@ func (cm *ConsensusModule) stats(shutdownCh chan struct{}) {
 		case <-shutdownCh:
 			return
 		case <-ticker.C:
-			// Чтение состояния под cm.mu: поля cm.state/cm.id/cm.currentTerm
+			// Чтение состояния под cm.mu: поля cm.cmState.state/cm.id/cm.cmState.currentTerm
 			// изменяются под мутексом (в т.ч. в Stop), их чтение без
 			// блокировки — data race.
 			cm.mu.Lock()
-			state := cm.state
+			state := cm.cmState.state
 			id := cm.id
-			currentTerm := cm.currentTerm
+			currentTerm := cm.cmState.currentTerm
 			cm.mu.Unlock()
 			var (
 				appendEntriesLatencies     []float64

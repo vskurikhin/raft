@@ -653,7 +653,7 @@ func TestBug_StartElectionMissingPersist(t *testing.T) {
 	// Считываем значение терма жертвы из памяти и из постоянного хранилища.
 	cm := h.cluster[victim]
 	cm.mu.Lock()
-	inMemoryTerm := cm.currentTerm
+	inMemoryTerm := cm.cmState.currentTerm
 	cm.mu.Unlock()
 
 	persistedTerm := getPersistedTerm(h.storage[victim])
@@ -786,15 +786,15 @@ func TestBecomeFollowerSameTermPreservesVotedFor(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		cm := h.cluster[i]
 		cm.mu.Lock()
-		if cm.state == Follower && cm.votedFor >= 0 {
-			savedVotedFor := cm.votedFor
-			savedTerm := cm.currentTerm
+		if cm.cmState.state == Follower && cm.cmState.votedFor >= 0 {
+			savedVotedFor := cm.cmState.votedFor
+			savedTerm := cm.cmState.currentTerm
 
 			cm.becomeFollower(savedTerm)
 
-			if cm.votedFor != savedVotedFor {
+			if cm.cmState.votedFor != savedVotedFor {
 				t.Errorf("becomeFollower(%d) reset votedFor from %d to %d on same-term transition",
-					savedTerm, savedVotedFor, cm.votedFor)
+					savedTerm, savedVotedFor, cm.cmState.votedFor)
 			}
 			cm.mu.Unlock()
 			return
@@ -817,14 +817,14 @@ func TestBecomeFollowerHigherTermResetsVotedFor(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		cm := h.cluster[i]
 		cm.mu.Lock()
-		if cm.state == Follower && cm.votedFor >= 0 {
-			savedTerm := cm.currentTerm
+		if cm.cmState.state == Follower && cm.cmState.votedFor >= 0 {
+			savedTerm := cm.cmState.currentTerm
 
 			cm.becomeFollower(savedTerm + 1)
 
-			if cm.votedFor != -1 {
+			if cm.cmState.votedFor != -1 {
 				t.Errorf("becomeFollower(%d) did not reset votedFor (got %d, want -1)",
-					savedTerm+1, cm.votedFor)
+					savedTerm+1, cm.cmState.votedFor)
 			}
 			cm.mu.Unlock()
 			return
@@ -880,7 +880,7 @@ func TestSameTermDoubleVotePrevented(t *testing.T) {
 		}
 		cm := h.cluster[i]
 		cm.mu.Lock()
-		if cm.votedFor == leaderId && cm.currentTerm == leaderTerm {
+		if cm.cmState.votedFor == leaderId && cm.cmState.currentTerm == leaderTerm {
 			followerId = i
 		}
 		cm.mu.Unlock()
@@ -926,27 +926,31 @@ func TestSameTermDoubleVotePrevented(t *testing.T) {
 // не вызывает панику при повторном close(electionTimerDone) (проблема 10).
 func TestBecomeFollowerDoubleClose(t *testing.T) {
 	cm := &ConsensusModule{
-		id:                 1,
-		state:              Follower,
-		currentTerm:        1,
-		votedFor:           -1,
-		leaderStartIndex:   -1,
-		electionTimerDone:  make(chan struct{}),
-		electionResetEvent: time.Now(),
-		storage:            NewMapStorage(),
-		nextIndex:          make(map[int]int),
-		matchIndex:         make(map[int]int),
-		inflightAE:         make(map[int]*atomic.Bool),
-		inflight:           make(map[int]*logFuture),
-		applyCh:            make(chan *logFuture),
-		verifyCh:           make(chan *verifyFuture, 64),
-		shutdownCh:         make(chan struct{}),
-		commitCh:           make(chan int, 1),
-		stepDown:           make(chan struct{}, 1),
-		confChangeCh:       make(chan *configurationChangeFuture),
-		configurationsCh:   make(chan *configurationsFuture),
+		leaderState: leaderState{
+			leaderStartIndex: -1,
+			nextIndex:        make(map[int]int),
+			matchIndex:       make(map[int]int),
+			inflightAE:       make(map[int]*atomic.Bool),
+			inflight:         make(map[int]*logFuture),
+		},
+
+		id:           1,
+		storage:      NewMapStorage(),
+		applyCh:      make(chan *logFuture),
+		verifyCh:     make(chan *verifyFuture, 64),
+		shutdownCh:   make(chan struct{}),
+		commitCh:     make(chan int, 1),
+		stepDown:     make(chan struct{}, 1),
+		confChangeCh: make(chan *configurationChangeFuture),
+		cmState: cmState{
+			state:              Follower,
+			currentTerm:        1,
+			votedFor:           -1,
+			electionTimerDone:  make(chan struct{}),
+			electionResetEvent: time.Now(),
+		},
 	}
-	cm.log = make([]LogEntry, 0)
+	cm.cmState.log = make([]LogEntry, 0)
 	cm.mu.Lock()
 
 	// Первый вызов becomeFollower — нормально закрывает старый канал
@@ -1520,7 +1524,7 @@ func TestLeader_Shutdown_NoInflight(t *testing.T) {
 }
 
 // TestLeader_Shutdown_DuringApply проверяет shutdown во время Apply.
-// Из-за гонки между Apply() (проверка cm.state) и Stop() (установка state=Dead)
+// Из-за гонки между Apply() (проверка cm.cmState.state) и Stop() (установка state=Dead)
 // допускается ErrNotLeader — Stop может успеть раньше.
 func TestLeader_Shutdown_DuringApply(t *testing.T) {
 	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
@@ -2936,7 +2940,7 @@ func TestRace_ConcurrentLeaderSendAEs(t *testing.T) {
 }
 
 // TestIntegration_TermIndexConsistency проверяет, что termIndexMap
-// консистентен с cm.log после отправки команд и смены лидера.
+// консистентен с cm.cmState.log после отправки команд и смены лидера.
 //
 // Сценарий:
 //  1. Создать кластер из 3 серверов, отправить 3 команды.
@@ -2944,7 +2948,7 @@ func TestRace_ConcurrentLeaderSendAEs(t *testing.T) {
 //  3. Сменить лидера (отключить, дождаться выборов среди оставшихся).
 //  4. Проверить termIndexMap на новом лидере.
 //
-// Ожидание: для каждой записи в cm.log termIndexMap содержит её терм.
+// Ожидание: для каждой записи в cm.cmState.log termIndexMap содержит её терм.
 func TestIntegration_TermIndexConsistency(t *testing.T) {
 	defer leaktest.CheckTimeout(t, 30*time.Second)()
 
@@ -2962,8 +2966,8 @@ func TestIntegration_TermIndexConsistency(t *testing.T) {
 	lid, _ := h.CheckSingleLeader()
 	cm := h.cluster[lid]
 	cm.mu.Lock()
-	for _, entry := range cm.log {
-		if _, ok := cm.termIndexMap[entry.Term]; !ok {
+	for _, entry := range cm.cmState.log {
+		if _, ok := cm.cmState.termIndexMap[entry.Term]; !ok {
 			cm.mu.Unlock()
 			t.Fatalf("leader %d: termIndexMap missing term %d", lid, entry.Term)
 		}
@@ -2981,8 +2985,8 @@ func TestIntegration_TermIndexConsistency(t *testing.T) {
 	// Проверить termIndexMap на новом лидере.
 	cm = h.cluster[newLid]
 	cm.mu.Lock()
-	for _, entry := range cm.log {
-		if _, ok := cm.termIndexMap[entry.Term]; !ok {
+	for _, entry := range cm.cmState.log {
+		if _, ok := cm.cmState.termIndexMap[entry.Term]; !ok {
 			cm.mu.Unlock()
 			t.Fatalf("new leader %d: termIndexMap missing term %d", newLid, entry.Term)
 		}
@@ -3047,14 +3051,14 @@ func TestIntegration_TermIndexAfterLogTruncation(t *testing.T) {
 	lid, _ = h.CheckSingleLeader()
 	leaderCM := h.cluster[lid]
 	leaderCM.mu.Lock()
-	targetIdx := leaderCM.lastLogIndex
+	targetIdx := leaderCM.cmState.lastLogIndex
 	leaderCM.mu.Unlock()
 
 	victimCM := h.cluster[victimID]
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		victimCM.mu.Lock()
-		lastIdx := victimCM.lastLogIndex
+		lastIdx := victimCM.cmState.lastLogIndex
 		victimCM.mu.Unlock()
 
 		if lastIdx >= targetIdx {
@@ -3071,8 +3075,8 @@ func TestIntegration_TermIndexAfterLogTruncation(t *testing.T) {
 	victimCM.mu.Lock()
 	defer victimCM.mu.Unlock()
 
-	for _, entry := range victimCM.log {
-		if _, ok := victimCM.termIndexMap[entry.Term]; !ok {
+	for _, entry := range victimCM.cmState.log {
+		if _, ok := victimCM.cmState.termIndexMap[entry.Term]; !ok {
 			t.Fatalf("follower %d: termIndexMap missing term %d (Index %d)",
 				victimID, entry.Term, entry.Index)
 		}
@@ -3096,31 +3100,36 @@ func TestRace_TermIndexMapDispatchAndConflict(t *testing.T) {
 	storage := NewMapStorage()
 	mock := &mockTransportConflict{replyTerm: 1, success: false, conflictTerm: 1}
 	cm := &ConsensusModule{
-		id:           0,
-		storage:      storage,
-		state:        Leader,
-		currentTerm:  1,
-		transport:    mock,
-		log:          make([]LogEntry, 0),
-		nextIndex:    map[int]int{1: -1},
-		matchIndex:   map[int]int{1: -1, 0: -1},
-		lastLogIndex: -1,
-		lastLogTerm:  -1,
-		commitIndex:  -1,
-		inflight:     make(map[int]*logFuture),
-		termIndexMap: make(map[int]int),
-		shutdownCh:   make(chan struct{}),
-		configurations: configurations{
-			committed: Configuration{
-				ConfigServers: []ConfigServer{
-					{ID: 0, Suffrage: Voter},
-					{ID: 1, Suffrage: Voter},
+		leaderState: leaderState{
+			nextIndex:  map[int]int{1: -1},
+			matchIndex: map[int]int{1: -1, 0: -1},
+			inflight:   make(map[int]*logFuture),
+		},
+
+		id:         0,
+		storage:    storage,
+		transport:  mock,
+		shutdownCh: make(chan struct{}),
+		cmState: cmState{
+			state:        Leader,
+			currentTerm:  1,
+			log:          make([]LogEntry, 0),
+			lastLogIndex: -1,
+			lastLogTerm:  -1,
+			commitIndex:  -1,
+			termIndexMap: make(map[int]int),
+			configurations: configurations{
+				committed: Configuration{
+					ConfigServers: []ConfigServer{
+						{ID: 0, Suffrage: Voter},
+						{ID: 1, Suffrage: Voter},
+					},
 				},
-			},
-			latest: Configuration{
-				ConfigServers: []ConfigServer{
-					{ID: 0, Suffrage: Voter},
-					{ID: 1, Suffrage: Voter},
+				latest: Configuration{
+					ConfigServers: []ConfigServer{
+						{ID: 0, Suffrage: Voter},
+						{ID: 1, Suffrage: Voter},
+					},
 				},
 			},
 		},
@@ -3177,21 +3186,26 @@ func TestRace_TermIndexMapCompactAndRead(t *testing.T) {
 	defer leaktest.CheckTimeout(t, 10*time.Second)()
 
 	cm := &ConsensusModule{
-		storage:      NewMapStorage(),
-		state:        Follower,
-		currentTerm:  1,
-		log:          make([]LogEntry, 0),
-		nextIndex:    map[int]int{},
-		matchIndex:   map[int]int{},
-		lastLogIndex: 10,
-		lastLogTerm:  1,
-		commitIndex:  -1,
-		termIndexMap: make(map[int]int),
-		shutdownCh:   make(chan struct{}),
+		leaderState: leaderState{
+			nextIndex:  map[int]int{},
+			matchIndex: map[int]int{},
+		},
+
+		storage:    NewMapStorage(),
+		shutdownCh: make(chan struct{}),
+		cmState: cmState{
+			state:        Follower,
+			currentTerm:  1,
+			log:          make([]LogEntry, 0),
+			lastLogIndex: 10,
+			lastLogTerm:  1,
+			commitIndex:  -1,
+			termIndexMap: make(map[int]int),
+		},
 	}
 	cm.mu.Lock()
 	for i := 0; i < 10; i++ {
-		cm.log = append(cm.log, LogEntry{Index: i + 1, Term: 1})
+		cm.cmState.log = append(cm.cmState.log, LogEntry{Index: i + 1, Term: 1})
 	}
 	cm.rebuildTermIndexMap()
 	cm.mu.Unlock()
@@ -3220,7 +3234,7 @@ func TestRace_TermIndexMapCompactAndRead(t *testing.T) {
 				return
 			default:
 				cm.mu.Lock()
-				_ = cm.termIndexMap[1]
+				_ = cm.cmState.termIndexMap[1]
 				cm.mu.Unlock()
 			}
 		}

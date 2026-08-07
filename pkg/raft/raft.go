@@ -52,7 +52,7 @@ const (
 )
 
 // TraceCM — порог детализации отладочных сообщений консенсус-модуля
-// (traceLogf, traceLogfLocked). Сообщение с уровнем level выводится,
+// (traceLogf, traceLogLocked). Сообщение с уровнем level выводится,
 // если TraceCM > level. Значение задаётся флагом --trace-log-level
 // командной строки, по умолчанию 1.
 var TraceCM = 1
@@ -205,32 +205,31 @@ func NewConsensusModule(
 	// verifyCh — канал для ReadIndex-подтверждения лидерства.
 	// Ёмкость 64 выбрана для burst: при 10k RPS VerifyLeader не блокируется.
 	cm.verifyCh = make(chan *verifyFuture, 64)
-	cm.inflight = make(map[int]*logFuture)
+	cm.leaderState.inflight = make(map[int]*logFuture)
 	cm.commitCh = make(chan int, 1)
 	cm.stepDown = make(chan struct{}, 1)
 	cm.confChangeCh = make(chan *configurationChangeFuture, 1)
-	cm.configurationsCh = make(chan *configurationsFuture, 1)
-	cm.state = Follower
-	cm.votedFor = -1
-	cm.commitIndex = -1
-	cm.lastApplied = -1
-	cm.leaderStartIndex = -1
-	cm.lastLogIndex = -1
-	cm.lastLogTerm = -1
-	cm.nextIndex = make(map[int]int)
-	cm.matchIndex = make(map[int]int)
-	cm.inflightAE = make(map[int]*atomic.Bool)
-	cm.termIndexMap = make(map[int]int)
-	cm.electionTimerDone = make(chan struct{})
+	cm.cmState.state = Follower
+	cm.cmState.votedFor = -1
+	cm.cmState.commitIndex = -1
+	cm.cmState.lastApplied = -1
+	cm.leaderState.leaderStartIndex = -1
+	cm.cmState.lastLogIndex = -1
+	cm.cmState.lastLogTerm = -1
+	cm.leaderState.nextIndex = make(map[int]int)
+	cm.leaderState.matchIndex = make(map[int]int)
+	cm.leaderState.inflightAE = make(map[int]*atomic.Bool)
+	cm.cmState.termIndexMap = make(map[int]int)
+	cm.cmState.electionTimerDone = make(chan struct{})
 	cm.preVoteDisabled = false
-	cm.leaderLastContact = time.Time{}
-	cm.leaderID = -1
-	cm.leadershipTransferCh = make(chan *leadershipTransferFuture, 1)
-	cm.logNeedsPersist = true
+	cm.cmState.leaderLastContact = time.Time{}
+	cm.cmState.leaderID = -1
+	cm.leaderState.leadershipTransferCh = make(chan *leadershipTransferFuture, 1)
+	cm.cmState.logNeedsPersist = true
 
 	// Инициализация snapshot-полей.
-	cm.lastSnapshotIndex = -1
-	cm.lastSnapshotTerm = -1
+	cm.cmState.lastSnapshotIndex = -1
+	cm.cmState.lastSnapshotTerm = -1
 	if len(snapshots) > 0 && snapshots[0] != nil {
 		cm.snapshotStore = snapshots[0]
 		cm.snapshotThreshold = defaultSnapshotThreshold
@@ -238,17 +237,23 @@ func NewConsensusModule(
 		cm.trailingLogs = defaultTrailingLogs
 		cm.snapshotCh = make(chan struct{}, 1)
 		cm.fsmSnapshotCh = make(chan *reqSnapshotFuture)
-		cm.restoreCh = make(chan *restoreFuture)
 	}
 
 	if cm.storage.HasData() {
 		cm.restoreFromStorage()
-		cm.logNeedsPersist = false
+		cm.cmState.logNeedsPersist = false
+		// Восстановление FSM из снэпшота до запуска горутин (однопоточно).
+		// Fail-fast: старт с невосстановимым durable-состоянием недопустим —
+		// громкий отказ узла предпочтительнее молчаливой потери
+		// подтверждённых данных (см. ADR-002).
+		if err := cm.restoreFromSnapshotStore(); err != nil {
+			log.Fatalf("raft: startup snapshot restore failed: %v", err)
+		}
 	}
 
 	// Установить начальную конфигурацию, если она ещё не задана
 	// (первый запуск или хранилище не содержит данных).
-	if len(cm.configurations.latest.ConfigServers) == 0 {
+	if len(cm.cmState.configurations.latest.ConfigServers) == 0 {
 		cm.setInitialConfiguration()
 	}
 
@@ -262,7 +267,7 @@ func NewConsensusModule(
 	go func() {
 		<-ready
 		cm.mu.Lock()
-		cm.electionResetEvent = time.Now()
+		cm.cmState.electionResetEvent = time.Now()
 		cm.mu.Unlock()
 		cm.runElectionTimer()
 	}()
