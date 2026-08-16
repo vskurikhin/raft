@@ -8,7 +8,6 @@ import (
 
 const latencyChannelSize = 4096
 
-// TODO refactoring
 var (
 	latencyAppendEntriesCh     = make(chan time.Duration, latencyChannelSize)
 	latencyBatchingFSMCh       = make(chan time.Duration, latencyChannelSize)
@@ -22,24 +21,6 @@ var (
 	latencyTakeSnapshotCh      = make(chan time.Duration, latencyChannelSize)
 	latencyTimeoutNowRequestCh = make(chan time.Duration, latencyChannelSize)
 )
-
-// TODO
-// - latencyAppendEntriesCh - Append entries elapsed
-// - latencyBatchingFSMCh - FSM timer elapsed
-// - latencyElectionCh - Election elapsed
-// - latencyHandleFsmSnapshotCh- FSM snapshot handling elapsed
-// - latencyInstallSnapshotCh - Install Snapshot elapsed
-// - latencyProcessLogsCh - Logs processing elapsed
-// - latencyRequestPreVoteCh - Request pre-vote elapsed
-// - latencyRequestVoteCh - Request vote elapsed
-// - latencySendBatchCh - Send batch elapsed
-// - latencyTakeSnapshotCh - Take snapshot elapsed
-// - latencyTimeoutNowRequestCh - TimeoutNow elapsed
-
-/*
-	startTimeNow := time.Now()
-	defer func() { latencyHandleInstallSnapshotCh <- time.Since(startTimeNow) }()
-*/
 
 func (cm *ConsensusModule) stats(shutdownCh chan struct{}) {
 	ticker := time.NewTicker(time.Second)

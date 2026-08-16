@@ -115,8 +115,18 @@ type leaderState struct {
 
 	// pendingVerify — очередь verifyFuture, ожидающих подтверждения
 	// от follower-ов. Каждый успешный AppendEntries ответ голосует за
-	// все ожидающие verifyFuture.
+	// все ожидающие verifyFuture (при условии, что ответ принадлежит
+	// AE, отправленному после постановки запроса — см. verifyEpoch).
 	pendingVerify []*verifyFuture
+
+	// verifyEpoch — монотонный счётчик раундов верификации ReadIndex.
+	// Инкрементируется в leaderLoop при обработке каждого нового
+	// verify-запроса; snapshot значения снимается в leaderSendAEs и
+	// передаётся в горутину leaderSendAEsToPeer (dispatchEpoch).
+	// Голос засчитывается только при vf.epoch <= dispatchEpoch, то
+	// есть кворум собирается из ответов на AE, отправленные не раньше
+	// постановки запроса (SA-016). Защищено cm.mu.
+	verifyEpoch uint64
 
 	// leaderStartIndex — первый индекс текущего терма лидера.
 	leaderStartIndex int

@@ -40,24 +40,45 @@ type Future interface {
 
 // verifyFuture — Future для ReadIndex-подтверждения лидерства (Raft §8).
 // Отправляется в verifyCh, обрабатывается в runLeaderLoop.
-// После получения кворумного подтверждения от большинства узлов
+// После получения кворумного подтверждения от большинства voter'ов
 // respond(nil). При потере лидерства respond(ErrNotLeader).
+//
+// Поля votes/voted/quorumSize/epoch не имеют собственного mutex:
+// оба call sites vote() (обработчик verifyCh в runLeaderLoop и
+// success-ветка leaderSendAEsToPeer) выполняются под cm.mu
+// ConsensusModule, поэтому дополнительной синхронизации не требуется.
 type verifyFuture struct {
 	deferError
 	quorumSize int
 	votes      int
-	notifyCh   chan *verifyFuture
+
+	// voted — множество peerID, от которых голос уже учтён.
+	// Обеспечивает дедупликацию: повторные heartbeat-ack'и одного
+	// узла не накапливаются (SA-004/SA-016).
+	voted map[int]struct{}
+
+	// epoch — раунд верификации, к которому привязан запрос.
+	// Присваивается в leaderLoop при обработке запроса; голос
+	// засчитывается только от AE, отправленного с dispatchEpoch >= epoch
+	// (AE отправлен не раньше запроса, Raft §8).
+	epoch uint64
 }
 
-// vote учитывает голос follower при подтверждении лидерства.
+// vote учитывает голос voter'а peerID при подтверждении лидерства.
 // Если leader == false, future немедленно завершается с ErrNotLeader.
-// Если votes >= quorumSize, future завершается с nil.
-// Потокобезопасен.
-func (v *verifyFuture) vote(leader bool) {
+// Повторный голос того же peerID — no-op (дедупликация). Если
+// votes >= quorumSize, future завершается с nil.
+// Потокобезопасен при условии, что все вызовы выполняются под cm.mu
+// ConsensusModule (см. комментарий к структуре).
+func (v *verifyFuture) vote(peerID int, leader bool) {
 	if !leader {
 		v.respond(ErrNotLeader)
 		return
 	}
+	if _, ok := v.voted[peerID]; ok {
+		return
+	}
+	v.voted[peerID] = struct{}{}
 	v.votes++
 	if v.votes >= v.quorumSize {
 		v.respond(nil)

@@ -97,6 +97,9 @@ func (s *Server) Serve(address string) {
 }
 
 // Apply отправляет команду в Raft-кластер и возвращает ApplyFuture.
+//
+// Обязательство отправителя: объект команды cmd сохраняется по ссылке;
+// вызывающий не должен мутировать переданную команду после вызова Apply.
 func (s *Server) Apply(cmd any, timeout time.Duration) ApplyFuture {
 	return s.cm.Apply(cmd, timeout)
 }

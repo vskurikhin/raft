@@ -361,7 +361,7 @@ func TestTermIndexMap_LeaderSendAEsConflictLookup(t *testing.T) {
 	}
 
 	// Вызываем leaderSendAEsToPeer с ConflictTerm=2.
-	cm.leaderSendAEsToPeer(1, 2)
+	cm.leaderSendAEsToPeer(1, 2, 0)
 
 	// Проверяем nextIndex: должен быть 4 (последний LogEntry.Index с term=2 это 3, +1).
 	cm.mu.Lock()
@@ -438,7 +438,7 @@ func TestTermIndexMap_SlicePositionBug(t *testing.T) {
 	}
 
 	// Вызываем leaderSendAEsToPeer с ConflictTerm=2.
-	cm.leaderSendAEsToPeer(1, 2)
+	cm.leaderSendAEsToPeer(1, 2, 0)
 
 	// Проверяем nextIndex: должен быть 301 (LogEntry.Index 300 + 1).
 	cm.mu.Lock()

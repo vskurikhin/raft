@@ -163,8 +163,14 @@ func (cm *ConsensusModule) sendBatch(start, end int) {
 			)
 			continue
 		}
-		log := &cm.cmState.log[pos]
-		batch = append(batch, &commitTuple{log: log, future: future})
+		// Копия значения записи журнала под cm.mu обязательна (ADR-001):
+		// после cm.mu.Unlock() элемент батча не должен ссылаться в
+		// cm.cmState.log. Единственный in-place писатель существующих слотов —
+		// конфликтная перезапись в AppendEntries (raft_cm_rpc.go:149); без
+		// копии горутина runFSM читала бы запись, которую может перезаписать
+		// следующий AppendEntries, пока батч ждёт в fsmMutateCh.
+		entry := cm.cmState.log[pos]
+		batch = append(batch, &commitTuple{log: &entry, future: future})
 	}
 	cm.mu.Unlock()
 	if len(batch) > 0 {

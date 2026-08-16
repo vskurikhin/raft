@@ -41,6 +41,11 @@ func (cm *ConsensusModule) AddVoter(id ServerID, addr ServerAddress) IndexFuture
 
 // Apply отправляет команду в Raft и возвращает ApplyFuture.
 // Команда будет применена к FSM после коммита.
+//
+// Обязательство отправителя: объект команды command сохраняется по ссылке
+// (LogEntry.Data = command, без копирования); вызывающий не должен мутировать
+// переданную команду после вызова Apply — в противном случае изменение увидят
+// и журнал, и FSM, и любой потребитель, удержавший payload.
 func (cm *ConsensusModule) Apply(command any, timeout time.Duration) ApplyFuture {
 	select {
 	case <-cm.shutdownCh:
@@ -166,6 +171,10 @@ func (cm *ConsensusModule) RemoveServer(id ServerID) IndexFuture {
 //
 // Если узел не лидер, немедленно возвращает ошибку ErrNotLeader.
 // Вызов на лидере проверяет кворум без записи в журнал (ReadIndex).
+//
+// Порог кворума и раунд верификации (epoch) назначаются в leaderLoop
+// при обработке запроса — от voter-набора актуальной конфигурации,
+// а не от статического len(cm.peerIds) (SA-004/SA-016).
 func (cm *ConsensusModule) VerifyLeader() Future {
 	cm.mu.Lock()
 	isLeader := cm.cmState.state == Leader
@@ -174,9 +183,7 @@ func (cm *ConsensusModule) VerifyLeader() Future {
 		return errorFuture{err: ErrNotLeader}
 	}
 	vf := &verifyFuture{
-		quorumSize: len(cm.peerIds)/2 + 1,
-		votes:      0,
-		notifyCh:   make(chan *verifyFuture, len(cm.peerIds)),
+		voted: make(map[int]struct{}),
 	}
 	vf.init(cm.shutdownCh)
 	select {
@@ -227,6 +234,15 @@ func (cm *ConsensusModule) appendConfigurationEntry(future *configurationChangeF
 	future.index = entry.log.Index
 
 	cm.leaderState.commitmentTracker.setConfiguration(voterIDs(nextCfg), cm.lookupTerm)
+
+	// Запустить репликацию новым серверам с момента append config entry
+	// (§9 п.4 ADR-005, асимметричная форма): без этого AddVoter из
+	// кластера с одним voter'ом — вечный deadlock (новый voter не
+	// получает AE до коммита своей config entry, а его ack входит в
+	// кворум 2/2 этой записи). Останов репликации удаляемым серверам
+	// остаётся в post-commit горутине (startStopReplication) — удаляемый
+	// сервер сохраняет шанс получить запись о собственном удалении.
+	cm.ensureReplicationFor(nextCfg)
 
 	cm.leaderState.commitmentTracker.commit(cm.cmState.lastLogIndex, cm.lookupTerm)
 	savedCommitIndex := cm.cmState.commitIndex
@@ -327,7 +343,12 @@ func (cm *ConsensusModule) handleLeadershipTransfer(future *leadershipTransferFu
 		go func() {
 			for {
 				// Отправляем сигнал репликации целевому узлу.
-				cm.leaderSendAEsToPeer(targetID, savedCurrentTerm)
+				// Эпоха верификации снимается под cm.mu для каждого
+				// вызова — как в leaderSendAEs (SA-016).
+				cm.mu.Lock()
+				dispatchEpoch := cm.leaderState.verifyEpoch
+				cm.mu.Unlock()
+				cm.leaderSendAEsToPeer(targetID, savedCurrentTerm, dispatchEpoch)
 
 				// Ждём короткий интервал, затем проверяем nextIndex.
 				time.Sleep(10 * time.Millisecond)
@@ -544,14 +565,36 @@ func (cm *ConsensusModule) runLeaderLoop() {
 				cm.mu.Unlock()
 				break
 			}
-			vf.vote(true)
+			// Порог кворума — от voter-набора актуальной (latest)
+			// конфигурации, вычисленный в момент обработки запроса,
+			// а не в момент вызова VerifyLeader (SA-016).
+			if !hasVote(cm.cmState.configurations.latest, cm.id) {
+				// Лидер не voter собственной конфигурации (self-removal):
+				// подтвердить кворумное лидерство нельзя.
+				vf.respond(ErrNotLeader)
+				cm.mu.Unlock()
+				break
+			}
+			vf.quorumSize = quorumSize(len(voterIDs(cm.cmState.configurations.latest)))
+
+			// Привязка запроса к раунду: эпоха инкрементируется под cm.mu,
+			// голоса засчитываются только от AE с dispatchEpoch >= epoch.
+			cm.leaderState.verifyEpoch++
+			vf.epoch = cm.leaderState.verifyEpoch
+
+			// Self-голос лидера (ReadIndex: узел знает свой журнал).
+			vf.vote(cm.id, true)
 			if vf.votes >= vf.quorumSize {
 				cm.mu.Unlock()
 				break
 			}
 			cm.leaderState.pendingVerify = append(cm.leaderState.pendingVerify, vf)
+			// Снимок длины под cm.mu: чтение len(pendingVerify) вне
+			// блокировки гоняло с записью списка из горутин репликации
+			// (SA-026). Механика списка и снятия завершённых — без изменений.
+			firstPending := len(cm.leaderState.pendingVerify) == 1
 			cm.mu.Unlock()
-			if len(cm.leaderState.pendingVerify) == 1 {
+			if firstPending {
 				cm.leaderSendAEs()
 			}
 
@@ -611,12 +654,52 @@ func (cm *ConsensusModule) startLeader() {
 	noop.init(cm.shutdownCh)
 	cm.dispatchLogsUnsafe([]*logFuture{noop})
 
+	// Синхронизировать self-match трекера с только что добавленной
+	// noop-записью (SA-003, §9 п.3 ADR-005): dispatchLogsUnsafe трекер
+	// не обновляет (в отличие от dispatchLogs — raft_cm_log.go), а
+	// setMatch(self, …) выше был выполнен ДО noop. Без этого вызова
+	// медиана при чётном n попадает на запись прошлого терма и
+	// term-guard блокирует коммит законного кворума (включая noop
+	// текущего терма), а configurationChangeChIfStable остаётся
+	// закрытым. Вызов изолирован от appendConfigurationEntry (там
+	// commit выполняется под новой конфигурацией трекера — :229).
+	cm.leaderState.commitmentTracker.commit(cm.cmState.lastLogIndex, cm.lookupTerm)
+
 	go cm.runLeaderLoop()
 }
 
+// ensureReplicationFor добавляет репликационные структуры (nextIndex,
+// matchIndex, inflightAE) для серверов cfg, которых ещё нет в leaderState.
+// Add-only процедура (§9 п.4 ADR-005): НИЧЕГО не удаляет — остановка
+// репликации отсутствующим серверам остаётся в post-commit горутине
+// (startStopReplication), чтобы удаляемый сервер сохранял шанс получить
+// запись о собственном удалении.
+//
+// inflightAE.Store(false) выполняется ТОЛЬКО для вновь созданных флагов
+// (SA-023): сброс флага существующей горутины репликации привёл бы к
+// двум параллельным RPC к одному peer.
+//
+// Вызывается под уже удерживаемым cm.mu; сама блокировку не берёт.
+func (cm *ConsensusModule) ensureReplicationFor(cfg Configuration) {
+	for _, s := range cfg.ConfigServers {
+		peerID := int(s.ID)
+		if peerID == cm.id {
+			continue
+		}
+		if _, ok := cm.leaderState.nextIndex[peerID]; !ok {
+			cm.leaderState.nextIndex[peerID] = cm.cmState.lastLogIndex + 1
+			cm.leaderState.matchIndex[peerID] = -1
+		}
+		if _, ok := cm.leaderState.inflightAE[peerID]; !ok {
+			cm.leaderState.inflightAE[peerID] = new(atomic.Bool)
+			cm.leaderState.inflightAE[peerID].Store(false)
+		}
+	}
+}
+
 // startStopReplication обновляет набор реплицируемых peer'ов в соответствии
-// с новой конфигурацией. Добавляет новые серверы в nextIndex/matchIndex
-// и удаляет отсутствующие.
+// с новой конфигурацией. Удаляет серверы, отсутствующие в cfg, и добавляет
+// новые (add-only часть выделена в ensureReplicationFor).
 func (cm *ConsensusModule) startStopReplication(cfg Configuration) {
 	for peerID := range cm.leaderState.nextIndex {
 		if peerID == cm.id {
@@ -636,18 +719,5 @@ func (cm *ConsensusModule) startStopReplication(cfg Configuration) {
 			delete(cm.leaderState.matchIndex, peerID)
 		}
 	}
-	for _, s := range cfg.ConfigServers {
-		peerID := int(s.ID)
-		if peerID == cm.id {
-			continue
-		}
-		if _, ok := cm.leaderState.nextIndex[peerID]; !ok {
-			cm.leaderState.nextIndex[peerID] = cm.cmState.lastLogIndex + 1
-			cm.leaderState.matchIndex[peerID] = -1
-		}
-		if _, ok := cm.leaderState.inflightAE[peerID]; !ok {
-			cm.leaderState.inflightAE[peerID] = new(atomic.Bool)
-		}
-		cm.leaderState.inflightAE[peerID].Store(false)
-	}
+	cm.ensureReplicationFor(cfg)
 }

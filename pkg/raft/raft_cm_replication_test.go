@@ -194,7 +194,7 @@ func TestInflightAE_DeferReset(t *testing.T) {
 
 	// Установить флаг и вызвать leaderSendAEsToPeer.
 	cm.leaderState.inflightAE[1].Store(true)
-	cm.leaderSendAEsToPeer(1, 1)
+	cm.leaderSendAEsToPeer(1, 1, 0)
 	time.Sleep(20 * time.Millisecond)
 
 	// После завершения флаг должен быть сброшен.
@@ -252,7 +252,7 @@ func TestInflightAE_DeferResetOnSnapshotPath(t *testing.T) {
 	cm.leaderState.inflightAE[1].Store(false)
 
 	cm.leaderState.inflightAE[1].Store(true)
-	cm.leaderSendAEsToPeer(1, 1)
+	cm.leaderSendAEsToPeer(1, 1, 0)
 	time.Sleep(20 * time.Millisecond)
 
 	if cm.leaderState.inflightAE[1].Load() {
@@ -317,7 +317,7 @@ func TestInflightAE_NilSafe(t *testing.T) {
 
 	// Не должно быть panic.
 	cm.leaderSendAEs()
-	cm.leaderSendAEsToPeer(1, 1)
+	cm.leaderSendAEsToPeer(1, 1, 0)
 }
 
 // TestBecomeFollower_InflightAE_NilEntry проверяет, что becomeFollower

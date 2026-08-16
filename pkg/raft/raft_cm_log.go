@@ -88,6 +88,13 @@ func (cm *ConsensusModule) setLastLog(index, term int) {
 // compactLogs удаляет записи из cm.cmState.log с Index < compactIndex.
 // Оставляет как минимум trailingLogs записей.
 // Вызывается под cm.mu.Lock().
+//
+// Инвариант компактирования (INV-4 Compaction Safety): замена backing array
+// допустима ТОЛЬКО аллокацией нового среза (make+copy). In-place обрезка вида
+// log = log[pos:] с переиспользованием того же массива запрещена: сформированные
+// в sendBatch батчи FSM хранят собственные копии записей, но будущий рефакторинг
+// на in-place обрезку молча сломал бы гарантию «применяемые записи не зависят
+// от мутаций старого массива».
 func (cm *ConsensusModule) compactLogs(compactIndex int) {
 	if compactIndex <= 0 {
 		return

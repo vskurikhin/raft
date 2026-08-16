@@ -45,10 +45,15 @@ func (cm *ConsensusModule) nextIndexArgsEntries(peerID, savedCurrentTerm int) (i
 // leaderSendAEsToPeer отправляет AppendEntries указанному peer и
 // обрабатывает ответ. Выполняется в отдельной горутине.
 //
+// dispatchEpoch — эпоха верификации, снятая в leaderSendAEs под cm.mu
+// в момент запуска горутины: ответы этого AE являются голосами только
+// для verify-запросов с epoch <= dispatchEpoch (AE отправлен не раньше
+// постановки запроса, Raft §8 / SA-016).
+//
 // При любом завершении (успех, ошибка, step down) сбрасывает
 // inflightAE[peerID], разрешая последующий вызов leaderSendAEs
 // для этого peer. Сброс гарантирован через defer.
-func (cm *ConsensusModule) leaderSendAEsToPeer(peerID, savedCurrentTerm int) {
+func (cm *ConsensusModule) leaderSendAEsToPeer(peerID, savedCurrentTerm int, dispatchEpoch uint64) {
 	defer func() {
 		cm.mu.Lock()
 		if cm.leaderState.inflightAE != nil && cm.leaderState.inflightAE[peerID] != nil {
@@ -90,7 +95,12 @@ func (cm *ConsensusModule) leaderSendAEsToPeer(peerID, savedCurrentTerm int) {
 
 				if len(cm.leaderState.pendingVerify) > 0 && cm.cmState.state == Leader {
 					for _, vf := range cm.leaderState.pendingVerify {
-						vf.vote(true)
+						// Голос засчитывается только от voter'а текущей
+						// (latest) конфигурации и только для ответов на AE,
+						// отправленные не раньше запроса (SA-004/SA-016).
+						if hasVote(cm.cmState.configurations.latest, peerID) && vf.epoch <= dispatchEpoch {
+							vf.vote(peerID, true)
+						}
 					}
 					var remaining []*verifyFuture
 					for _, vf := range cm.leaderState.pendingVerify {
@@ -141,6 +151,10 @@ func (cm *ConsensusModule) leaderSendAEs() {
 		return
 	}
 	savedCurrentTerm := cm.cmState.currentTerm
+	// Снимок эпохи верификации под cm.mu: ответы этих AE будут
+	// голосами только для verify-запросов с epoch <= dispatchEpoch
+	// (SA-016 — голоса привязываются к раунду рассылки).
+	dispatchEpoch := cm.leaderState.verifyEpoch
 
 	peers := make(map[int]struct{})
 	for _, s := range cm.cmState.configurations.committed.ConfigServers {
@@ -159,7 +173,7 @@ func (cm *ConsensusModule) leaderSendAEs() {
 			continue
 		}
 		if cm.leaderState.inflightAE[peerID].CompareAndSwap(false, true) {
-			go cm.leaderSendAEsToPeer(peerID, savedCurrentTerm)
+			go cm.leaderSendAEsToPeer(peerID, savedCurrentTerm, dispatchEpoch)
 		}
 	}
 	cm.mu.Unlock()

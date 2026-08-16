@@ -169,6 +169,10 @@ func (cm *ConsensusModule) handleInstallSnapshot(rpc RPC, req *InstallSnapshotRe
 	cm.cmState.lastApplied = meta.Index
 	cm.cmState.commitIndex = meta.Index
 	// Заменить журнал: удалить все записи <= LastLogIndex.
+	// Инвариант компактирования (INV-4, как в compactLogs): замена backing
+	// array только аллокацией нового среза (make+copy / nil); in-place
+	// обрезка вида log = log[pos:] запрещена — применение батчей FSM не
+	// должно зависеть от мутаций старого массива.
 	pos := cm.logPosition(meta.Index)
 	if pos < len(cm.cmState.log) && cm.cmState.log[pos].Index == meta.Index {
 		kept := make([]LogEntry, len(cm.cmState.log)-pos-1)

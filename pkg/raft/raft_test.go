@@ -1295,32 +1295,41 @@ func TestConfiguration_RejectAddNonvoterEmptyAddress(t *testing.T) {
 
 // TestConfiguration_SequentialChanges проверяет два последовательных
 // изменения конфигурации.
+//
+// Принцип (SA-001): каждая промежуточная конфигурация должна иметь
+// кворум, достижимый физически существующими узлами. Прежняя версия на
+// harness(2) после AddVoter(несуществующий узел 2) и DemoteVoter(otherID)
+// формировала voter-набор {лидер, узел-призрак} с кворумом 2/2,
+// недостижимым реальными узлами — f2.Error() вис до test timeout
+// (корректное поведение Raft при недостижимом кворуме, дефект теста).
+// Оба шага имеют нулевой запас отказоустойчивости: ожидания futures —
+// только через дедлайн-обёртку waitFuture (SA-014), не голый Error().
 func TestConfiguration_SequentialChanges(t *testing.T) {
 	defer leaktest.CheckTimeout(t, 200*Quantum*time.Millisecond)()
-	h := NewHarness(t, 2)
+	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
 	lid, _ := h.CheckSingleLeader()
 
-	// Первое изменение: добавить сервер 2 как voter.
-	f1 := h.cluster[lid].AddVoter(ServerID(2), "raft-2")
-	if err := f1.Error(); err != nil {
+	// Первое изменение: добавить несуществующий сервер 3 как voter
+	// («призрак»). voters {0,1,2,3}, кворум 3 — достижим тремя
+	// реальными узлами.
+	f1 := h.cluster[lid].AddVoter(ServerID(3), "raft-3")
+	if err := waitFuture(t, f1, 3*time.Second); err != nil {
 		t.Fatalf("first AddVoter failed: %v", err)
 	}
-	sleepMs(50 * Quantum)
 
-	// Второе изменение: демотировать сервер 1 (себя) — должно работать.
-	// Но на кластере из 2 узлов (0 и 1) добавили 2 как voter.
-	// Теперь демотируем сервер 1 (если это лидер 1 — не себя).
-	otherID := (lid + 1) % 2
+	// Второе изменение: демотировать реального не-лидера.
+	// voters {0,1,2,3} без демотированного → 3 voters (включая
+	// призрака), кворум 2 — достижим двумя реальными узлами.
+	otherID := (lid + 1) % 3
 	f2 := h.cluster[lid].DemoteVoter(ServerID(otherID))
-	if err := f2.Error(); err != nil {
+	if err := waitFuture(t, f2, 3*time.Second); err != nil {
 		t.Fatalf("DemoteVoter failed: %v", err)
 	}
 
-	sleepMs(50 * Quantum)
-
-	// Проверить, что конфигурация обновлена.
+	// Проверить, что конфигурация обновлена: демотированный сервер —
+	// Nonvoter.
 	cfg := h.cluster[lid].GetConfiguration().Configuration()
 	nonvoterFound := false
 	for _, s := range cfg.ConfigServers {
@@ -3162,7 +3171,7 @@ func TestRace_TermIndexMapDispatchAndConflict(t *testing.T) {
 			case <-done:
 				return
 			default:
-				cm.leaderSendAEsToPeer(1, 1)
+				cm.leaderSendAEsToPeer(1, 1, 0)
 			}
 		}
 	}()

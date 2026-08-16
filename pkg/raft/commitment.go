@@ -4,25 +4,38 @@ import "sort"
 
 // commitmentTracker отслеживает прогресс репликации записей журнала для
 // лидера Raft. Получает обновления matchIndex от каждого узла-избирателя
-// (voter) и вычисляет commitIndex на основе медианного значения
+// (voter) и вычисляет commitIndex на основе кворумного порога
 // (majority). При изменении commitIndex отправляет уведомление в commitCh.
 //
 // Алгоритм: при каждом обновлении matchIndex собираются все значения
-// (только для voter'ов), сортируются, и commitIndex устанавливается
-// равным медианному элементу (индекс len/2), но только если:
+// (только для voter'ов текущей конфигурации), сортируются, и commitIndex
+// устанавливается равным значению matchVals[n-quorumSize(n)] (алгебраически
+// то же, что matchVals[(n-1)/2], как в эталоне HashiCorp), но только если:
 //   - запись с этим индексом принадлежит текущему term (Raft safety, §5.4.2),
 //   - median >= startIndex (первый индекс текущего терма лидера).
+//
+// В отсортированном по возрастанию массиве значение matchVals[i]
+// реплицировано не менее чем на n-i узлах; выбор индекса n-quorumSize(n)
+// гарантирует, что коммит возможен только при репликации записи не менее
+// чем на quorumSize(n) = n/2 + 1 voter'ах (Commit Safety, Raft Fig. 2).
+// Для нечётных n индексы n-quorumSize(n) и n/2 совпадают; при чётных n
+// старый индекс n/2 допускал коммит при n/2 репликах (дефект P0-2).
 //
 // Если хотя бы одно из условий не выполнено, commitIndex не продвигается.
 // При изменении commitIndex в канал commitCh отправляется уведомление
 // (non-blocking send), что позволяет leaderLoop асинхронно обработать
-// новый коммит без ожидания.
+// новый коммит без ожидания. Потерянное уведомление (канал cap 1 занят)
+// переотправляется при следующем вызове recalculateCommitIndex через
+// флаг pendingNotify.
 //
-// Трекер НЕ является потокобезопасным. Вызывающий (leaderLoop) должен
-// обеспечить sequential consistency.
+// Трекер НЕ является потокобезопасным. Реальная защита — внешний cm.mu
+// ConsensusModule, удерживаемый на всех call sites: трекер напрямую
+// вызывают per-peer replication-горутины (setMatch) и leaderLoop
+// (setConfiguration/commit/getCommitIndex) — но всегда под cm.mu.
 type commitmentTracker struct {
 	// matchIndex содержит пары voterID → последний известный совпадающий
-	// индекс журнала. Только узлы-избиратели влияют на commitIndex.
+	// индекс журнала. Только узлы-избиратели текущей конфигурации влияют
+	// на commitIndex: setMatch/commit для ID вне map — no-op (INV-4).
 	matchIndex map[int]int
 
 	commitIndex int // текущий commitIndex (монотонно возрастает)
@@ -30,6 +43,13 @@ type commitmentTracker struct {
 	startIndex  int // первый индекс, который может быть закоммичен в этом term
 	commitCh    chan<- int
 	term        int // текущий term лидера
+
+	// pendingNotify — признак потерянного уведомления commitCh.
+	// Устанавливается при каждом продвижении commitIndex; сбрасывается
+	// при успешной non-blocking отправке. Пока флаг взведён, каждый вызов
+	// recalculateCommitIndex (включая не продвигающие) повторяет попытку
+	// отправки текущего ct.commitIndex (SA-006/SA-020).
+	pendingNotify bool
 }
 
 // newCommitmentTracker создаёт трекер для лидера.
@@ -74,13 +94,19 @@ func (ct *commitmentTracker) setConfiguration(voters []int, lookupTerm func(int)
 }
 
 // setMatch обновляет значение matchIndex для указанного узла.
+// Если peerID не является voter'ом текущей конфигурации трекера —
+// вызов игнорируется (membership guard, INV-4: ack'и nonvoter'ов и
+// удалённых серверов не создают ghost-ключей, искажающих кворум).
 // Если новый matchIndex меньше текущего — игнорируется (инвариант:
 // matchIndex никогда не уменьшается). После обновления пересчитывает
-// commitIndex через медиану.
+// commitIndex через кворумную медиану.
 //
 // lookupTerm — функция для получения term записи журнала по индексу,
 // необходима для проверки Raft safety.
 func (ct *commitmentTracker) setMatch(peerID, index int, lookupTerm func(int) int) {
+	if _, ok := ct.matchIndex[peerID]; !ok {
+		return
+	}
 	if index < ct.matchIndex[peerID] {
 		return
 	}
@@ -91,7 +117,14 @@ func (ct *commitmentTracker) setMatch(peerID, index int, lookupTerm func(int) in
 // commit принудительно продвигает commitIndex через обновление matchIndex
 // для selfID. Используется в dispatchLogs для single-node акселератора:
 // лидер немедленно отмечает свою запись как совпадающую.
+//
+// Если selfID отсутствует в voter-наборе трекера (лидер удалил или
+// демотировал сам себя) — вызов игнорируется (membership guard, INV-4):
+// ghost-self не появляется в map и не участвует в кворуме.
 func (ct *commitmentTracker) commit(index int, lookupTerm func(int) int) {
+	if _, ok := ct.matchIndex[ct.selfID]; !ok {
+		return
+	}
 	ct.matchIndex[ct.selfID] = index
 	ct.recalculateCommitIndex(lookupTerm)
 }
@@ -101,19 +134,20 @@ func (ct *commitmentTracker) getCommitIndex() int {
 	return ct.commitIndex
 }
 
-// setTerm обновляет term и startIndex при смене терма лидера.
-func (ct *commitmentTracker) setTerm(term int, startIndex int) {
-	ct.term = term
-	ct.startIndex = startIndex
-}
-
-// recalculateCommitIndex вычисляет новый commitIndex на основе медианы
-// всех значений matchIndex. Для проверки Raft safety используются два
-// условия: term записи равен текущему term лидера, и индекс >= startIndex.
+// recalculateCommitIndex вычисляет новый commitIndex на основе кворумной
+// медианы всех значений matchIndex. Для проверки Raft safety используются
+// два условия: term записи равен текущему term лидера, и индекс >= startIndex.
 //
-// Медианный подход: сортируем все matchIndex, берём элемент с индексом n/2.
-// Если запись по этому индексу удовлетворяет условиям безопасности,
-// устанавливаем commitIndex = median и отправляем уведомление в commitCh.
+// Кворумный подход: сортируем все matchIndex, берём элемент с индексом
+// n-quorumSize(n) — значение, реплицированное не менее чем на
+// quorumSize(n) voter'ах. Если запись по этому индексу удовлетворяет
+// условиям безопасности, устанавливаем commitIndex = median и отправляем
+// уведомление в commitCh (non-blocking).
+//
+// Переотправка уведомления (pendingNotify) выполняется на всех выходах
+// функции, кроме guard'а пустого voter-набора: потерянное уведомление
+// повторно отправляется при последующих вызовах, в том числе проходящих
+// через ветку без продвижения commitIndex (SA-006/SA-020).
 func (ct *commitmentTracker) recalculateCommitIndex(lookupTerm func(int) int) {
 	if len(ct.matchIndex) == 0 {
 		return
@@ -124,14 +158,17 @@ func (ct *commitmentTracker) recalculateCommitIndex(lookupTerm func(int) int) {
 	}
 	sort.Ints(matchVals)
 
-	median := matchVals[len(matchVals)/2]
-	if median <= ct.commitIndex {
-		return
-	}
-	if lookupTerm(median) == ct.term && median >= ct.startIndex {
+	quorum := quorumSize(len(matchVals))
+	median := matchVals[len(matchVals)-quorum]
+	if median > ct.commitIndex &&
+		lookupTerm(median) == ct.term && median >= ct.startIndex {
 		ct.commitIndex = median
+		ct.pendingNotify = true
+	}
+	if ct.pendingNotify {
 		select {
 		case ct.commitCh <- ct.commitIndex:
+			ct.pendingNotify = false
 		default:
 		}
 	}
