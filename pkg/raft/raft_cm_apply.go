@@ -83,7 +83,7 @@ func (cm *ConsensusModule) applySingle(batch []*commitTuple) {
 // внутри для чтения журнала и поиска future в карте inflight.
 func (cm *ConsensusModule) processLogs(commitIndex int) {
 	startTimeNow := time.Now()
-	defer func() { latencyProcessLogsCh <- time.Since(startTimeNow) }()
+	defer func() { cm.latency.processLogs.observe(time.Since(startTimeNow)) }()
 	cm.mu.Lock()
 	if commitIndex <= cm.cmState.lastApplied {
 		cm.mu.Unlock()
@@ -111,17 +111,20 @@ func (cm *ConsensusModule) processLogs(commitIndex int) {
 // Type assertion выполняется один раз при старте горутины.
 // Завершает работу при закрытии shutdownCh.
 func (cm *ConsensusModule) runFSM() {
-	startTimeNow := time.Now()
-	defer func() { latencyBatchingFSMCh <- time.Since(startTimeNow) }()
 	batchingFSM, supportsBatch := cm.fsm.(BatchingFSM)
 	for {
 		select {
 		case batch := <-cm.fsmMutateCh:
+			// Замер охватывает только применение батча к FSM (ADR-P06-004):
+			// прежний defer на выходе измерял время жизни горутины.
+			// Наблюдение — атомарная операция, мьютексов не захватывает.
+			start := time.Now()
 			if supportsBatch {
 				cm.applyBatch(batchingFSM, batch)
 			} else {
 				cm.applySingle(batch)
 			}
+			cm.latency.fsmApply.observe(time.Since(start))
 		case req := <-cm.fsmSnapshotCh:
 			cm.handleFsmSnapshot(req)
 		case <-cm.shutdownCh:
@@ -136,7 +139,7 @@ func (cm *ConsensusModule) runFSM() {
 // поиска и чтения журнала, отправка — без блокировки.
 func (cm *ConsensusModule) sendBatch(start, end int) {
 	startTimeNow := time.Now()
-	defer func() { latencySendBatchCh <- time.Since(startTimeNow) }()
+	defer func() { cm.latency.sendBatch.observe(time.Since(startTimeNow)) }()
 	cm.mu.Lock()
 	batch := make([]*commitTuple, 0, end-start+1)
 	for idx := start; idx <= end; idx++ {

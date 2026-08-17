@@ -27,9 +27,8 @@ type Server struct {
 
 	ready <-chan any
 	quit  chan any
-	wg    sync.WaitGroup
 
-	tcpRpcTimeout time.Duration
+	tcpRPCTimeout time.Duration
 }
 
 // Config — конфигурация для создания нового сервера Raft.
@@ -50,12 +49,12 @@ type Config struct {
 
 	Storage Storage
 
-	TcpRpcTimeout time.Duration
+	TCPRPCTimeout time.Duration
 }
 
 // New создаёт новый сервер Raft с заданной конфигурацией cfg, хранилищем storage,
 // каналом уведомления ready и FSM для применения зафиксированных записей журнала.
-func New(cfg Config, ready <-chan any) *Server {
+func New(cfg *Config, ready <-chan any) *Server {
 	s := &Server{
 		fsm:           cfg.Fsm,
 		maxPool:       cfg.MaxPool,
@@ -65,7 +64,7 @@ func New(cfg Config, ready <-chan any) *Server {
 		serverID:      cfg.ServerID,
 		snapshotStore: cfg.SnapshotStore,
 		storage:       cfg.Storage,
-		tcpRpcTimeout: cfg.TcpRpcTimeout,
+		tcpRPCTimeout: cfg.TCPRPCTimeout,
 	}
 	return s
 }
@@ -74,18 +73,18 @@ func New(cfg Config, ready <-chan any) *Server {
 // списком идентификаторов узлов-соседей peerIds, хранилищем storage, каналом
 // уведомления ready и FSM для применения зафиксированных записей журнала.
 func NewServer(serverID int, peerIds []int, fsm FSM, ready <-chan any) *Server {
-	return New(Config{
+	return New(&Config{
 		ServerID:      serverID,
 		Fsm:           fsm,
 		PeerIds:       peerIds,
 		Storage:       NewMapStorage(),
-		TcpRpcTimeout: time.Duration(TcpRpcTimeoutMs) * time.Millisecond,
+		TCPRPCTimeout: TCPRPCTimeout,
 	}, ready)
 }
 
 // Serve запускает TCP-транспорт на указанном адресе и создаёт ConsensusModule.
 func (s *Server) Serve(address string) {
-	transport, err := NewTCPTransport(address, time.Duration(TcpRpcTimeoutMs)*time.Millisecond, s.maxPool)
+	transport, err := NewTCPTransport(address, TCPRPCTimeout, s.maxPool)
 	if err != nil {
 		log.Fatalf("raft: failed to create TCPTransport: %v", err)
 	}

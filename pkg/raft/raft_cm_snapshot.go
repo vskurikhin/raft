@@ -26,7 +26,7 @@ func (cm *ConsensusModule) SetSnapshotConfig(threshold int, interval time.Durati
 // Захватывает текущий lastApplied и терм, вызывает fsm.Snapshot().
 func (cm *ConsensusModule) handleFsmSnapshot(req *reqSnapshotFuture) {
 	startTimeNow := time.Now()
-	defer func() { latencyHandleFsmSnapshotCh <- time.Since(startTimeNow) }()
+	defer func() { cm.latency.handleFsmSnapshot.observe(time.Since(startTimeNow)) }()
 
 	// Захватываем индекс и терм под cm.mu: cm.cmState.lastApplied и cm.cmState.log
 	// изменяются из других горутин (processLogs, restoreFromStorage),
@@ -55,9 +55,11 @@ func (cm *ConsensusModule) handleFsmSnapshot(req *reqSnapshotFuture) {
 
 // Получает снэпшот от лидера, сохраняет в SnapshotStore,
 // восстанавливает FSM и заменяет журнал.
+//
+//nolint:funlen
 func (cm *ConsensusModule) handleInstallSnapshot(rpc RPC, req *InstallSnapshotRequest) {
 	startTimeNow := time.Now()
-	defer func() { latencyInstallSnapshotCh <- time.Since(startTimeNow) }()
+	defer func() { cm.latency.installSnapshot.observe(time.Since(startTimeNow)) }()
 
 	resp := &InstallSnapshotResponse{
 		RPCHeader: RPCHeader{
@@ -225,7 +227,7 @@ func (cm *ConsensusModule) runSnapshots() {
 // Вызывается только из runSnapshots.
 func (cm *ConsensusModule) takeSnapshot() error {
 	startTimeNow := time.Now()
-	defer func() { latencyTakeSnapshotCh <- time.Since(startTimeNow) }()
+	defer func() { cm.latency.takeSnapshot.observe(time.Since(startTimeNow)) }()
 	snapReq := &reqSnapshotFuture{}
 	snapReq.init(cm.shutdownCh)
 

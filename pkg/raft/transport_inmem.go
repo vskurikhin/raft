@@ -26,7 +26,7 @@ type InmemTransport struct {
 }
 
 // NewInmemTransport создаёт новый InmemTransport с заданным локальным адресом.
-// Таймаут по умолчанию — 500ms.
+// Тайм-аут по умолчанию — 500ms.
 func NewInmemTransport(addr ServerAddress) *InmemTransport {
 	return &InmemTransport{
 		consumerCh: make(chan RPC),
@@ -48,8 +48,10 @@ func (t *InmemTransport) LocalAddr() ServerAddress {
 }
 
 // AppendEntries отправляет AppendEntries RPC узлу peerID.
-// Блокируется до получения ответа или таймаута. Таймаут — t.timeout (500ms).
+// Блокируется до получения ответа или тайм-аута. Тайм-аут — t.timeout (500ms).
 // Возвращает ErrNotReachable, ErrRaftShutdown или ErrEnqueueTimeout.
+//
+//nolint:gocritic
 func (t *InmemTransport) AppendEntries(peerID ServerID, args AppendEntriesArgs) (AppendEntriesReply, error) {
 	var zero AppendEntriesReply
 	select {
@@ -129,7 +131,7 @@ func (t *InmemTransport) RequestVote(peerID ServerID, args RequestVoteArgs) (Req
 }
 
 // RequestPreVote отправляет PreVote RPC узлу peerID.
-// Семантика ошибок и таймаут аналогичны RequestVote.
+// Семантика ошибок и тайм-аут аналогичны RequestVote.
 func (t *InmemTransport) RequestPreVote(peerID ServerID, args RequestPreVoteArgs) (RequestPreVoteReply, error) {
 	var zero RequestPreVoteReply
 	select {
@@ -212,7 +214,11 @@ func (t *InmemTransport) TimeoutNow(peerID ServerID, args TimeoutNowRequest) (Ti
 // InstallSnapshot отправляет InstallSnapshot RPC узлу peerID.
 // В отличие от AppendEntries/RequestVote, данные снэпшота передаются
 // через поле RPC.Reader, а RespChan — через поле RPC.RespChan.
-func (t *InmemTransport) InstallSnapshot(peerID ServerID, req InstallSnapshotRequest, data io.Reader) (InstallSnapshotResponse, error) {
+//
+//nolint:gocritic
+func (t *InmemTransport) InstallSnapshot(
+	peerID ServerID, req InstallSnapshotRequest, data io.Reader,
+) (InstallSnapshotResponse, error) {
 	var zero InstallSnapshotResponse
 	select {
 	case <-t.shutdownCh:

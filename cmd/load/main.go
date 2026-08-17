@@ -18,11 +18,7 @@ import (
 )
 
 const (
-	// KeyCount       = 3000
-	Workers = 5
-	// RequestRate    = 202 // общий RPS
-	// VerifyPercent  = 75
-	// GetPercent     = 90
+	Workers        = 5
 	RequestTimeout = 10 * time.Second
 )
 
@@ -42,6 +38,7 @@ var (
 	values config.Values
 )
 
+//nolint:gochecknoinits
 func init() {
 	values = config.ParseFlags()
 	keys = make([]string, values.KeyCount)
@@ -51,7 +48,7 @@ func init() {
 }
 
 func main() {
-	var peers []string
+	peers := make([]string, 0, len(values.Peers))
 	for _, peer := range values.Peers {
 		peers = append(peers, peer.String())
 	}
@@ -76,11 +73,10 @@ func main() {
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-
+					//nolint:contextcheck
 					run(client, r)
 				}
 			}
-
 		}(i)
 	}
 	go stats(ctx)
@@ -101,9 +97,8 @@ func run(client *kvclient.KVClient, rnd *rand.Rand) {
 			getFail.Add(1)
 			fmt.Printf("GET: %v\n", err)
 			return
-		} else {
-			getOK.Add(1)
 		}
+		getOK.Add(1)
 		reqCount.Add(1)
 		return
 	}

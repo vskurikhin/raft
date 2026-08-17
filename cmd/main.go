@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/vskurikhin/raft/internal/_init"
 	"github.com/vskurikhin/raft/internal/config"
 	"github.com/vskurikhin/raft/pkg/kvservice"
 	"github.com/vskurikhin/raft/pkg/raft"
@@ -27,31 +28,12 @@ func main() {
 }
 
 func run() error {
-	return runWith(config.ParseFlags())
+	return runWith(&_init.Values)
 }
 
 var wg sync.WaitGroup
 
-// configureTraceLogging применяет параметры трассировки командной строки:
-// --trace-log-level задаёт пороги raft.TraceCM и kvservice.TraceKV,
-// --trace-log-file — файл, в который пишутся отладочные сообщения
-// консенсус-модуля и KV-сервиса (пустая строка — stderr).
-func configureTraceLogging(values config.Values) error {
-	raft.TraceCM = values.TraceLogLevel
-	kvservice.TraceKV = values.TraceLogLevel
-	if values.TraceLogFile == "" {
-		return nil
-	}
-	if err := raft.SetTraceLogFile(values.TraceLogFile); err != nil {
-		return err
-	}
-	return kvservice.SetTraceLogFile(values.TraceLogFile)
-}
-
-func runWith(values config.Values) error {
-	if err := configureTraceLogging(values); err != nil {
-		return err
-	}
+func runWith(values *config.Values) error {
 	nums := slices.Collect(maps.Keys(values.Peers))
 	done := make(chan any)
 	ready := make(chan any)
@@ -78,11 +60,11 @@ func runWith(values config.Values) error {
 			ServerID:      values.Number,
 			SnapshotStore: snapshotStore,
 			Storage:       raft.NewFileStorage(dataDir),
-			TcpRpcTimeout: raft.TcpRpcTimeoutMs,
+			TCPRPCTimeout: raft.TCPRPCTimeout,
 			MaxPool:       4,
 		},
 	}
-	kvs := kvservice.New(cfg, ready)
+	kvs := kvservice.New(&cfg, ready)
 	wg.Add(len(nums) / 2)
 	for _, num := range nums {
 		go connect(num, kvs, values, nums)
@@ -99,7 +81,7 @@ var (
 	mu    sync.Mutex
 )
 
-func connect(n int, kvs *kvservice.KVService, values config.Values, nums []int) {
+func connect(n int, kvs *kvservice.KVService, values *config.Values, nums []int) {
 	log.Printf("connect to peer %d", n)
 	err := kvs.ConnectToRaftPeer(n, values.Peers[n])
 	for i := 0; i < Try && err != nil; i++ {

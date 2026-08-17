@@ -5,10 +5,20 @@ import (
 	"os"
 )
 
+// TraceCM — порог детализации отладочных сообщений консенсус-модуля
+// (traceLogf, traceLogLocked). Сообщение с уровнем level выводится,
+// если TraceCM > level. Значение задаётся флагом --trace-log-level
+// командной строки, по умолчанию 1.
+var TraceCM = 1
+
 // _traceLogger — логгер отладочных сообщений консенсус-модуля (traceLogf,
 // traceLogfLocked). По умолчанию выводит в стандартный логгер (stderr).
 // Перенаправляется в файл функцией SetTraceLogFile.
 var _traceLogger = log.Default()
+
+// traceEnabled сообщает, будет ли сообщение уровня level напечатано
+// трассировкой. Единственный источник истины для порога TraceCM.
+func traceEnabled(level int) bool { return level < TraceCM }
 
 // _traceLogFile — открытый файл трассировки; nil, если вывод в stderr.
 var _traceLogFile *os.File

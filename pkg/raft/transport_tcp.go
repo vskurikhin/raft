@@ -33,6 +33,7 @@ const (
 	rpcRequestPreVote
 )
 
+//nolint:gochecknoinits
 func init() {
 	gob.Register(AppendEntriesArgs{})
 	gob.Register(AppendEntriesReply{})
@@ -143,6 +144,8 @@ func (t *TCPTransport) SetHeartbeatHandler(fn func(RPC)) {
 }
 
 // AppendEntries отправляет AppendEntries указанному узлу через пул соединений.
+//
+//nolint:gocritic
 func (t *TCPTransport) AppendEntries(peerID ServerID, args AppendEntriesArgs) (AppendEntriesReply, error) {
 	var reply AppendEntriesReply
 	err := t.genericRPC(peerID, rpcAppendEntries, &args, &reply)
@@ -171,7 +174,11 @@ func (t *TCPTransport) TimeoutNow(peerID ServerID, args TimeoutNowRequest) (Time
 }
 
 // InstallSnapshot отправляет snapshot узлу peerID. Соединение НЕ возвращается в пул.
-func (t *TCPTransport) InstallSnapshot(peerID ServerID, args InstallSnapshotRequest, data io.Reader) (InstallSnapshotResponse, error) {
+//
+//nolint:gocritic
+func (t *TCPTransport) InstallSnapshot(
+	peerID ServerID, args InstallSnapshotRequest, data io.Reader,
+) (InstallSnapshotResponse, error) {
 	var reply InstallSnapshotResponse
 	target, err := t.lookupPeer(peerID)
 	if err != nil {
@@ -500,7 +507,9 @@ func (t *TCPTransport) handleConn(conn net.Conn) {
 // conn — TCP-соединение, используется для чтения данных снэпшота напрямую
 // (минуя bufio), чтобы избежать повреждения внутреннего состояния bufio
 // после ошибок gob-декодирования.
-func (t *TCPTransport) handleCommand(r *bufio.Reader, conn net.Conn, dec *gob.Decoder, enc *gob.Encoder) error {
+//
+//nolint:funlen
+func (t *TCPTransport) handleCommand(r *bufio.Reader, _ net.Conn, dec *gob.Decoder, enc *gob.Encoder) error {
 	var req tcpRPCRequest
 	if err := dec.Decode(&req); err != nil {
 		return err

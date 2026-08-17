@@ -66,7 +66,7 @@ func (cm *ConsensusModule) becomeFollower(term int) {
 //nolint:funlen
 func (cm *ConsensusModule) startElection() {
 	startTimeNow := time.Now()
-	defer func() { latencyElectionCh <- time.Since(startTimeNow) }()
+	defer func() { cm.latency.election.observe(time.Since(startTimeNow)) }()
 	cm.cmState.state = Candidate
 	cm.cmState.currentTerm += 1
 	savedCurrentTerm := cm.cmState.currentTerm
@@ -446,7 +446,7 @@ func (cm *ConsensusModule) electionTimeout() time.Duration {
 // выборы (без PreVote, без ожидания election timeout).
 func (cm *ConsensusModule) timeoutNow(rpc RPC, req *TimeoutNowRequest) {
 	startTimeNow := time.Now()
-	defer func() { latencyTimeoutNowRequestCh <- time.Since(startTimeNow) }()
+	defer func() { cm.latency.timeoutNowRequest.observe(time.Since(startTimeNow)) }()
 	cm.traceLogf(0, "received TimeoutNow from %d", req.ServerID)
 
 	// Уже лидер — no-op.

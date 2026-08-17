@@ -29,7 +29,7 @@ func TestNewKVService(t *testing.T) {
 	storage := raft.NewMapStorage()
 	ready := make(chan any)
 
-	kvs := New(Config{
+	kvs := New(&Config{
 		Config: raft.Config{
 			PeerIds:    []int{1, 2},
 			RPCAddress: ":0",

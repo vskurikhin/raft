@@ -12,35 +12,64 @@ const (
 	ProtocolVersion = 3
 
 	// Quantum — множитель для всех Raft-таймеров.
-	// TCP RPC timeout (TcpRpcTimeoutMs) задаётся независимо.
+	// TCP RPC timeout (TCPRPCTimeout) задаётся независимо.
 	// Для тестового ускорения Quantum не меняется — используются
 	// test-only хуки (RAFT_FORCE_MORE_REELECTION и аналоги).
-	Quantum             = 2
-	HeartbeatTimeoutMs  = 23 * Quantum
+	Quantum             = 3
+	HeartbeatTimeoutMs  = 31 * Quantum
 	ReelectionTimeoutMs = 127 * Quantum
-	TickerTimeoutMs     = 11 * Quantum
+	TickerTimeoutMs     = 7 * Quantum
 
-	// TcpRpcTimeoutMs — таймаут TCP RPC (не зависит от Quantum), используется
-	// в production-транспорте. Исходное значение 85ms получено из 254/3 при
-	// Quantum=2. Вынесено в независимую константу, чтобы изменение Quantum
+	// TCPRPCTimeout — тайм-аут TCP RPC (не зависит от Quantum), используется
+	// в production-транспорте. Исходное значение 85ms получено из 382/2 при
+	// Quantum=3. Вынесено в независимую константу, чтобы изменение Quantum
 	// для ускорения тестов не влияло на production-развёртывание.
-	TcpRpcTimeoutMs = 85
+	TCPRPCTimeout = 191 * time.Millisecond
 
 	// leaderBatchSize — количество записей, которые лидер собирает из applyCh
 	// перед одним вызовом dispatchLogs. Компромисс между latency (одиночные
 	// записи) и throughput (групповой commit, Raft §5.1).
-	leaderBatchSize = 64
+	leaderBatchSize = 256
 
 	// maxApplyBatchSize — максимальное количество записей в одном батче,
 	// отправляемом в fsmMutateCh. Если commitIndex - lastApplied превышает
 	// этот порог, processLogs делит диапазон на под-батчи.
-	maxApplyBatchSize = 128
+	maxApplyBatchSize = 512
 
 	// applyBatchInterval — интервал, с которым runApplyLoop проверяет
 	// необходимость применения записей к FSM. Накопление commitCh
 	// уведомлений за этот интервал позволяет объединять несколько
 	// мелких коммитов в один батч.
 	applyBatchInterval = 50 * time.Millisecond
+
+	// batchApplyBuffer — ёмкость fsmMutateCh для burst-устойчивости.
+	// Выбрана как 1024: при массовом коммите processLogs не блокируется.
+	batchApplyBuffer = 1024
+
+	// defaultSnapshotThreshold — минимальное количество записей после
+	// последнего снэпшота, при котором создаётся новый снэпшот.
+	// Значение 1024 выбрано как компромисс: частые снэпшоты создают
+	// нагрузку на FSM.Snapshot(), редкие — увеличивают время восстановления
+	// и объём журнала, который нужно передавать отстающим узлам.
+	defaultSnapshotThreshold = 1024
+
+	// defaultSnapshotInterval — интервал проверки необходимости снэпшота.
+	// Каждые 3 секунды runSnapshots проверяет, не превышен ли порог
+	// defaultSnapshotThreshold.
+	defaultSnapshotInterval = 3 * time.Second
+
+	// defaultTakeSnapshotTimeout — тайм-аут отправки запроса на снэпшот
+	// в fsmSnapshotCh. Если runFSM не принимает запрос за это время,
+	// takeSnapshot возвращает ошибку вместо вечной блокировки.
+	// Значение 30 секунд выбрано как разумный максимум для создания
+	// снэпшота в production (запись состояния + persist на диск).
+	defaultTakeSnapshotTimeout = 30 * time.Second
+
+	// defaultTrailingLogs — количество записей журнала, сохраняемых
+	// после самого свежего снэпшота. Нужно для поддержки репликации
+	// без отправки полного снэпшота каждому новому follower.
+	// Значение 128 — разумный минимум для большинства сценариев.
+	defaultTrailingLogs = 128
 
 	// maxSnapshotDataSize — максимальный допустимый размер данных снэпшота
 	// в байтах. Значение 1 ГБ выбрано как разумный предел для production
@@ -50,12 +79,6 @@ const (
 	// Защита от паники io.Copy при повреждённом DataSize.
 	maxSnapshotDataSize = 1 << 30
 )
-
-// TraceCM — порог детализации отладочных сообщений консенсус-модуля
-// (traceLogf, traceLogLocked). Сообщение с уровнем level выводится,
-// если TraceCM > level. Значение задаётся флагом --trace-log-level
-// командной строки, по умолчанию 1.
-var TraceCM = 1
 
 // CommitEntry — это данные, которые Raft отправляет в канал фиксации.
 // Каждая запись фиксации уведомляет клиента о том, что консенсус по команде
@@ -107,35 +130,6 @@ const (
 	LogConfiguration
 )
 
-// batchApplyBuffer — ёмкость fsmMutateCh для burst-устойчивости.
-// Выбрана как 1024: при массовом коммите processLogs не блокируется.
-const batchApplyBuffer = 1024
-
-// defaultSnapshotThreshold — минимальное количество записей после
-// последнего снэпшота, при котором создаётся новый снэпшот.
-// Значение 1024 выбрано как компромисс: частые снэпшоты создают
-// нагрузку на FSM.Snapshot(), редкие — увеличивают время восстановления
-// и объём журнала, который нужно передавать отстающим узлам.
-const defaultSnapshotThreshold = 1024
-
-// defaultSnapshotInterval — интервал проверки необходимости снэпшота.
-// Каждые 3 секунды runSnapshots проверяет, не превышен ли порог
-// defaultSnapshotThreshold.
-const defaultSnapshotInterval = 3 * time.Second
-
-// defaultTakeSnapshotTimeout — таймаут отправки запроса на снэпшот
-// в fsmSnapshotCh. Если runFSM не принимает запрос за это время,
-// takeSnapshot возвращает ошибку вместо вечной блокировки.
-// Значение 30 секунд выбрано как разумный максимум для создания
-// снэпшота в production (запись состояния + persist на диск).
-const defaultTakeSnapshotTimeout = 30 * time.Second
-
-// defaultTrailingLogs — количество записей журнала, сохраняемых
-// после самого свежего снэпшота. Нужно для поддержки репликации
-// без отправки полного снэпшота каждому новому follower.
-// Значение 128 — разумный минимум для большинства сценариев.
-const defaultTrailingLogs = 128
-
 type LogEntry struct {
 	Index int
 	Term  int
@@ -152,6 +146,7 @@ type commitTuple struct {
 // configurationChangeFuture — future для изменения конфигурации кластера.
 type configurationChangeFuture struct {
 	deferError
+
 	req   configurationChangeRequest
 	index int
 }
@@ -171,6 +166,8 @@ func (f *configurationChangeFuture) Index() int {
 // для инициализации по AGENTS.md), а не в рабочих горутинах. Проверка
 // обнаруживает как «чистый» nil-интерфейс, так и типизированный nil-указатель
 // (например, (*InmemTransport)(nil)) — см. isNilInterface.
+//
+//nolint:funlen
 func NewConsensusModule(
 	id int,
 	peerIds []int,
@@ -302,6 +299,7 @@ func checkRPCHeader(rpc WithRPCHeader) error {
 // RequestVoteArgs См. рисунок 2 в статье.
 type RequestVoteArgs struct {
 	RPCHeader
+
 	Term         int
 	CandidateID  int
 	LastLogIndex int
@@ -317,6 +315,7 @@ func (r *RequestVoteArgs) GetRPCHeader() RPCHeader {
 
 type RequestVoteReply struct {
 	RPCHeader
+
 	Term        int
 	VoteGranted bool
 }
@@ -330,6 +329,7 @@ func (r *RequestVoteReply) GetRPCHeader() RPCHeader {
 // Получатель проверяет только актуальность лога (log-safety) и наличие активного лидера.
 type RequestPreVoteArgs struct {
 	RPCHeader
+
 	Term         int
 	LastLogIndex int
 	LastLogTerm  int
@@ -342,6 +342,7 @@ func (r *RequestPreVoteArgs) GetRPCHeader() RPCHeader {
 // RequestPreVoteReply — ответ на RequestPreVote RPC.
 type RequestPreVoteReply struct {
 	RPCHeader
+
 	Term        int
 	VoteGranted bool
 }
@@ -353,6 +354,7 @@ func (r *RequestPreVoteReply) GetRPCHeader() RPCHeader {
 // AppendEntriesArgs См. рисунок 2 в статье.
 type AppendEntriesArgs struct {
 	RPCHeader
+
 	Term     int
 	LeaderID int
 
@@ -368,6 +370,7 @@ func (r *AppendEntriesArgs) GetRPCHeader() RPCHeader {
 
 type AppendEntriesReply struct {
 	RPCHeader
+
 	Term    int
 	Success bool
 

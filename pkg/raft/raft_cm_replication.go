@@ -53,6 +53,8 @@ func (cm *ConsensusModule) nextIndexArgsEntries(peerID, savedCurrentTerm int) (i
 // При любом завершении (успех, ошибка, step down) сбрасывает
 // inflightAE[peerID], разрешая последующий вызов leaderSendAEs
 // для этого peer. Сброс гарантирован через defer.
+//
+//nolint:funlen,gocognit
 func (cm *ConsensusModule) leaderSendAEsToPeer(peerID, savedCurrentTerm int, dispatchEpoch uint64) {
 	defer func() {
 		cm.mu.Lock()
@@ -181,7 +183,9 @@ func (cm *ConsensusModule) leaderSendAEs() {
 
 // leaderSendSnapshot отправляет последний снэпшот отстающему follower.
 // Вызывается, когда nextIndex[follower] <= lastSnapshotIndex.
-func (cm *ConsensusModule) leaderSendSnapshot(peerID int, term int) {
+//
+//nolint:funlen
+func (cm *ConsensusModule) leaderSendSnapshot(peerID, term int) {
 	start := time.Now()
 	defer func() {
 		elapsed := time.Since(start)

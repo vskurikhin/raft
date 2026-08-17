@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -69,6 +70,12 @@ type ConsensusModule struct {
 	// apply-пути под общим cm.mu (ADR-003). Всегда инициализирован (не nil),
 	// даже на follower — иначе sendBatch упадёт (RISK-5).
 	leaderState leaderState
+
+	// latency — агрегаты латентности этого CM. Нулевое значение готово к
+	// использованию; инициализация в конструкторе не требуется (INV-M6).
+	// Собственного мьютекса нет: поля — atomic.Int64, наблюдение корректно
+	// из любого контекста, включая удержание cm.mu (INV-M3, ADR-P06-002).
+	latency cmLatency
 }
 
 // leaderState — состояние, используемое только пока узел является лидером.
@@ -232,6 +239,8 @@ func (cm *ConsensusModule) Stop() {
 }
 
 // debugLogf выводит отладочное сообщение.
+//
+//nolint:unused
 func (cm *ConsensusModule) debugLogf(format string, args ...any) {
 	if slog.Default().Enabled(context.Background(), slog.LevelDebug) {
 		format = fmt.Sprintf("[%c,N:%d,T:%03d] ", stateLetter(cm.cmState.state), cm.id, cm.cmState.currentTerm) + format
@@ -259,6 +268,14 @@ func (cm *ConsensusModule) traceLogf(level int, format string, args ...any) {
 		cm.traceLockedLogf(level, format, args...)
 		cm.mu.Unlock()
 	}
+}
+
+func (cm *ConsensusModule) stdoutTracePrintln(msg string) {
+	cm.mu.Lock()
+	_, _ = fmt.Fprintln(os.Stdout, fmt.Sprintf(
+		"[%c,N:%d,T:%03d] %s", stateLetter(cm.cmState.state), cm.id, cm.cmState.currentTerm, msg,
+	))
+	cm.mu.Unlock()
 }
 
 func stateLetter(s CMState) rune {

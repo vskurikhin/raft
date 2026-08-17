@@ -198,6 +198,8 @@ func (cm *ConsensusModule) VerifyLeader() Future {
 
 // appendConfigurationEntry записывает запись LogConfiguration в журнал лидера
 // и запускает репликацию. Вызывается из leaderLoop.
+//
+//nolint:funlen
 func (cm *ConsensusModule) appendConfigurationEntry(future *configurationChangeFuture) {
 	cm.mu.Lock()
 	nextCfg, err := nextConfiguration(
@@ -317,6 +319,8 @@ func (cm *ConsensusModule) enqueueConfigurationChange(future *configurationChang
 // Вызывается только из leaderLoop. Блокирует leaderLoop до завершения
 // передачи или таймаута. Все новые Apply и confChange во время передачи
 // отклоняются через флаг leadershipTransferInProgress.
+//
+//nolint:funlen
 func (cm *ConsensusModule) handleLeadershipTransfer(future *leadershipTransferFuture) {
 	targetID := int(future.targetID)
 
@@ -430,6 +434,8 @@ func (cm *ConsensusModule) handleLeadershipTransfer(future *leadershipTransferFu
 //
 // После выхода из цикла все ожидающие future из списка inflight
 // получают ошибку ErrLeadershipLost, после чего список очищается.
+//
+//nolint:funlen,gocognit
 func (cm *ConsensusModule) runLeaderLoop() {
 	startNow := time.Now()
 	defer func() {

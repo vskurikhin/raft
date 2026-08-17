@@ -29,7 +29,7 @@ func TestRunWithEmptyPeers(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- runWith(values)
+		errCh <- runWith(&values)
 	}()
 
 	select {
@@ -68,7 +68,7 @@ func TestRunWithPeerConnect(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- runWith(values)
+		errCh <- runWith(&values)
 	}()
 
 	select {

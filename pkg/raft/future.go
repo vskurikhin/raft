@@ -2,7 +2,6 @@ package raft
 
 import (
 	"errors"
-	"io"
 	"sync"
 	"time"
 )
@@ -49,6 +48,7 @@ type Future interface {
 // ConsensusModule, поэтому дополнительной синхронизации не требуется.
 type verifyFuture struct {
 	deferError
+
 	quorumSize int
 	votes      int
 
@@ -151,6 +151,7 @@ func (d *deferError) ErrorCh() <-chan error {
 // logFuture — future для одной записи журнала.
 type logFuture struct {
 	deferError
+
 	log      LogEntry
 	response any
 	dispatch time.Time
@@ -167,6 +168,7 @@ func (l *logFuture) Response() any {
 // configurationsFuture — future для GetConfiguration.
 type configurationsFuture struct {
 	deferError
+
 	config Configuration
 }
 
@@ -187,6 +189,7 @@ type LeadershipTransferFuture interface {
 // leadershipTransferFuture — future для отслеживания передачи лидерства.
 type leadershipTransferFuture struct {
 	deferError
+
 	targetID ServerID
 }
 
@@ -209,20 +212,13 @@ func (e errorFuture) Configuration() Configuration { return Configuration{} }
 // reqSnapshotFuture — внутренний future для запроса снэпшота у runFSM.
 type reqSnapshotFuture struct {
 	deferError
+
 	index    int
 	term     int
 	snapshot FSMSnapshot
 }
 
-// restoreFuture — future для восстановления из снэпшота на runFSM.
-type restoreFuture struct {
-	deferError
-	meta   *SnapshotMeta
-	reader io.ReadCloser
-}
-
 // SnapshotFuture — публичный future для пользовательского Snapshot().
 type SnapshotFuture struct {
 	deferError
-	index int
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/gob"
 	"fmt"
+	"slices"
 )
 
 // ServerSuffrage определяет, участвует ли сервер в голосовании.
@@ -41,7 +42,6 @@ type configurationChangeRequest struct {
 	command       ConfigurationChangeCommand
 	serverID      ServerID
 	serverAddress ServerAddress
-	prevIndex     int
 }
 
 // configurations — пара committed+latest с индексами.
@@ -104,13 +104,14 @@ func checkConfiguration(cfg Configuration) error {
 }
 
 // nextConfiguration вычисляет новую конфигурацию на основе текущей и запроса.
+//
+//nolint:funlen
 func nextConfiguration(current Configuration, currentIndex int, req configurationChangeRequest) (Configuration, error) {
 	if err := checkConfiguration(current); err != nil {
 		return Configuration{}, err
 	}
 
-	servers := make([]ConfigServer, len(current.ConfigServers))
-	copy(servers, current.ConfigServers)
+	servers := slices.Clone(current.ConfigServers)
 
 	switch req.command {
 	case AddVoter:

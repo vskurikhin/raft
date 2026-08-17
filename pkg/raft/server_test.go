@@ -25,7 +25,7 @@ func TestNewServer(t *testing.T) {
 	commitChan := make(chan CommitEntry, 10)
 	ready := make(chan any)
 
-	s := New(Config{
+	s := New(&Config{
 		Fsm:        NewCommitChannelFSM(commitChan),
 		PeerIds:    []int{2, 3},
 		RPCAddress: ":0",

@@ -20,6 +20,8 @@ import (
 // («lastSnapshotIndex новее, лог полный») безопасно — полный лог
 // консервативнее, а startup-restore самовосстанавливает рассинхрон
 // (restoreFromSnapshotStore).
+//
+//nolint:gocritic
 func (cm *ConsensusModule) persistToStorage() {
 	start := time.Now()
 	defer func() {

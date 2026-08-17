@@ -31,11 +31,12 @@ func (cm *ConsensusModule) lookupTerm(index int) int {
 	lo, hi := 0, len(cm.cmState.log)-1
 	for lo <= hi {
 		mid := (lo + hi) / 2
-		if cm.cmState.log[mid].Index == index {
+		switch {
+		case cm.cmState.log[mid].Index == index:
 			return cm.cmState.log[mid].Term
-		} else if cm.cmState.log[mid].Index < index {
+		case cm.cmState.log[mid].Index < index:
 			lo = mid + 1
-		} else {
+		default:
 			hi = mid - 1
 		}
 	}
@@ -210,20 +211,21 @@ func (cm *ConsensusModule) processLogConflict(conflictIndex int) {
 func (cm *ConsensusModule) rebuildConfigurations() {
 	cm.setInitialConfiguration()
 	for i, entry := range cm.cmState.log {
-		if entry.Type == LogConfiguration {
-			entryData, ok := entry.Data.([]byte)
-			if !ok {
-				continue
-			}
-			cfg, err := DecodeConfiguration(entryData)
-			if err != nil {
-				continue
-			}
-			cm.cmState.configurations.committed = cm.cmState.configurations.latest
-			cm.cmState.configurations.committedIndex = cm.cmState.configurations.latestIndex
-			cm.cmState.configurations.latest = cfg
-			cm.cmState.configurations.latestIndex = i
+		if entry.Type != LogConfiguration {
+			continue
 		}
+		entryData, ok := entry.Data.([]byte)
+		if !ok {
+			continue
+		}
+		cfg, err := DecodeConfiguration(entryData)
+		if err != nil {
+			continue
+		}
+		cm.cmState.configurations.committed = cm.cmState.configurations.latest
+		cm.cmState.configurations.committedIndex = cm.cmState.configurations.latestIndex
+		cm.cmState.configurations.latest = cfg
+		cm.cmState.configurations.latestIndex = i
 	}
 }
 

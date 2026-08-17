@@ -20,11 +20,13 @@ linters:
     - gomodguard
     - gosec
     - gosmopolitan
+    - iface
     - inamedparam
     - intrange
     - ireturn
     - maintidx
     - mnd
+    - modernize
     - nakedret
     - nestif
     - nlreturn

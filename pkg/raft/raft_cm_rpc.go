@@ -61,9 +61,10 @@ func (cm *ConsensusModule) respondRPC(rpc RPC, reply any, err error) {
 	}
 }
 
+//nolint:funlen,gocognit,gocritic
 func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
 	startTimeNow := time.Now()
-	defer func() { latencyAppendEntriesCh <- time.Since(startTimeNow) }()
+	defer func() { cm.latency.appendEntries.observe(time.Since(startTimeNow)) }()
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	if cm.cmState.state == Dead {
@@ -210,9 +211,11 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 //
 // Кандидаты, не являющиеся voter'ами в текущей конфигурации, отклоняются.
 // Nonvoter не может быть избран лидером ни при каких обстоятельствах.
+//
+//nolint:funlen
 func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
 	startTimeNow := time.Now()
-	defer func() { latencyRequestVoteCh <- time.Since(startTimeNow) }()
+	defer func() { cm.latency.requestVote.observe(time.Since(startTimeNow)) }()
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	if cm.cmState.state == Dead {
@@ -301,7 +304,7 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 // PreVote отклоняется, чтобы предотвратить лишние выборы.
 func (cm *ConsensusModule) RequestPreVote(args RequestPreVoteArgs, reply *RequestPreVoteReply) error {
 	startTimeNow := time.Now()
-	defer func() { latencyRequestPreVoteCh <- time.Since(startTimeNow) }()
+	defer func() { cm.latency.requestPreVote.observe(time.Since(startTimeNow)) }()
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 

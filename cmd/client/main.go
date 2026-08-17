@@ -21,6 +21,7 @@ func main() {
 	if len(os.Args) > 2 && os.Args[1] == "get" {
 		value, ok, err := client.Get(ctx, os.Args[2])
 		if err != nil {
+			//nolint:gocritic
 			log.Fatalf(`{"Error", "%s"}`, err)
 		}
 		fmt.Printf(`{"RespStatus":1, "KeyFound":%v, "Value":"%s"}`, ok, value)

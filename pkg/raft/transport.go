@@ -22,6 +22,7 @@ type TimeoutNowRequest struct {
 // TimeoutNowResponse — ответ на TimeoutNowRequest.
 type TimeoutNowResponse struct {
 	RPCHeader
+
 	Success bool
 	Term    int
 }
@@ -29,6 +30,7 @@ type TimeoutNowResponse struct {
 // InstallSnapshotRequest — запрос на установку снэпшота от лидера.
 type InstallSnapshotRequest struct {
 	RPCHeader
+
 	Term          int
 	LeaderID      int
 	LastLogIndex  int
@@ -45,6 +47,7 @@ func (r *InstallSnapshotRequest) GetRPCHeader() RPCHeader {
 // InstallSnapshotResponse — ответ на установку снэпшота.
 type InstallSnapshotResponse struct {
 	RPCHeader
+
 	Term    int
 	Success bool
 }

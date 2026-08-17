@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"sync"
 	"time"
 
 	"github.com/vskurikhin/raft/pkg/api"
@@ -59,8 +58,6 @@ func SetTraceLogFile(path string) error {
 const requestTimeout = 10 * time.Second
 
 type KVService struct {
-	mu sync.Mutex
-
 	// id — идентификатор сервиса в кластере Raft.
 	id int
 
@@ -94,7 +91,7 @@ type Config struct {
 //
 // KVService реализует raft.FSM: закоммиченные записи журнала применяются
 // непосредственно к DataStore через метод Apply.
-func New(cfg Config, readyChan <-chan any) *KVService {
+func New(cfg *Config, readyChan <-chan any) *KVService {
 	gob.Register(Command{})
 
 	kvs := &KVService{
@@ -107,7 +104,7 @@ func New(cfg Config, readyChan <-chan any) *KVService {
 	// raft.Server обрабатывает RPC-вызовы протокола Raft в кластере.
 	// KVService передаётся как FSM, поэтому Apply будет вызываться Raft'ом
 	// для каждой закоммиченной записи.
-	rs := raft.New(cfg.Config, readyChan)
+	rs := raft.New(&cfg.Config, readyChan)
 	rs.Serve(cfg.RPCAddress)
 	kvs.rs = rs
 
@@ -197,13 +194,14 @@ func (kvs *KVService) ApplyBatch(logs []*raft.LogEntry) []any {
 //     как кластер Raft будет готов к работе (все узлы запущены и соединены
 //     друг с другом).
 func NewKVService(address string, id int, peerIds []int, storage raft.Storage, readyChan <-chan any) *KVService {
-	return New(Config{
+	return New(&Config{
 		Config: raft.Config{
 			RPCAddress: address,
 			ServerID:   id,
 			PeerIds:    peerIds,
 			Storage:    storage,
-		}}, readyChan,
+		},
+	}, readyChan,
 	)
 }
 
@@ -365,8 +363,7 @@ func (kvs *KVService) handleGet(w http.ResponseWriter, req *http.Request) {
 	}
 
 	// Локальное чтение из DataStore (без raft-журнала, только после ReadIndex).
-	cmd := Command{Kind: CommandGet, Key: gr.Key, ID: kvs.id}
-	value, found := kvs.ds.Get(cmd.Key)
+	value, found := kvs.ds.Get(gr.Key)
 	kvs.sendHTTPResponse(w, api.GetResponse{
 		RespStatus: api.StatusOK,
 		KeyFound:   found,
