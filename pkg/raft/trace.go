@@ -23,6 +23,8 @@ var _traceLogger = log.Default()
 func traceEnabled(level int) bool { return level < TraceCM }
 
 // _traceLogFile — открытый файл трассировки; nil, если вывод в stderr.
+//
+//nolint:unused
 var _traceLogFile *os.File
 
 // traceConfigured — сторожевой флаг строгого set-once: единственная

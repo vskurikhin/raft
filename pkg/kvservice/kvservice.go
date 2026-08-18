@@ -28,6 +28,8 @@ var TraceKV = 1
 var _traceLogger = log.Default()
 
 // _traceLogFile — открытый файл трассировки; nil, если вывод в stderr.
+//
+//nolint:unused
 var _traceLogFile *os.File
 
 // traceConfigured — сторожевой флаг строгого set-once: единственная

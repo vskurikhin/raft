@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -26,6 +27,47 @@ type snapshotHarness struct {
 	connected  []bool
 	ready      chan any
 	mu         sync.Mutex
+	// isCounters — счётчики InstallSnapshot по узлу-получателю (SA-003:
+	// перехват в тестовом транспорте harness, образец —
+	// raft_cm_replication_test.go).
+	isCounters *isReceivedCounters
+}
+
+// isReceivedCounters — общие счётчики InstallSnapshot, отправленных
+// каждому узлу кластера. Разделяются всеми тестовыми транспортами
+// harness; инкремент — atomic, чтение из теста — Load.
+type isReceivedCounters struct {
+	mu       sync.Mutex
+	byTarget map[int]*atomic.Int64
+}
+
+// target возвращает счётчик узла-получателя, лениво его создавая.
+func (c *isReceivedCounters) target(id int) *atomic.Int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.byTarget == nil {
+		c.byTarget = make(map[int]*atomic.Int64)
+	}
+	v, ok := c.byTarget[id]
+	if !ok {
+		v = new(atomic.Int64)
+		c.byTarget[id] = v
+	}
+	return v
+}
+
+// snapshotCountingTransport — обёртка InmemTransport, подсчитывающая
+// InstallSnapshot по узлу-получателю. Consumer() и Connect/Disconnect
+// работают с нижележащим транспортом без изменений; перехватывается
+// только исходящий вызов InstallSnapshot.
+type snapshotCountingTransport struct {
+	*InmemTransport
+	counters *isReceivedCounters
+}
+
+func (t *snapshotCountingTransport) InstallSnapshot(peerID ServerID, req InstallSnapshotRequest, data io.Reader) (InstallSnapshotResponse, error) {
+	t.counters.target(int(peerID)).Add(1)
+	return t.InmemTransport.InstallSnapshot(peerID, req, data)
 }
 
 // newSnapshotHarness создаёт кластер из n узлов с поддержкой снэпшотов.
@@ -40,6 +82,7 @@ func newSnapshotHarness(t *testing.T, n int) *snapshotHarness {
 	alive := make([]bool, n)
 	connected := make([]bool, n)
 	ready := make(chan any)
+	counters := &isReceivedCounters{}
 
 	// Создаём транспорты и соединяем их.
 	for i := 0; i < n; i++ {
@@ -54,6 +97,8 @@ func newSnapshotHarness(t *testing.T, n int) *snapshotHarness {
 	}
 
 	// Создаём ConsensusModule для каждого узла со снэпшотами.
+	// В CM передаётся counting-обёртка транспорта (SA-003): перехват
+	// InstallSnapshot для счётчика installSnapshotCount(id).
 	for i := 0; i < n; i++ {
 		peerIds := make([]int, 0)
 		for p := 0; p < n; p++ {
@@ -67,7 +112,7 @@ func newSnapshotHarness(t *testing.T, n int) *snapshotHarness {
 		stores[i] = NewInmemSnapshotStore()
 
 		cluster[i] = NewConsensusModule(
-			i, peerIds, transports[i],
+			i, peerIds, &snapshotCountingTransport{InmemTransport: transports[i], counters: counters},
 			storage[i], fsms[i], ready,
 			stores[i],
 		)
@@ -87,6 +132,7 @@ func newSnapshotHarness(t *testing.T, n int) *snapshotHarness {
 		alive:      alive,
 		connected:  connected,
 		ready:      ready,
+		isCounters: counters,
 	}
 	return h
 }
@@ -165,7 +211,7 @@ func (h *snapshotHarness) RestartPeer(id int) {
 	store := h.stores[id]
 
 	h.cluster[id] = NewConsensusModule(
-		id, peerIds, h.transports[id],
+		id, peerIds, &snapshotCountingTransport{InmemTransport: h.transports[id], counters: h.isCounters},
 		h.storage[id], fsm, ready, store,
 	)
 	close(ready)
@@ -217,6 +263,61 @@ func (h *snapshotHarness) getSnapshotIndex(serverID int) int {
 	h.cluster[serverID].mu.Lock()
 	defer h.cluster[serverID].mu.Unlock()
 	return h.cluster[serverID].cmState.lastSnapshotIndex
+}
+
+// getLastSnapshotIndex — синоним getSnapshotIndex (единое имя аксессора
+// для матрицы Case A…F, TASK-004 п.1).
+func (h *snapshotHarness) getLastSnapshotIndex(serverID int) int {
+	return h.getSnapshotIndex(serverID)
+}
+
+// getLastSnapshotTerm возвращает lastSnapshotTerm узла.
+func (h *snapshotHarness) getLastSnapshotTerm(serverID int) int {
+	h.cluster[serverID].mu.Lock()
+	defer h.cluster[serverID].mu.Unlock()
+	return h.cluster[serverID].cmState.lastSnapshotTerm
+}
+
+// getLastLogIndex возвращает lastLogIndex узла.
+func (h *snapshotHarness) getLastLogIndex(serverID int) int {
+	h.cluster[serverID].mu.Lock()
+	defer h.cluster[serverID].mu.Unlock()
+	return h.cluster[serverID].cmState.lastLogIndex
+}
+
+// getLastLogTerm возвращает lastLogTerm узла.
+func (h *snapshotHarness) getLastLogTerm(serverID int) int {
+	h.cluster[serverID].mu.Lock()
+	defer h.cluster[serverID].mu.Unlock()
+	return h.cluster[serverID].cmState.lastLogTerm
+}
+
+// getLastApplied возвращает lastApplied узла.
+func (h *snapshotHarness) getLastApplied(serverID int) int {
+	h.cluster[serverID].mu.Lock()
+	defer h.cluster[serverID].mu.Unlock()
+	return h.cluster[serverID].cmState.lastApplied
+}
+
+// getCommitIndex возвращает commitIndex узла.
+func (h *snapshotHarness) getCommitIndex(serverID int) int {
+	h.cluster[serverID].mu.Lock()
+	defer h.cluster[serverID].mu.Unlock()
+	return h.cluster[serverID].cmState.commitIndex
+}
+
+// installSnapshotCount возвращает число InstallSnapshot, отправленных
+// указанному узлу с момента старта harness (SA-003: перехват в тестовом
+// транспорте).
+func (h *snapshotHarness) installSnapshotCount(serverID int) int64 {
+	return h.isCounters.target(serverID).Load()
+}
+
+// getLogEntries возвращает копию среза журнала узла.
+func (h *snapshotHarness) getLogEntries(serverID int) []LogEntry {
+	h.cluster[serverID].mu.Lock()
+	defer h.cluster[serverID].mu.Unlock()
+	return append([]LogEntry{}, h.cluster[serverID].cmState.log...)
 }
 
 // getLogLength возвращает длину журнала узла.
@@ -303,88 +404,188 @@ func TestSnapshot_NoSnapshotStore(t *testing.T) {
 }
 
 // TestSnapshot_Install проверяет, что отставший follower получает
-// InstallSnapshot RPC. Отключаем follower, накапливаем лог, создаём
-// снэпшот, подключаем обратно и проверяем состояние FSM.
+// InstallSnapshot RPC, пост-условия установки корректны (INV-S1/S2,
+// монотонность lastApplied/commitIndex), а репликация продолжается
+// обычным AppendEntries (INV-S5).
+//
+// Усилен по TASK-004: верхняя граница числа InstallSnapshot после
+// переподключения (≤2) исключает цикл IS↔AE-fail; журнал follower'а
+// совпадает с лидерским на пересечении. На HEAD до TASK-001 тест обязан
+// падать (INV-S1: lastLogIndex == -1 при установленном снапшоте).
 func TestSnapshot_Install(t *testing.T) {
 	defer leaktest.CheckTimeout(t, 60*time.Second)()
 
 	h := newSnapshotHarness(t, 3)
 	defer h.Shutdown()
 
-	// Устанавливаем низкий порог.
+	leaderID, followerID, _, isBefore := h.driveSnapshotInstall(20, 8, 30)
+
+	// Ждём установки снапшота на follower (опрос с дедлайном).
+	if !h.waitForSnapshot(followerID, 10*time.Second) {
+		t.Fatalf("follower %d did not install snapshot", followerID)
+	}
+
+	// Пост-условия установки (TASK-004 п.2): INV-S1, INV-S2,
+	// монотонность lastApplied/commitIndex.
+	snapIdxF := h.getLastSnapshotIndex(followerID)
+	lastLogIndex := h.getLastLogIndex(followerID)
+	if lastLogIndex < snapIdxF {
+		t.Fatalf("INV-S1 violated: lastLogIndex=%d < lastSnapshotIndex=%d", lastLogIndex, snapIdxF)
+	}
+	if h.getLogLength(followerID) == 0 {
+		// Пустой суффикс: lastLogIndex/lastLogTerm == граница снапшота.
+		if lastLogIndex != snapIdxF || h.getLastLogTerm(followerID) != h.getLastSnapshotTerm(followerID) {
+			t.Fatalf("INV-S2 violated: lastLog=(%d,%d), snapshot=(%d,%d)",
+				lastLogIndex, h.getLastLogTerm(followerID), snapIdxF, h.getLastSnapshotTerm(followerID))
+		}
+	}
+	if h.getLastApplied(followerID) < snapIdxF {
+		t.Fatalf("lastApplied=%d < snapshot index %d", h.getLastApplied(followerID), snapIdxF)
+	}
+	if h.getCommitIndex(followerID) < snapIdxF {
+		t.Fatalf("commitIndex=%d < snapshot index %d", h.getCommitIndex(followerID), snapIdxF)
+	}
+
+	// INV-S5: после снапшота репликация продолжается обычным
+	// AppendEntries — follower догоняет лидера.
+	h.waitForCatchUp(leaderID, followerID, 10*time.Second)
+
+	// Верхняя граница числа InstallSnapshot после переподключения:
+	// цикл IS↔AE-fail исключён. Попытки к недоступному пиру во время
+	// отключения не учитываются (их ограничивает backoff, TASK-007).
+	if n := h.installSnapshotCount(followerID) - isBefore; n > 2 {
+		t.Fatalf("installSnapshotCount after reconnect=%d, want <= 2 (snapshot loop)", n)
+	}
+
+	h.checkLogIntersection(leaderID, followerID)
+	h.waitForFSMStateEqual(leaderID, followerID, 10*time.Second)
+}
+
+// driveSnapshotInstall выполняет базовый сценарий догона через снапшот:
+// синхронизацию follower'а с лидером (seed-запись), отключение follower'а,
+// накопление numCmds команд на лидере до создания снапшота,
+// переподключение follower'а. Возвращает ID лидера, ID follower'а,
+// индекс снапшота лидера и число InstallSnapshot до переподключения.
+//
+// Seed-запись делает сценарий детерминированным: follower гарантированно
+// имеет записи журнала до отключения (nextIndex > 0), поэтому после
+// переподключения догон идёт через InstallSnapshot. Без seed'а возможен
+// случай prev == -1 (полностью пустой follower), обрабатываемый особым
+// случаем AE — см. blocker DEV-001 (.ai/developer/).
+func (h *snapshotHarness) driveSnapshotInstall(threshold, trailing, numCmds int) (int, int, int, int64) {
 	for i := 0; i < h.n; i++ {
-		h.cluster[i].SetSnapshotConfig(20, 50*time.Millisecond, 8)
+		h.cluster[i].SetSnapshotConfig(threshold, 50*time.Millisecond, trailing)
 	}
 
 	leaderID := h.waitForSingleLeader()
-	followerID := (leaderID + 1) % 3
+	if leaderID < 0 {
+		h.t.Fatal("no leader elected")
+	}
+	followerID := (leaderID + 1) % h.n
 
-	// Отключаем follower.
+	// Точка отсчёта: follower гарантированно имеет записи журнала.
+	if idx := h.SubmitToServer(leaderID, "kseed=vseed"); idx < 0 {
+		h.t.Fatal("seed command failed")
+	}
+	h.waitForCatchUp(leaderID, followerID, 10*time.Second)
+
 	h.DisconnectPeer(followerID)
-	t.Logf("disconnected follower %d", followerID)
 
-	// Отправляем 30 команд, чтобы превысить threshold.
-	for i := 0; i < 30; i++ {
+	for i := 0; i < numCmds; i++ {
 		cmd := fmt.Sprintf("k%d=v%d", i, i)
 		idx := h.SubmitToServer(leaderID, cmd)
 		if idx < 0 {
-			t.Fatalf("SubmitToServer(%q) failed", cmd)
+			h.t.Fatalf("SubmitToServer(%q) failed", cmd)
 		}
 	}
 
-	// Ждём снэпшот на лидере.
 	if !h.waitForSnapshot(leaderID, 10*time.Second) {
-		t.Fatal("snapshot was not created on leader")
+		h.t.Fatal("snapshot was not created on leader")
 	}
 	snapIdx := h.getSnapshotIndex(leaderID)
-	t.Logf("leader snapshot index: %d", snapIdx)
 
-	// Подключаем follower обратно.
+	isBefore := h.installSnapshotCount(followerID)
 	h.ReconnectPeer(followerID)
-	t.Log("reconnected follower")
+	return leaderID, followerID, snapIdx, isBefore
+}
 
-	// Ждём, пока follower получит снэпшот.
-	sleepMs(ReelectionTimeoutMs * 3)
-
-	// Проверяем, что follower догнал состояние.
-	followerSnapIdx := h.getSnapshotIndex(followerID)
-	t.Logf("follower snapshot index: %d", followerSnapIdx)
-
-	// Follower должен иметь снэпшот после InstallSnapshot.
-	if followerSnapIdx <= 0 {
-		// Иногда InstallSnapshot не срабатывает сразу — даём ещё время.
-		sleepMs(ReelectionTimeoutMs * 2)
-		followerSnapIdx = h.getSnapshotIndex(followerID)
+// waitForCatchUp ждёт (опросом с дедлайном), пока follower догонит лидера
+// по lastLogIndex.
+func (h *snapshotHarness) waitForCatchUp(leaderID, followerID int, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for {
+		if h.getLastLogIndex(followerID) >= h.getLastLogIndex(leaderID) {
+			return
+		}
+		if time.Now().After(deadline) {
+			h.t.Fatalf("follower %d did not catch up to leader %d: lastLogIndex follower=%d leader=%d",
+				followerID, leaderID, h.getLastLogIndex(followerID), h.getLastLogIndex(leaderID))
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	if followerSnapIdx <= 0 {
-		// Проверяем хотя бы то, что состояние FSM совпадает.
-		leaderFSM := h.fsms[leaderID]
-		followerFSM := h.fsms[followerID]
+}
 
-		leaderFSM.mu.Lock()
-		leaderState := make(map[string]string)
-		for k, v := range leaderFSM.state {
-			leaderState[k] = v
-		}
-		leaderFSM.mu.Unlock()
-
-		followerFSM.mu.Lock()
-		followerState := make(map[string]string)
-		for k, v := range followerFSM.state {
-			followerState[k] = v
-		}
-		followerFSM.mu.Unlock()
-
-		if len(leaderState) != len(followerState) {
-			t.Fatalf("state mismatch: leader has %d keys, follower has %d keys",
-				len(leaderState), len(followerState))
-		}
-		for k, v := range leaderState {
-			if followerState[k] != v {
-				t.Fatalf("state mismatch for key %q: leader=%q, follower=%q", k, v, followerState[k])
+// checkLogIntersection проверяет, что журналы двух узлов совпадают на
+// пересечении диапазонов индексов (Log Matching Property на пересечении).
+func (h *snapshotHarness) checkLogIntersection(a, b int) {
+	la := h.getLogEntries(a)
+	lb := h.getLogEntries(b)
+	ia, ib := 0, 0
+	for ia < len(la) && ib < len(lb) {
+		switch {
+		case la[ia].Index < lb[ib].Index:
+			ia++
+		case lb[ib].Index < la[ia].Index:
+			ib++
+		default:
+			if la[ia].Term != lb[ib].Term {
+				h.t.Fatalf("log mismatch at index %d: node %d term=%d, node %d term=%d",
+					la[ia].Index, a, la[ia].Term, b, lb[ib].Term)
 			}
+			ia++
+			ib++
 		}
-		t.Log("follower caught up via AppendEntries (snapshot index = -1)")
+	}
+}
+
+// fsmStateEqual сравнивает состояния FSM двух узлов (без Fatalf —
+// используется опросом).
+func (h *snapshotHarness) fsmStateEqual(a, b int) bool {
+	fsmA := h.fsms[a]
+	fsmB := h.fsms[b]
+	fsmA.mu.Lock()
+	defer fsmA.mu.Unlock()
+	fsmB.mu.Lock()
+	defer fsmB.mu.Unlock()
+	if len(fsmA.state) != len(fsmB.state) {
+		return false
+	}
+	for k, v := range fsmA.state {
+		if fsmB.state[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
+// checkFSMStateEqual — утверждение равенства FSM двух узлов.
+func (h *snapshotHarness) checkFSMStateEqual(a, b int) {
+	if !h.fsmStateEqual(a, b) {
+		h.t.Fatalf("FSM state mismatch between nodes %d and %d", a, b)
+	}
+}
+
+// waitForFSMStateEqual ждёт (опросом с дедлайном), пока FSM узла b
+// сравняется с FSM узла a. Применение записей к FSM отстаёт от
+// репликации журнала (процесс apply асинхронен), поэтому равенства
+// lastLogIndex недостаточно для утверждения о FSM.
+func (h *snapshotHarness) waitForFSMStateEqual(a, b int, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for !h.fsmStateEqual(a, b) {
+		if time.Now().After(deadline) {
+			h.checkFSMStateEqual(a, b)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -846,5 +1047,537 @@ func TestInmemTransport_InstallSnapshot(t *testing.T) {
 	}
 	if !reply.Success {
 		t.Fatal("InstallSnapshot: Success = false")
+	}
+}
+
+// ============================================================
+// Матрица Case A…F (TASK-004, architecture-2.md §18)
+// ============================================================
+
+// sendInstallSnapshotManually отправляет InstallSnapshot напрямую через
+// сырой транспорт узла (в обход counting-обёртки — ручные отправки не
+// учитываются в installSnapshotCount). Данные и метаданные — из
+// снапшот-стора отправителя.
+func (h *snapshotHarness) sendInstallSnapshotManually(from, to, lastLogIndex int) InstallSnapshotResponse {
+	snaps, err := h.stores[from].List()
+	if err != nil || len(snaps) == 0 {
+		h.t.Fatalf("node %d has no snapshot to send: err=%v", from, err)
+	}
+	meta, reader, err := h.stores[from].Open(snaps[0].ID)
+	if err != nil {
+		h.t.Fatalf("open snapshot: %v", err)
+	}
+	data, err := io.ReadAll(reader)
+	_ = reader.Close()
+	if err != nil {
+		h.t.Fatalf("read snapshot data: %v", err)
+	}
+	cfgData, _ := EncodeConfiguration(meta.Configuration)
+
+	h.cluster[from].mu.Lock()
+	term := h.cluster[from].cmState.currentTerm
+	h.cluster[from].mu.Unlock()
+
+	req := InstallSnapshotRequest{
+		RPCHeader:     RPCHeader{ProtocolVersion: ProtocolVersion, ServerID: from},
+		Term:          term,
+		LeaderID:      from,
+		LastLogIndex:  lastLogIndex,
+		LastLogTerm:   meta.Term,
+		Configuration: cfgData,
+		ConfigIndex:   meta.ConfigIndex,
+		DataSize:      int64(len(data)),
+	}
+	reply, err := h.transports[from].InstallSnapshot(ServerID(to), req, bytes.NewReader(data))
+	if err != nil {
+		h.t.Fatalf("manual InstallSnapshot: %v", err)
+	}
+	return reply
+}
+
+// TestSnapshot_CatchUpWithinTrailingWindow — Case A (TASK-006, ADR-P07-005):
+// follower отставал в пределах trailing-окна (≤128) → InstallSnapshot не
+// отправляется ни разу, догон — обычным AppendEntries. Заготовка создана
+// в TASK-004, рабочая реализация активируется TASK-006 (SA-003).
+func TestSnapshot_CatchUpWithinTrailingWindow(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 60*time.Second)()
+
+	h := newSnapshotHarness(t, 3)
+	defer h.Shutdown()
+
+	// Широкое trailing-окно: записи follower'а остаются в срезе лидера.
+	for i := 0; i < h.n; i++ {
+		h.cluster[i].SetSnapshotConfig(30, 50*time.Millisecond, 128)
+	}
+
+	leaderID := h.waitForSingleLeader()
+	if leaderID < 0 {
+		t.Fatal("no leader elected")
+	}
+	followerID := (leaderID + 1) % 3
+
+	// Синхронизируем кластер и даём лидеру скомпактировать журнал при
+	// всех подключённых узлах: 160 команд при threshold=30 дают несколько
+	// снапшотов, а trailing-окно (128) удерживает записи в срезе.
+	for i := 0; i < 160; i++ {
+		cmd := fmt.Sprintf("k%d=v%d", i, i)
+		if idx := h.SubmitToServer(leaderID, cmd); idx < 0 {
+			t.Fatalf("SubmitToServer(%q) failed", cmd)
+		}
+	}
+	if !h.waitForSnapshot(leaderID, 10*time.Second) {
+		t.Fatal("snapshot was not created on leader")
+	}
+	h.waitForCatchUp(leaderID, followerID, 10*time.Second)
+
+	// Отключаем follower и добавляем 10 команд — отставание в пределах
+	// trailing-окна (128) и порога снэпшота (30).
+	isBefore := h.installSnapshotCount(followerID)
+	h.DisconnectPeer(followerID)
+	for i := 160; i < 170; i++ {
+		cmd := fmt.Sprintf("k%d=v%d", i, i)
+		if idx := h.SubmitToServer(leaderID, cmd); idx < 0 {
+			t.Fatalf("SubmitToServer(%q) failed", cmd)
+		}
+	}
+
+	h.ReconnectPeer(followerID)
+	h.waitForCatchUp(leaderID, followerID, 10*time.Second)
+
+	if n := h.installSnapshotCount(followerID) - isBefore; n != 0 {
+		t.Fatalf("installSnapshotCount delta=%d, want 0 (follower within trailing window)", n)
+	}
+	h.waitForFSMStateEqual(leaderID, followerID, 10*time.Second)
+	h.checkLogIntersection(leaderID, followerID)
+}
+
+// TestSnapshot_CatchUpBehindSnapshot — Case B (TASK-002/004): follower
+// отставал за границу снапшота → ровно один InstallSnapshot, затем
+// догон через AppendEntries. Прямая проверка, что отвергнутая Option A
+// (кламп nextIndex по lastSnapshotIndex+1, отключающий InstallSnapshot)
+// не реализована.
+func TestSnapshot_CatchUpBehindSnapshot(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 60*time.Second)()
+
+	h := newSnapshotHarness(t, 3)
+	defer h.Shutdown()
+
+	leaderID, followerID, snapIdx, isBefore := h.driveSnapshotInstall(20, 8, 30)
+
+	if !h.waitForSnapshot(followerID, 10*time.Second) {
+		t.Fatalf("follower %d did not install snapshot", followerID)
+	}
+	h.waitForCatchUp(leaderID, followerID, 10*time.Second)
+
+	// Ровно один InstallSnapshot после переподключения (ADR-P07-002
+	// Validation Case B: отвергнутая Option A не реализована — IS
+	// по-прежнему отправляется, но ровно один раз, без цикла).
+	if n := h.installSnapshotCount(followerID) - isBefore; n != 1 {
+		t.Fatalf("installSnapshotCount after reconnect=%d, want exactly 1 (behind snapshot boundary)", n)
+	}
+	if h.getLastLogIndex(followerID) < snapIdx {
+		t.Fatalf("follower lastLogIndex=%d < leader snapshot index %d",
+			h.getLastLogIndex(followerID), snapIdx)
+	}
+	h.waitForFSMStateEqual(leaderID, followerID, 10*time.Second)
+	h.checkLogIntersection(leaderID, followerID)
+}
+
+// TestSnapshot_InstallPostConditions — Case C (TASK-001/004): после
+// установки снапшота, покрывающего весь лог follower'а, выполнены
+// INV-S1, INV-S2, INV-S4; lastLogIndexAndTerm() согласован с метаданными
+// снапшота (защита Leader Completeness: logOk в RequestVote/PreVote
+// считается против корректной пары, а не (-1,-1)).
+func TestSnapshot_InstallPostConditions(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 60*time.Second)()
+
+	h := newSnapshotHarness(t, 3)
+	defer h.Shutdown()
+
+	_, followerID, _, _ := h.driveSnapshotInstall(20, 8, 30)
+
+	if !h.waitForSnapshot(followerID, 10*time.Second) {
+		t.Fatalf("follower %d did not install snapshot", followerID)
+	}
+
+	cm := h.cluster[followerID]
+	cm.mu.Lock()
+	lastSnapshotIndex := cm.cmState.lastSnapshotIndex
+	lastSnapshotTerm := cm.cmState.lastSnapshotTerm
+	lastLogIndex := cm.cmState.lastLogIndex
+	lastLogTerm := cm.cmState.lastLogTerm
+	lastApplied := cm.cmState.lastApplied
+	commitIndex := cm.cmState.commitIndex
+	logLen := len(cm.cmState.log)
+	lli, llt := cm.lastLogIndexAndTerm()
+	cm.mu.Unlock()
+
+	if lastLogIndex < lastSnapshotIndex {
+		t.Fatalf("INV-S1 violated: lastLogIndex=%d < lastSnapshotIndex=%d", lastLogIndex, lastSnapshotIndex)
+	}
+	if logLen == 0 && (lastLogIndex != lastSnapshotIndex || lastLogTerm != lastSnapshotTerm) {
+		t.Fatalf("INV-S2 violated: lastLog=(%d,%d), snapshot=(%d,%d)",
+			lastLogIndex, lastLogTerm, lastSnapshotIndex, lastSnapshotTerm)
+	}
+	if lastApplied > lastLogIndex || commitIndex > lastLogIndex {
+		t.Fatalf("INV-S4 violated: lastApplied=%d commitIndex=%d > lastLogIndex=%d",
+			lastApplied, commitIndex, lastLogIndex)
+	}
+	if lli != lastLogIndex || llt != lastLogTerm {
+		t.Fatalf("lastLogIndexAndTerm() = (%d,%d), want (%d,%d) — vote-safety pair corrupted",
+			lli, llt, lastLogIndex, lastLogTerm)
+	}
+}
+
+// TestSnapshot_InstallThenAppendEntries — Case D (TASK-004, INV-S5):
+// сразу после установки снапшота AppendEntries с PrevLogIndex ==
+// meta.Index обязан завершиться Success:true, а журнал follower'а —
+// достроиться записями meta.Index+1….
+func TestSnapshot_InstallThenAppendEntries(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 60*time.Second)()
+
+	h := newSnapshotHarness(t, 3)
+	defer h.Shutdown()
+
+	leaderID, followerID, snapIdx, _ := h.driveSnapshotInstall(20, 8, 30)
+
+	if !h.waitForSnapshot(followerID, 10*time.Second) {
+		t.Fatalf("follower %d did not install snapshot", followerID)
+	}
+
+	// Формируем AE от лидера: prev == snapIdx, записи snapIdx+1….
+	leader := h.cluster[leaderID]
+	leader.mu.Lock()
+	prevLogTerm := leader.lookupTerm(snapIdx)
+	entries := append([]LogEntry{}, leader.cmState.log[leader.logPosition(snapIdx+1):]...)
+	leaderCommit := leader.cmState.commitIndex
+	term := leader.cmState.currentTerm
+	leader.mu.Unlock()
+
+	var reply AppendEntriesReply
+	err := h.cluster[followerID].AppendEntries(AppendEntriesArgs{
+		RPCHeader:    RPCHeader{ProtocolVersion: ProtocolVersion, ServerID: leaderID},
+		Term:         term,
+		LeaderID:     leaderID,
+		PrevLogIndex: snapIdx,
+		PrevLogTerm:  prevLogTerm,
+		Entries:      entries,
+		LeaderCommit: leaderCommit,
+	}, &reply)
+	if err != nil {
+		t.Fatalf("AppendEntries after snapshot: %v", err)
+	}
+	if !reply.Success {
+		t.Fatalf("AppendEntries with PrevLogIndex=%d after snapshot failed: %+v", snapIdx, reply)
+	}
+
+	// Журнал достроился записями snapIdx+1….
+	if h.getLastLogIndex(followerID) < h.getLastLogIndex(leaderID) {
+		t.Fatalf("follower lastLogIndex=%d < leader lastLogIndex=%d",
+			h.getLastLogIndex(followerID), h.getLastLogIndex(leaderID))
+	}
+	h.checkLogIntersection(leaderID, followerID)
+}
+
+// TestSnapshot_InstallRestartFollowUp — Case E (TASK-004): рестарт
+// follower'а после установки снапшота: persistent-состояние консистентно
+// (стартовый путь не отказывает, INV-S1 держится), FSM восстановлен из
+// снапшота, догон продолжается.
+func TestSnapshot_InstallRestartFollowUp(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 60*time.Second)()
+
+	h := newSnapshotHarness(t, 3)
+	defer h.Shutdown()
+
+	leaderID, followerID, snapIdx, _ := h.driveSnapshotInstall(20, 8, 30)
+
+	if !h.waitForSnapshot(followerID, 10*time.Second) {
+		t.Fatalf("follower %d did not install snapshot", followerID)
+	}
+	h.waitForCatchUp(leaderID, followerID, 10*time.Second)
+	h.waitForFSMStateEqual(leaderID, followerID, 10*time.Second)
+
+	h.CrashPeer(followerID)
+	h.RestartPeer(followerID)
+
+	// После рестарта persistent-состояние консистентно.
+	if h.getLastLogIndex(followerID) < h.getLastSnapshotIndex(followerID) {
+		t.Fatalf("after restart: lastLogIndex=%d < lastSnapshotIndex=%d — continuity violated",
+			h.getLastLogIndex(followerID), h.getLastSnapshotIndex(followerID))
+	}
+	if h.getLastSnapshotIndex(followerID) < snapIdx {
+		t.Fatalf("after restart: lastSnapshotIndex=%d < %d", h.getLastSnapshotIndex(followerID), snapIdx)
+	}
+	// FSM восстановлен из снапшота: ключ ниже линии компактирования жив.
+	if v := h.fsms[followerID].getState("k0"); v != "v0" {
+		t.Fatalf("k0 = %q after restart, want v0 (FSM not restored from snapshot)", v)
+	}
+
+	// Догон продолжается: новая команда доезжает до follower'а.
+	if idx := h.SubmitToServer(leaderID, "kpost=vpost"); idx < 0 {
+		t.Fatal("SubmitToServer after follower restart failed")
+	}
+	h.waitForCatchUp(leaderID, followerID, 10*time.Second)
+	h.waitForFSMStateEqual(leaderID, followerID, 10*time.Second)
+}
+
+// TestSnapshot_InstallIdempotency — Case F (TASK-003/004, ADR-P07-003):
+// повторная отправка того же и более старого снапшота — no-op с
+// Success:true; commitIndex/lastApplied не откатываются; цикла нет
+// (число InstallSnapshot не растёт за окно наблюдения).
+func TestSnapshot_InstallIdempotency(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 60*time.Second)()
+
+	h := newSnapshotHarness(t, 3)
+	defer h.Shutdown()
+
+	leaderID, followerID, _, isBefore := h.driveSnapshotInstall(20, 8, 30)
+
+	if !h.waitForSnapshot(followerID, 10*time.Second) {
+		t.Fatalf("follower %d did not install snapshot", followerID)
+	}
+	h.waitForCatchUp(leaderID, followerID, 10*time.Second)
+
+	if n := h.installSnapshotCount(followerID) - isBefore; n != 1 {
+		t.Fatalf("installSnapshotCount after reconnect=%d, want 1 after natural catch-up", n)
+	}
+
+	snapIdx := h.getSnapshotIndex(followerID)
+	commitBefore := h.getCommitIndex(followerID)
+	appliedBefore := h.getLastApplied(followerID)
+
+	// Повторная установка того же снапшота → no-op Success:true.
+	reply := h.sendInstallSnapshotManually(leaderID, followerID, snapIdx)
+	if !reply.Success {
+		t.Fatalf("repeated InstallSnapshot: Success=false, want true (idempotent no-op)")
+	}
+	// Более старый снапшот → no-op Success:true, состояние не откатывается.
+	reply = h.sendInstallSnapshotManually(leaderID, followerID, snapIdx-1)
+	if !reply.Success {
+		t.Fatalf("stale InstallSnapshot: Success=false, want true (no-op)")
+	}
+
+	if h.getCommitIndex(followerID) < commitBefore || h.getLastApplied(followerID) < appliedBefore {
+		t.Fatalf("commitIndex/lastApplied rolled back: commit=%d->%d applied=%d->%d",
+			commitBefore, h.getCommitIndex(followerID), appliedBefore, h.getLastApplied(followerID))
+	}
+
+	// Счётчик no-op'ов на follower'е учитывает обе отправки.
+	cm := h.cluster[followerID]
+	cm.mu.Lock()
+	stale := peerSum(cm.counters.installSnapshotSkippedStale)
+	cm.mu.Unlock()
+	if stale < 2 {
+		t.Fatalf("installSnapshotSkippedStale = %d, want >= 2", stale)
+	}
+
+	// Цикла нет: за окно наблюдения новых InstallSnapshot не появляется.
+	before := h.installSnapshotCount(followerID)
+	sleepMs(ReelectionTimeoutMs * 2)
+	if n := h.installSnapshotCount(followerID); n != before {
+		t.Fatalf("InstallSnapshot storm: count %d -> %d", before, n)
+	}
+}
+
+// TestSnapshot_InstallQuorumFiveNodes — TASK-008 тест 1: кластер из пяти
+// узлов, два follower'а догнаны исключительно через InstallSnapshot —
+// commitIndex продвигается, Apply-future разрешаются (кворум учитывает
+// догнанных снапшотом).
+func TestSnapshot_InstallQuorumFiveNodes(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 90*time.Second)()
+
+	h := newSnapshotHarness(t, 5)
+	defer h.Shutdown()
+
+	for i := 0; i < h.n; i++ {
+		h.cluster[i].SetSnapshotConfig(20, 50*time.Millisecond, 2)
+	}
+
+	leaderID := h.waitForSingleLeader()
+	if leaderID < 0 {
+		t.Fatal("no leader elected")
+	}
+	f1 := (leaderID + 1) % 5
+	f2 := (leaderID + 2) % 5
+
+	// Seed-запись: f1 и f2 гарантированно имеют записи журнала до
+	// отключения (детерминированность догона через InstallSnapshot).
+	if idx := h.SubmitToServer(leaderID, "kseed=vseed"); idx < 0 {
+		t.Fatal("seed command failed")
+	}
+	h.waitForCatchUp(leaderID, f1, 10*time.Second)
+	h.waitForCatchUp(leaderID, f2, 10*time.Second)
+
+	// Два follower'а отключены: отстанут за границу снапшота (trailing=2).
+	h.DisconnectPeer(f1)
+	h.DisconnectPeer(f2)
+
+	for i := 0; i < 40; i++ {
+		cmd := fmt.Sprintf("k%d=v%d", i, i)
+		if idx := h.SubmitToServer(leaderID, cmd); idx < 0 {
+			t.Fatalf("SubmitToServer(%q) failed", cmd)
+		}
+	}
+	if !h.waitForSnapshot(leaderID, 10*time.Second) {
+		t.Fatal("snapshot was not created on leader")
+	}
+
+	// Догон отставших — исключительно через InstallSnapshot.
+	h.ReconnectPeer(f1)
+	h.ReconnectPeer(f2)
+	if !h.waitForSnapshot(f1, 10*time.Second) || !h.waitForSnapshot(f2, 10*time.Second) {
+		t.Fatal("snapshot-caught followers did not install snapshot")
+	}
+	h.waitForCatchUp(leaderID, f1, 10*time.Second)
+	h.waitForCatchUp(leaderID, f2, 10*time.Second)
+
+	// Отключаем двух follower'ов, догнанных через AE: кворум теперь
+	// {leader, f1, f2}. Новая команда обязана закоммититься и примениться.
+	up1, up2 := -1, -1
+	for i := 0; i < h.n; i++ {
+		if i != leaderID && i != f1 && i != f2 {
+			if up1 < 0 {
+				up1 = i
+			} else {
+				up2 = i
+			}
+		}
+	}
+	h.DisconnectPeer(up1)
+	h.DisconnectPeer(up2)
+
+	idx := h.SubmitToServer(leaderID, "kq=vq")
+	if idx < 0 {
+		t.Fatal("apply did not commit with two snapshot-caught followers in quorum")
+	}
+}
+
+// TestReplicationBackoff_BoundsAttemptsToUnavailablePeer — TASK-007 тест 1:
+// недоступный пир, отставший за границу снапшота: число попыток
+// InstallSnapshot за фиксированное окно ограничено сверху backoff'ом
+// (до изменения — попытка на каждый heartbeat, ~30/с).
+func TestReplicationBackoff_BoundsAttemptsToUnavailablePeer(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 60*time.Second)()
+
+	h := newSnapshotHarness(t, 3)
+	defer h.Shutdown()
+
+	for i := 0; i < h.n; i++ {
+		h.cluster[i].SetSnapshotConfig(20, 50*time.Millisecond, 8)
+	}
+
+	leaderID := h.waitForSingleLeader()
+	if leaderID < 0 {
+		t.Fatal("no leader elected")
+	}
+	followerID := (leaderID + 1) % 3
+
+	// Seed-запись: follower имеет записи журнала до отключения, поэтому
+	// после снапшота лидер уходит именно в ветку InstallSnapshot
+	// (детерминированность — см. driveSnapshotInstall).
+	if idx := h.SubmitToServer(leaderID, "kseed=vseed"); idx < 0 {
+		t.Fatal("seed command failed")
+	}
+	h.waitForCatchUp(leaderID, followerID, 10*time.Second)
+
+	// Follower отключён: лидер будет безуспешно слать InstallSnapshot
+	// (транспортная ошибка) — backoff обязан ограничить частоту.
+	h.DisconnectPeer(followerID)
+	for i := 0; i < 30; i++ {
+		cmd := fmt.Sprintf("k%d=v%d", i, i)
+		if idx := h.SubmitToServer(leaderID, cmd); idx < 0 {
+			t.Fatalf("SubmitToServer(%q) failed", cmd)
+		}
+	}
+	if !h.waitForSnapshot(leaderID, 10*time.Second) {
+		t.Fatal("snapshot was not created on leader")
+	}
+
+	// Окно наблюдения: 3 секунды.
+	before := h.installSnapshotCount(followerID)
+	time.Sleep(3 * time.Second)
+	attempts := h.installSnapshotCount(followerID) - before
+
+	if attempts == 0 {
+		t.Fatal("no InstallSnapshot attempts — scenario broken")
+	}
+	if attempts > 12 {
+		t.Fatalf("InstallSnapshot attempts in 3s = %d, want <= 12 (backoff ceiling)", attempts)
+	}
+}
+
+// TestReplicationBackoff_RecoveryAfterReconnect — TASK-007 тест 2: пир
+// становится доступен — первый успешный RPC происходит вскоре после
+// переподключения, replFailures обнуляется после успеха. Потолок
+// задержки (1000 мс) проверяется детерминированно в
+// TestReplicationBackoffDelay_Clamp; здесь дедлайн 3 с — запас на
+// contention полного набора тестов (in-memory harness, один процесс).
+func TestReplicationBackoff_RecoveryAfterReconnect(t *testing.T) {
+	defer leaktest.CheckTimeout(t, 60*time.Second)()
+
+	h := newSnapshotHarness(t, 3)
+	defer h.Shutdown()
+
+	for i := 0; i < h.n; i++ {
+		h.cluster[i].SetSnapshotConfig(20, 50*time.Millisecond, 8)
+	}
+
+	leaderID := h.waitForSingleLeader()
+	if leaderID < 0 {
+		t.Fatal("no leader elected")
+	}
+	followerID := (leaderID + 1) % 3
+
+	// Seed-запись: детерминированный вход в ветку InstallSnapshot
+	// (см. driveSnapshotInstall).
+	if idx := h.SubmitToServer(leaderID, "kseed=vseed"); idx < 0 {
+		t.Fatal("seed command failed")
+	}
+	h.waitForCatchUp(leaderID, followerID, 10*time.Second)
+
+	// Точка отсчёта: matchIndex до отключения (после seed-записи > -1).
+	// Успешный RPC после переподключения определяется именно ростом
+	// matchIndex, а не значением > -1.
+	cm := h.cluster[leaderID]
+	cm.mu.Lock()
+	matchBefore := cm.leaderState.matchIndex[followerID]
+	cm.mu.Unlock()
+
+	h.DisconnectPeer(followerID)
+	for i := 0; i < 30; i++ {
+		cmd := fmt.Sprintf("k%d=v%d", i, i)
+		if idx := h.SubmitToServer(leaderID, cmd); idx < 0 {
+			t.Fatalf("SubmitToServer(%q) failed", cmd)
+		}
+	}
+	if !h.waitForSnapshot(leaderID, 10*time.Second) {
+		t.Fatal("snapshot was not created on leader")
+	}
+
+	// Даём накопиться транспортным ошибкам (задержка выросла).
+	time.Sleep(1500 * time.Millisecond)
+
+	h.ReconnectPeer(followerID)
+	start := time.Now()
+
+	// Ждём первого успешного RPC (matchIndex на лидере растёт выше
+	// значения, зафиксированного до отключения).
+	deadline := start.Add(3000 * time.Millisecond)
+	for {
+		cm := h.cluster[leaderID]
+		cm.mu.Lock()
+		mi := cm.leaderState.matchIndex[followerID]
+		rf := cm.leaderState.replFailures[followerID]
+		cm.mu.Unlock()
+		if mi > matchBefore {
+			if rf != 0 {
+				t.Fatalf("replFailures = %d after first success, want 0", rf)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("first successful RPC delayed beyond backoff ceiling + load margin")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

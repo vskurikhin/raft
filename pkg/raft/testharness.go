@@ -373,6 +373,41 @@ func (h *Harness) CheckSingleLeader() (int, int) {
 	return -1, -1
 }
 
+// WaitForSingleLeader ждёт, пока среди подключённых узлов останется
+// ровно один лидер, и возвращает его ID и term. Backoff репликации
+// (ADR-P07-006) задерживает step-down прежнего лидера (его первые AE
+// к вернувшимся пирам откладываются до 1000 мс), поэтому после
+// переподключения окно «два лидера» дольше, чем предполагали прежние
+// фиксированные sleep в тестах.
+func (h *Harness) WaitForSingleLeader(timeout time.Duration) (int, int) {
+	h.t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		leaderId, leaderTerm, multiple := -1, -1, false
+		for i := 0; i < h.n; i++ {
+			if !h.connected[i] {
+				continue
+			}
+			_, term, isLeader := h.cluster[i].Report()
+			if isLeader {
+				if leaderId >= 0 {
+					multiple = true
+					break
+				}
+				leaderId, leaderTerm = i, term
+			}
+		}
+		if !multiple && leaderId >= 0 {
+			return leaderId, leaderTerm
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return h.CheckSingleLeader()
+}
+
 // GetTerm возвращает текущий term указанного сервера.
 // Используется в тестах для проверки стабильности term при Pre-Vote.
 func (h *Harness) GetTerm(serverID int) int {
@@ -461,10 +496,12 @@ func (h *Harness) CheckCommittedN(cmd int, n int) {
 }
 
 // WaitForCommit ждёт, пока команда cmd не будет зафиксирована
-// на n серверах (с таймаутом 500ms), затем проверяет фиксацию.
+// на n серверах, затем проверяет фиксацию. Дедлайн покрывает потолок
+// backoff репликации (ADR-P07-006: доставка переподключённому пиру
+// может задерживаться до 1000 мс) и замедление под -race.
 func (h *Harness) WaitForCommit(cmd int, n int) {
 	h.t.Helper()
-	deadline := time.Now().Add(300 * time.Millisecond)
+	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		h.mu.Lock()
 		nc := 0
@@ -485,6 +522,47 @@ func (h *Harness) WaitForCommit(cmd int, n int) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	h.CheckCommittedN(cmd, n)
+}
+
+// WaitForCommitAll ждёт, пока команда cmd не будет зафиксирована на всех
+// подключённых серверах с одинаковым числом коммитов — достаточное
+// условие для CheckCommitted. Учитывает backoff репликации (ADR-P07-006):
+// доставка переподключённому пиру может задерживаться до 1000 мс,
+// фиксированный sleep недостаточен.
+func (h *Harness) WaitForCommitAll(cmd int, timeout time.Duration) {
+	h.t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		h.mu.Lock()
+		equal, found := true, true
+		wantLen := -1
+		for i := 0; i < h.n; i++ {
+			if !h.connected[i] {
+				continue
+			}
+			if wantLen < 0 {
+				wantLen = len(h.commits[i])
+			} else if len(h.commits[i]) != wantLen {
+				equal = false
+			}
+			has := false
+			for _, c := range h.commits[i] {
+				if c.Data.(int) == cmd {
+					has = true
+					break
+				}
+			}
+			if !has {
+				found = false
+			}
+		}
+		h.mu.Unlock()
+		if equal && found {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	h.CheckCommitted(cmd)
 }
 
 // CheckNotCommitted проверяет, что команда cmd ещё не зафиксирована.

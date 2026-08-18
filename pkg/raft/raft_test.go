@@ -605,13 +605,16 @@ func TestDisconnectAfterSubmit(t *testing.T) {
 	h.CheckSingleLeader()
 
 	h.ReconnectPeer(origLeaderId)
-	sleepMs(100)
-	newLeaderId, _ := h.CheckSingleLeader()
+	// Backoff репликации (ADR-P07-006) задерживает step-down прежнего
+	// лидера до 1000 мс — ждём схождения к единственному лидеру.
+	newLeaderId, _ := h.WaitForSingleLeader(3 * time.Second)
 
 	// После отправки новой команды 6 запись 5 будет закоммичена вместе с 6,
 	// независимо от того, успела ли она закоммититься до дисконнекта.
+	// Backoff репликации (ADR-P07-006) может задержать доставку
+	// переподключённому узлу до 1000 мс — ждём опросом.
 	h.SubmitToServer(newLeaderId, 6)
-	sleepMs(50)
+	h.WaitForCommitAll(6, 3*time.Second)
 	h.CheckCommittedN(5, 3)
 	h.CheckCommittedN(6, 3)
 }
@@ -970,8 +973,11 @@ func TestElectionSafetyStress(t *testing.T) {
 
 		h.CheckSingleLeader()
 
+		// Backoff репликации (ADR-P07-006, потолок 1000 мс) задерживает
+		// step-down прежнего лидера: его первые AE к вернувшимся пирам
+		// откладываются, поэтому окно «два лидера» дольше прежних 66 мс.
 		h.ReconnectPeer(leaderId)
-		sleepMs(HeartbeatTimeoutMs * 2)
+		h.WaitForSingleLeader(3 * time.Second)
 		h.CheckSingleLeader()
 	}
 }
@@ -1655,11 +1661,14 @@ func TestCommitmentInteg_CommitAfterReconnect(t *testing.T) {
 	future := h.cluster[lid].Apply(42, 0)
 	sleepMs(HeartbeatTimeoutMs)
 
-	// Подключаем одного follower -> должен быть кворум
+	// Подключаем одного follower -> должен быть кворум.
+	// Backoff репликации (ADR-P07-006, потолок 1000 мс) может задержать
+	// доставку коммита переподключённому follower'у — фиксированный sleep
+	// недостаточен, ждём опросом.
 	h.ReconnectPeer(follower)
-	sleepMs(HeartbeatTimeoutMs * 3)
 
 	if err := future.Error(); err == nil {
+		h.WaitForCommitAll(42, 3*time.Second)
 		h.CheckCommitted(42)
 	} else {
 		// Команда могла быть отклонена из-за stepDown — нормально
@@ -2789,8 +2798,11 @@ func TestDedup_AllServersConsistentAfterCrash(t *testing.T) {
 	h.WaitForCommit(59, 2)
 
 	// Перезапускаем follower и ждём синхронизации.
+	// Backoff репликации (ADR-P07-006, потолок 1000 мс) может задержать
+	// догон перезапущенного follower'а — фиксированный sleep недостаточен,
+	// ждём опросом.
 	h.RestartPeer(followerID)
-	sleepMs(100 * Quantum)
+	h.WaitForCommitAll(59, 3*time.Second)
 
 	// Проверить, что все 60 команд закоммичены.
 	for i := 0; i < 60; i++ {
@@ -2843,7 +2855,10 @@ func TestDedup_RapidLeadershipChange(t *testing.T) {
 		sleepMs(HeartbeatTimeoutMs * 3)
 	}
 
-	// Проверяем целостность: последняя команда закоммичена.
+	// Проверяем целостность: последняя команда закоммичена на всех
+	// подключённых серверах. Backoff репликации (ADR-P07-006) может
+	// задержать догон перезапущенного узла до 1000 мс — ждём опросом.
+	h.WaitForCommitAll(409, 3*time.Second)
 	h.CheckCommitted(409)
 }
 

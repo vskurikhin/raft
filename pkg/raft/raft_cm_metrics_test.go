@@ -3,6 +3,7 @@ package raft
 import (
 	"io"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -232,6 +233,129 @@ func TestLatencyTraceEnabledPredicate(t *testing.T) {
 	}
 	if traceEnabled(TraceCM) {
 		t.Errorf("traceEnabled(TraceCM) = true, want false")
+	}
+}
+
+// TestFailedAETraceReportsActualNextIndex — TASK-005 тест 4
+// (ADR-P07-008 п.3): текст трассировки неудачного AE печатает фактически
+// присвоенное значение nextIndex (не ni-1) и поля matchIndex/ConflictIndex/
+// ConflictTerm — ровно тот набор, которого не хватило при разборе обоих
+// инцидентов. Формат проверяется через чистую функцию: мутация TraceCM и
+// _traceLogger в тестах запрещена (ADR-P06-005, P06R2-02 T5c).
+func TestFailedAETraceReportsActualNextIndex(t *testing.T) {
+	// Значения инцидента: фактически присвоенный nextIndex = 0 при
+	// matchIndex = 13490; старая трасса печатала бы «13490» (ni-1).
+	got := failedAETrace(3, 0, 13490, 0, -1)
+	want := "AppendEntries reply from 3 !success: nextIndex := 0 (ConflictIndex=0, ConflictTerm=-1, matchIndex=13490)"
+	if got != want {
+		t.Fatalf("failedAETrace = %q\nwant          = %q", got, want)
+	}
+}
+
+// TestRaftCountersReportFormat — TASK-005 тест 1 (новая строка отчёта):
+// счётчики и per-peer gauge nextIndex/matchIndex форматируются
+// детерминированно (пиры — по возрастанию ID). Существующая строка
+// латентности защищена отдельно (TestLatencyReportFormat, ADR-P06-003/005).
+func TestRaftCountersReportFormat(t *testing.T) {
+	c := &raftCounters{
+		installSnapshotSent:         map[int]int64{2: 3, 1: 4},
+		installSnapshotSkippedStale: map[int]int64{1: 2},
+		appendEntriesRejected:       map[int]int64{1: 7},
+		nextIndexRejectionIgnored:   map[int]int64{1: 1},
+	}
+	c.installSnapshotReceived.Add(5)
+	c.snapshotLogBoundaryViolation.Add(0)
+	ls := &leaderState{
+		nextIndex:  map[int]int{2: 30, 1: 25},
+		matchIndex: map[int]int{2: 29, 1: 24},
+	}
+	got := c.report(ls)
+	want := "ISsent=7 ISrecv=5 ISstale=2 AErej=7 NIrejIgn=1 BndViol=0 p1:ni=25/mi=24 p2:ni=30/mi=29"
+	if got != want {
+		t.Fatalf("report = %q\nwant   = %q", got, want)
+	}
+}
+
+// TestCounters_DistinguishSnapshotLoop — TASK-005 тест 2
+// (ADR-P07-008 Validation): искусственно смоделированный цикл
+// «InstallSnapshot → AppendEntries-failure» делает наблюдаемым рост
+// installSnapshotSent и appendEntriesRejected — однозначно отличимый
+// от нормального догона (ISsent=1, AErej=0). Одновременно проверяется
+// предохранитель ADR-P07-002: повторная отсылка снапшота блокируется,
+// nextIndex остаётся согласованным (snapshotIndex+1, а не 0).
+func TestCounters_DistinguishSnapshotLoop(t *testing.T) {
+	defer leaktest.CheckTimeout(t, time.Second)()
+
+	mock := &mockTransportAE{
+		failReply: true, failConflictIndex: 0, failConflictTerm: -1,
+		replyTerm: 1,
+	}
+	tracker := newCommitmentTracker(0, make(chan int, 1), 1, -1)
+	cm := &ConsensusModule{
+		leaderState: leaderState{
+			nextIndex:         map[int]int{1: 1},
+			matchIndex:        map[int]int{1: -1},
+			inflightAE:        map[int]*atomic.Bool{1: new(atomic.Bool)},
+			commitmentTracker: tracker,
+		},
+		cmState: cmState{
+			state:             Leader,
+			currentTerm:       1,
+			commitIndex:       -1,
+			lastLogIndex:      5,
+			lastLogTerm:       2,
+			lastSnapshotIndex: 5,
+			lastSnapshotTerm:  2,
+			log:               []LogEntry{},
+			termIndexMap:      make(map[int]int),
+			configurations: configurations{
+				committed: Configuration{ConfigServers: []ConfigServer{{ID: 0, Suffrage: Voter}, {ID: 1, Suffrage: Voter}}},
+				latest:    Configuration{ConfigServers: []ConfigServer{{ID: 0, Suffrage: Voter}, {ID: 1, Suffrage: Voter}}},
+			},
+		},
+		id:        0,
+		transport: mock,
+		snapshotStore: &mockSnapshotStoreCfg{
+			listResult: []*SnapshotMeta{{ID: "snap", Index: 5, Term: 2, Size: 0}},
+			openMeta:   &SnapshotMeta{ID: "snap", Index: 5, Term: 2, Size: 0},
+		},
+	}
+	tracker.setConfiguration([]int{0, 1}, cm.lookupTerm)
+	cm.leaderState.inflightAE[1].Store(false)
+
+	// Три итерации искусственного цикла: каждая итерация сбрасывает
+	// состояние репликации так, как его портил бы повреждённый follower
+	// (nextIndex/matchIndex в начало), затем — пара «IS-успех →
+	// AE-отказ».
+	const iterations = 3
+	for i := 0; i < iterations; i++ {
+		cm.mu.Lock()
+		cm.leaderState.nextIndex[1] = 1
+		cm.leaderState.matchIndex[1] = -1
+		cm.mu.Unlock()
+
+		cm.leaderSendAEsToPeer(1, 1, 0) // ветка снапшота → успех IS
+		cm.leaderSendAEsToPeer(1, 1, 0) // ветка AE → отказ CI=0
+	}
+
+	cm.mu.Lock()
+	isSent := cm.counters.installSnapshotSent[1]
+	aeRej := cm.counters.appendEntriesRejected[1]
+	niRejIgn := cm.counters.nextIndexRejectionIgnored[1]
+	nextIndex := cm.leaderState.nextIndex[1]
+	cm.mu.Unlock()
+
+	if isSent != iterations {
+		t.Fatalf("installSnapshotSent = %d, want %d", isSent, iterations)
+	}
+	if aeRej != iterations {
+		t.Fatalf("appendEntriesRejected = %d, want %d", aeRej, iterations)
+	}
+	if niRejIgn != iterations {
+		t.Fatalf("nextIndexRejectionIgnored = %d, want %d (impossible rejections blocked)", niRejIgn, iterations)
+	}
+	if nextIndex != 6 {
+		t.Fatalf("nextIndex = %d, want 6 (snapshotIndex+1) — loop must not corrupt replication state", nextIndex)
 	}
 }
 

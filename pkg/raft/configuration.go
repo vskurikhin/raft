@@ -104,8 +104,6 @@ func checkConfiguration(cfg Configuration) error {
 }
 
 // nextConfiguration вычисляет новую конфигурацию на основе текущей и запроса.
-//
-//nolint:funlen
 func nextConfiguration(current Configuration, currentIndex int, req configurationChangeRequest) (Configuration, error) {
 	if err := checkConfiguration(current); err != nil {
 		return Configuration{}, err

@@ -1,8 +1,11 @@
 package raft
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
-func (cm *ConsensusModule) nextIndexArgsEntries(peerID, savedCurrentTerm int) (int, AppendEntriesArgs, []LogEntry) {
+func (cm *ConsensusModule) nextIndexArgsEntries(peerID, savedCurrentTerm int) (int, AppendEntriesArgs, []LogEntry, bool) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	ni := cm.leaderState.nextIndex[peerID]
@@ -11,6 +14,12 @@ func (cm *ConsensusModule) nextIndexArgsEntries(peerID, savedCurrentTerm int) (i
 	if 0 <= prevLogIndex && prevLogIndex <= cm.cmState.lastLogIndex {
 		prevLogTerm = cm.lookupTerm(prevLogIndex)
 	}
+	// Явная проверка обслуживаемости запроса (ADR-P07-005): для
+	// PrevLogIndex >= 0 терм обязан быть известен (запись в срезе либо
+	// fallback по границе снапшота). Неизвестный терм означает, что
+	// предикат «снапшот или AE» пропустил случай — вызывающий обязан
+	// отправить снапшот, иначе follower гарантированно отвергнет AE.
+	snapshotNeeded := prevLogIndex >= 0 && prevLogTerm == -1
 	var entries []LogEntry
 	if ni <= cm.cmState.lastLogIndex {
 		pos := cm.logPosition(ni)
@@ -39,7 +48,7 @@ func (cm *ConsensusModule) nextIndexArgsEntries(peerID, savedCurrentTerm int) (i
 		PrevLogTerm:  prevLogTerm,
 		Entries:      entries,
 		LeaderCommit: cm.cmState.commitIndex,
-	}, entries
+	}, entries, snapshotNeeded
 }
 
 // leaderSendAEsToPeer отправляет AppendEntries указанному peer и
@@ -54,7 +63,13 @@ func (cm *ConsensusModule) nextIndexArgsEntries(peerID, savedCurrentTerm int) (i
 // inflightAE[peerID], разрешая последующий вызов leaderSendAEs
 // для этого peer. Сброс гарантирован через defer.
 //
-//nolint:funlen,gocognit
+// Backoff (ADR-P07-006): перед отправкой вычисляется per-peer задержка
+// от числа подряд идущих транспортных ошибок; при активной задержке
+// попытка пропускается. Пропуск — сравнение времени с lastAttempt, а не
+// time.Sleep: sleep удержал бы inflightAE[peer] и задерживал бы
+// восстановление вернувшегося узла.
+//
+//nolint:gocognit
 func (cm *ConsensusModule) leaderSendAEsToPeer(peerID, savedCurrentTerm int, dispatchEpoch uint64) {
 	defer func() {
 		cm.mu.Lock()
@@ -65,74 +80,164 @@ func (cm *ConsensusModule) leaderSendAEsToPeer(peerID, savedCurrentTerm int, dis
 	}()
 
 	cm.mu.Lock()
+	// Пропуск попытки при активном backoff. Действует только для текущего
+	// лидерства: запоздавшие горутины прошлых термов не влияют на
+	// состояние нового лидера.
+	if cm.replicationBackoffActive(peerID, savedCurrentTerm) {
+		cm.mu.Unlock()
+		return
+	}
 	ni := cm.leaderState.nextIndex[peerID]
-	if ni <= cm.cmState.lastSnapshotIndex && !isNilInterface(cm.snapshotStore) {
+	// Предикат «снапшот или AppendEntries» по фактической обслуживаемости
+	// запроса (ADR-P07-005): first — первый индекс, для которого лидер
+	// может сообщить терм (граница снапшота при пустом срезе, первая
+	// запись среза иначе); prev = ni - 1. Снапшот отправляется только
+	// когда prev попадает в дыру между снапшотом и первым индексом
+	// журнала — единственный случай, когда lookupTerm(prev) == -1.
+	first := cm.cmState.lastSnapshotIndex + 1
+	if len(cm.cmState.log) > 0 {
+		first = cm.cmState.log[0].Index
+	}
+	prev := ni - 1
+	if !isNilInterface(cm.snapshotStore) &&
+		prev >= 0 && prev != cm.cmState.lastSnapshotIndex && prev < first {
 		cm.mu.Unlock()
 		cm.leaderSendSnapshot(peerID, savedCurrentTerm)
 		return
 	}
 	cm.mu.Unlock()
 
-	ni, args, entries := cm.nextIndexArgsEntries(peerID, savedCurrentTerm)
+	ni, args, entries, snapshotNeeded := cm.nextIndexArgsEntries(peerID, savedCurrentTerm)
+	// Defense-in-depth (ADR-P07-005): если предикат ошибся и для
+	// PrevLogIndex >= 0 терм неизвестен — отправить снапшот, а не AE,
+	// который follower гарантированно отвергнет.
+	if snapshotNeeded && !isNilInterface(cm.snapshotStore) {
+		cm.leaderSendSnapshot(peerID, savedCurrentTerm)
+		return
+	}
 	cm.traceLogf(8, "sending AppendEntries to %v: ni=%d, args=%+v", peerID, ni, args)
+	// Фиксация момента реальной попытки (ADR-P07-006 п.6) — только для
+	// текущего лидерства; запоздавшие горутины прошлых термов состояние
+	// не трогают.
+	cm.mu.Lock()
+	if cm.cmState.state == Leader && cm.cmState.currentTerm == savedCurrentTerm {
+		cm.recordAttempt(peerID)
+	}
+	cm.mu.Unlock()
 	reply, err := cm.transport.AppendEntries(ServerID(peerID), args)
-	if err == nil {
+	if err != nil {
+		// Backoff активируется только транспортными ошибками
+		// (ADR-P07-006 п.5): логические отказы (Success:false) его
+		// не вызывают — иначе замаскировался бы легитимный догон.
 		cm.mu.Lock()
-		if reply.Term > cm.cmState.currentTerm {
-			cm.traceLockedLogf(8, "term out of date in heartbeat reply")
-			cm.becomeFollower(reply.Term)
-			cm.mu.Unlock()
-			return
+		if cm.cmState.state == Leader && cm.cmState.currentTerm == savedCurrentTerm {
+			cm.incReplFailures(peerID)
 		}
-		if cm.cmState.state == Leader && savedCurrentTerm == reply.Term {
-			if reply.Success {
-				cm.leaderState.nextIndex[peerID] = ni + len(entries)
-				cm.leaderState.matchIndex[peerID] = cm.leaderState.nextIndex[peerID] - 1
+		cm.mu.Unlock()
+		return
+	}
+	// Сброс backoff при любом RPC без транспортной ошибки (ADR-P07-006
+	// п.4), независимо от reply.Success.
+	cm.mu.Lock()
+	if cm.cmState.state == Leader && cm.cmState.currentTerm == savedCurrentTerm {
+		cm.resetReplFailures(peerID)
+	}
+	if reply.Term > cm.cmState.currentTerm {
+		cm.traceLockedLogf(8, "term out of date in heartbeat reply")
+		cm.becomeFollower(reply.Term)
+		cm.mu.Unlock()
+		return
+	}
+	if cm.cmState.state == Leader && savedCurrentTerm == reply.Term {
+		if reply.Success {
+			cm.leaderState.nextIndex[peerID] = ni + len(entries)
+			cm.leaderState.matchIndex[peerID] = cm.leaderState.nextIndex[peerID] - 1
 
-				cm.leaderState.commitmentTracker.setMatch(peerID, cm.leaderState.matchIndex[peerID], cm.lookupTerm)
-				cm.traceLockedLogf(
-					8, "AppendEntries reply from %d success: nextIndex := %v, matchIndex := %v; commitIndex := %d",
-					peerID, cm.leaderState.nextIndex, cm.leaderState.matchIndex, cm.leaderState.commitmentTracker.getCommitIndex(),
-				)
+			cm.leaderState.commitmentTracker.setMatch(peerID, cm.leaderState.matchIndex[peerID], cm.lookupTerm)
+			cm.traceLockedLogf(
+				8, "AppendEntries reply from %d success: nextIndex := %v, matchIndex := %v; commitIndex := %d",
+				peerID, cm.leaderState.nextIndex, cm.leaderState.matchIndex, cm.leaderState.commitmentTracker.getCommitIndex(),
+			)
 
-				if len(cm.leaderState.pendingVerify) > 0 && cm.cmState.state == Leader {
-					for _, vf := range cm.leaderState.pendingVerify {
-						// Голос засчитывается только от voter'а текущей
-						// (latest) конфигурации и только для ответов на AE,
-						// отправленные не раньше запроса (SA-004/SA-016).
-						if hasVote(cm.cmState.configurations.latest, peerID) && vf.epoch <= dispatchEpoch {
-							vf.vote(peerID, true)
-						}
+			if len(cm.leaderState.pendingVerify) > 0 && cm.cmState.state == Leader {
+				for _, vf := range cm.leaderState.pendingVerify {
+					// Голос засчитывается только от voter'а текущей
+					// (latest) конфигурации и только для ответов на AE,
+					// отправленные не раньше запроса (SA-004/SA-016).
+					if hasVote(cm.cmState.configurations.latest, peerID) && vf.epoch <= dispatchEpoch {
+						vf.vote(peerID, true)
 					}
-					var remaining []*verifyFuture
-					for _, vf := range cm.leaderState.pendingVerify {
-						if vf.votes >= vf.quorumSize {
-							vf.respond(nil)
-						} else {
-							remaining = append(remaining, vf)
-						}
-					}
-					cm.leaderState.pendingVerify = remaining
 				}
-
-				cm.mu.Unlock()
-			} else {
-				if reply.ConflictTerm >= 0 {
-					if lastIndex, ok := cm.cmState.termIndexMap[reply.ConflictTerm]; ok {
-						cm.leaderState.nextIndex[peerID] = lastIndex + 1
+				var remaining []*verifyFuture
+				for _, vf := range cm.leaderState.pendingVerify {
+					if vf.votes >= vf.quorumSize {
+						vf.respond(nil)
 					} else {
-						cm.leaderState.nextIndex[peerID] = reply.ConflictIndex
+						remaining = append(remaining, vf)
 					}
-				} else {
-					cm.leaderState.nextIndex[peerID] = reply.ConflictIndex
 				}
-				cm.traceLockedLogf(8, "AppendEntries reply from %d !success: nextIndex := %d", peerID, ni-1)
-				cm.mu.Unlock()
+				cm.leaderState.pendingVerify = remaining
 			}
-		} else {
+
 			cm.mu.Unlock()
+		} else {
+			cm.handleFailedAEReply(peerID, reply)
+		}
+	} else {
+		cm.mu.Unlock()
+	}
+}
+
+// replicationBackoffActive сообщает, активен ли backoff для попытки
+// репликации текущего лидерства (ADR-P07-006 п.3): с последней реальной
+// попытки прошло меньше задержки, вычисленной по числу транспортных
+// ошибок. Требует удержания cm.mu.
+func (cm *ConsensusModule) replicationBackoffActive(peerID, savedCurrentTerm int) bool {
+	if cm.cmState.state != Leader || cm.cmState.currentTerm != savedCurrentTerm {
+		return false
+	}
+	delay := replicationBackoffDelay(cm.leaderState.replFailures[peerID])
+	return delay > 0 && !cm.leaderState.lastAttempt[peerID].IsZero() &&
+		time.Since(cm.leaderState.lastAttempt[peerID]) < delay
+}
+
+// handleFailedAEReply обрабатывает логический отказ AppendEntries
+// (Success:false): счётчик, предохранитель невозможного отказа
+// (ADR-P07-002) и обновление nextIndex. Требует удержания cm.mu.
+func (cm *ConsensusModule) handleFailedAEReply(peerID int, reply AppendEntriesReply) {
+	// Счётчик отказов AE (ADR-P07-008): «follower отвергает
+	// AppendEntries?» — ключевой признак цикла IS↔AE-fail.
+	cm.counters.appendEntriesRejected = incPeerCount(cm.counters.appendEntriesRejected, peerID)
+	newNi := reply.ConflictIndex
+	if reply.ConflictTerm >= 0 {
+		if lastIndex, ok := cm.cmState.termIndexMap[reply.ConflictTerm]; ok {
+			newNi = lastIndex + 1
 		}
 	}
+	// Предохранитель ADR-P07-002: отказ, результат которого не
+	// может быть истинным (отрицательный ConflictIndex либо
+	// новый nextIndex не больше доказанного durable-префикса
+	// matchIndex[peer]), не изменяет состояние репликации —
+	// прецедент etcd/raft Progress.MaybeDecrTo. Аномалия
+	// наблюдаема через счётчик и трассировку уровня 0.
+	if reply.ConflictIndex < 0 || newNi <= cm.leaderState.matchIndex[peerID] {
+		cm.counters.nextIndexRejectionIgnored = incPeerCount(
+			cm.counters.nextIndexRejectionIgnored, peerID,
+		)
+		cm.traceLockedLogf(
+			0, "AppendEntries reply from %d rejected (impossible): peer=%d term=%d ni=%d matchIndex=%d ConflictIndex=%d ConflictTerm=%d",
+			peerID, peerID, reply.Term, newNi, cm.leaderState.matchIndex[peerID],
+			reply.ConflictIndex, reply.ConflictTerm,
+		)
+		cm.mu.Unlock()
+		return
+	}
+	cm.leaderState.nextIndex[peerID] = newNi
+	cm.traceLockedLogf(8, "%s", failedAETrace(
+		peerID, cm.leaderState.nextIndex[peerID], cm.leaderState.matchIndex[peerID],
+		reply.ConflictIndex, reply.ConflictTerm,
+	))
+	cm.mu.Unlock()
 }
 
 // leaderSendAEs отправляет AppendEntries всем peer, для которых
@@ -184,9 +289,8 @@ func (cm *ConsensusModule) leaderSendAEs() {
 }
 
 // leaderSendSnapshot отправляет последний снэпшот отстающему follower.
-// Вызывается, когда nextIndex[follower] <= lastSnapshotIndex.
-//
-//nolint:funlen
+// Вызывается, когда лидер не может обслужить AppendEntries для текущего
+// nextIndex[follower] (предикат ADR-P07-005).
 func (cm *ConsensusModule) leaderSendSnapshot(peerID, term int) {
 	start := time.Now()
 	defer func() {
@@ -253,10 +357,34 @@ func (cm *ConsensusModule) leaderSendSnapshot(peerID, term int) {
 		DataSize:      meta.Size,
 	}
 
+	// Фиксация момента реальной попытки (ADR-P07-006 п.6) и счётчик
+	// отправленных снапшотов (ADR-P07-008): «лидер повторно шлёт
+	// снапшот?» — инкремент на каждую реальную отправку через транспорт.
+	cm.mu.Lock()
+	if cm.cmState.state == Leader && cm.cmState.currentTerm == term {
+		cm.recordAttempt(peerID)
+	}
+	cm.counters.installSnapshotSent = incPeerCount(cm.counters.installSnapshotSent, peerID)
+	cm.mu.Unlock()
+
 	reply, err := cm.transport.InstallSnapshot(ServerID(peerID), req, reader)
 	if err != nil {
+		// Backoff активируется только транспортными ошибками
+		// (ADR-P07-006 п.5) — для текущего лидерства.
+		cm.mu.Lock()
+		if cm.cmState.state == Leader && cm.cmState.currentTerm == term {
+			cm.incReplFailures(peerID)
+		}
+		cm.mu.Unlock()
 		return
 	}
+	// Сброс backoff при RPC без транспортной ошибки (ADR-P07-006 п.4),
+	// независимо от reply.Success.
+	cm.mu.Lock()
+	if cm.cmState.state == Leader && cm.cmState.currentTerm == term {
+		cm.resetReplFailures(peerID)
+	}
+	cm.mu.Unlock()
 	if reply.Term > term {
 		// becomeFollower требует удержания cm.mu; здесь блокировка
 		// не удерживается (RPC выполнялся без блокировки).
@@ -267,8 +395,78 @@ func (cm *ConsensusModule) leaderSendSnapshot(peerID, term int) {
 	}
 	if reply.Success {
 		cm.mu.Lock()
-		cm.leaderState.nextIndex[peerID] = meta.Index + 1
-		cm.leaderState.matchIndex[peerID] = meta.Index
+		// Симметрия с путём AppendEntries (raft_cm_replication.go, ветка
+		// успеха AE): запоздавший ответ из вытесненного term'а не должен
+		// менять состояние репликации нового лидера (ADR-P07-007).
+		if cm.cmState.state == Leader && term == reply.Term {
+			cm.leaderState.nextIndex[peerID] = meta.Index + 1
+			cm.leaderState.matchIndex[peerID] = meta.Index
+			// matchIndex = meta.Index означает durable владение префиксом
+			// до meta.Index — ровно то, что гарантирует Success:true.
+			// Проверка term'а внутри setMatch работает через fallback
+			// lookupTerm на lastSnapshotTerm.
+			cm.leaderState.commitmentTracker.setMatch(peerID, meta.Index, cm.lookupTerm)
+		}
 		cm.mu.Unlock()
+	}
+}
+
+// failedAETrace формирует текст трассировки неудачного AppendEntries
+// (ADR-P07-008 п.3): печатается фактически присвоенное значение
+// nextIndex (ранее ошибочно печаталось ni-1), а также matchIndex и поля
+// конфликта ответа — ровно тот набор, которого не хватило при разборе
+// обоих инцидентов. Выделена в чистую функцию: мутация TraceCM и
+// _traceLogger в тестах запрещена (ADR-P06-005), формат проверяется
+// unit-тестом функции.
+func failedAETrace(peerID, nextIndex, matchIndex, conflictIndex, conflictTerm int) string {
+	return fmt.Sprintf(
+		"AppendEntries reply from %d !success: nextIndex := %d (ConflictIndex=%d, ConflictTerm=%d, matchIndex=%d)",
+		peerID, nextIndex, conflictIndex, conflictTerm, matchIndex,
+	)
+}
+
+// replicationBackoffDelay вычисляет per-peer задержку между попытками
+// репликации по числу подряд идущих транспортных ошибок (ADR-P07-006 п.2):
+// delay = min(HeartbeatTimeoutMs * 2^min(failures, 5), 1000) мс.
+// Явный clamp (SA-002): при HeartbeatTimeoutMs = 33 и показателе 5
+// получается 33·2⁵ = 1056 мс > потолка 1000 мс. При нуле ошибок
+// задержка нулевая — поведение прежнее.
+func replicationBackoffDelay(failures int) time.Duration {
+	if failures <= 0 {
+		return 0
+	}
+	const maxBackoffDelay = 1000 * time.Millisecond
+	delay := HeartbeatTimeoutMs * time.Millisecond * time.Duration(1<<min(failures, 5))
+	if delay > maxBackoffDelay {
+		delay = maxBackoffDelay
+	}
+	return delay
+}
+
+// recordAttempt фиксирует момент реальной попытки отправки RPC пиру
+// (ADR-P07-006 п.6). Требует удержания cm.mu.
+func (cm *ConsensusModule) recordAttempt(peerID int) {
+	if cm.leaderState.lastAttempt == nil {
+		cm.leaderState.lastAttempt = make(map[int]time.Time)
+	}
+	cm.leaderState.lastAttempt[peerID] = time.Now()
+}
+
+// incReplFailures инкрементирует число подряд идущих транспортных ошибок
+// по пиру (ADR-P07-006 п.5): вызывается только при err != nil от
+// транспорта. Требует удержания cm.mu.
+func (cm *ConsensusModule) incReplFailures(peerID int) {
+	if cm.leaderState.replFailures == nil {
+		cm.leaderState.replFailures = make(map[int]int)
+	}
+	cm.leaderState.replFailures[peerID]++
+}
+
+// resetReplFailures сбрасывает счётчик транспортных ошибок по пиру при
+// любом RPC без ошибки транспорта — независимо от reply.Success
+// (ADR-P07-006 п.4). Требует удержания cm.mu.
+func (cm *ConsensusModule) resetReplFailures(peerID int) {
+	if cm.leaderState.replFailures != nil {
+		cm.leaderState.replFailures[peerID] = 0
 	}
 }

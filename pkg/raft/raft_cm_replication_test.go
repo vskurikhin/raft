@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/fortytw2/leaktest"
 )
 
 // mockTransportAE — минимальная реализация Transport для тестов,
@@ -18,26 +20,61 @@ type mockTransportAE struct {
 	installCallCount atomic.Int32
 	delay            time.Duration
 	blockCh          chan struct{}
+
+	// failReply — AppendEntries отвечает Success:false с заданным
+	// конфликтом (ConflictIndex/ConflictTerm), вместо Success:true.
+	failReply bool
+	// failConflictIndex / failConflictTerm — поля конфликта для failReply.
+	failConflictIndex int
+	failConflictTerm  int
+	// replyTerm — Term в ответах (0 по умолчанию: существующие тесты
+	// полагаются на несовпадение с savedCurrentTerm, чтобы пропустить
+	// ветки обработки ответа).
+	replyTerm int
+	// installReplyTerm — отдельный Term ответа InstallSnapshot; если
+	// installReplyTermSet, используется вместо replyTerm (позволяет
+	// независимо задавать термы ответов AE и IS).
+	installReplyTerm    int
+	installReplyTermSet bool
+	// lastArgs — аргументы последнего AppendEntries (для утверждений
+	// о содержимом запроса в тестах предиката TASK-006).
+	lastArgs    AppendEntriesArgs
+	lastArgsSet bool
 }
 
-func (m *mockTransportAE) AppendEntries(_ ServerID, _ AppendEntriesArgs) (AppendEntriesReply, error) {
+func (m *mockTransportAE) AppendEntries(_ ServerID, args AppendEntriesArgs) (AppendEntriesReply, error) {
 	m.callCount.Add(1)
+	m.lastArgs = args
+	m.lastArgsSet = true
 	if m.blockCh != nil {
 		<-m.blockCh
 	}
 	if m.delay > 0 {
 		time.Sleep(m.delay)
 	}
+	if m.failReply {
+		return AppendEntriesReply{
+			Term:          m.replyTerm,
+			Success:       false,
+			ConflictIndex: m.failConflictIndex,
+			ConflictTerm:  m.failConflictTerm,
+		}, nil
+	}
 	return AppendEntriesReply{
-		Term:    0,
+		Term:    m.replyTerm,
 		Success: true,
 	}, nil
 }
 
 func (m *mockTransportAE) InstallSnapshot(_ ServerID, _ InstallSnapshotRequest, _ io.Reader) (InstallSnapshotResponse, error) {
 	m.installCallCount.Add(1)
+	term := m.replyTerm
+	if m.installReplyTermSet {
+		term = m.installReplyTerm
+	}
 	return InstallSnapshotResponse{
 		Success: true,
+		Term:    term,
 	}, nil
 }
 
@@ -532,23 +569,30 @@ func TestLeaderSendSnapshot_EmptyID(t *testing.T) {
 
 // TestLeaderSendSnapshot_Success проверяет, что leaderSendSnapshot при
 // корректном хранилище отправляет InstallSnapshot и обновляет nextIndex
-// и matchIndex.
+// и matchIndex, а также уведомляет commitmentTracker (ADR-P07-007 —
+// симметрия с путём AE).
 //
 // Сценарий:
 //  1. snapshotStore.List() возвращает один снэпшот (Index=5, Term=2, Size=100).
-//  2. transport.InstallSnapshot возвращает Success=true, Term=0 (не выше term=1).
+//  2. transport.InstallSnapshot возвращает Success=true, Term=1 — терм
+//     follower'а совпадает с термом запроса (реалистичный ответ).
 //  3. Проверить, что InstallSnapshot вызван ровно один раз.
-//  4. Проверить, что nextIndex[1] == 6 и matchIndex[1] == 5.
+//  4. Проверить, что nextIndex[1] == 6, matchIndex[1] == 5 и
+//     commitmentTracker.matchIndex[1] == 5.
 func TestLeaderSendSnapshot_Success(t *testing.T) {
-	transport := &mockTransportAE{}
+	transport := &mockTransportAE{replyTerm: 1}
+	tracker := newCommitmentTracker(0, make(chan int, 1), 1, -1)
 	cm := &ConsensusModule{
 		leaderState: leaderState{
-			nextIndex:  map[int]int{1: -1},
-			matchIndex: map[int]int{1: -1},
+			nextIndex:         map[int]int{1: -1},
+			matchIndex:        map[int]int{1: -1},
+			commitmentTracker: tracker,
 		},
 		cmState: cmState{
-			state:       Leader,
-			currentTerm: 1,
+			state:             Leader,
+			currentTerm:       1,
+			lastSnapshotIndex: 5,
+			lastSnapshotTerm:  2,
 		},
 
 		id:        0,
@@ -558,6 +602,7 @@ func TestLeaderSendSnapshot_Success(t *testing.T) {
 			openMeta:   &SnapshotMeta{Index: 5, Term: 2, Size: 100},
 		},
 	}
+	tracker.setConfiguration([]int{0, 1}, cm.lookupTerm)
 
 	cm.leaderSendSnapshot(1, 1)
 
@@ -569,5 +614,384 @@ func TestLeaderSendSnapshot_Success(t *testing.T) {
 	}
 	if cm.leaderState.matchIndex[1] != 5 {
 		t.Errorf("matchIndex[1] = %d, want 5", cm.leaderState.matchIndex[1])
+	}
+	if got := tracker.matchIndex[1]; got != 5 {
+		t.Errorf("commitmentTracker.matchIndex[1] = %d, want 5 (setMatch on IS path)", got)
+	}
+}
+
+// TestLeaderSendSnapshot_SuccessStaleTerm проверяет защиту от
+// запоздалого ответа из вытесненного term'а (ADR-P07-007 п.1): при
+// reply.Term != term запроса (ответ из прошлого лидерства) состояние
+// репликации не изменяется.
+func TestLeaderSendSnapshot_SuccessStaleTerm(t *testing.T) {
+	transport := &mockTransportAE{replyTerm: 1}
+	tracker := newCommitmentTracker(0, make(chan int, 1), 2, -1)
+	cm := &ConsensusModule{
+		leaderState: leaderState{
+			nextIndex:         map[int]int{1: 7},
+			matchIndex:        map[int]int{1: 3},
+			commitmentTracker: tracker,
+		},
+		cmState: cmState{
+			state:             Leader,
+			currentTerm:       2,
+			lastSnapshotIndex: 5,
+			lastSnapshotTerm:  1,
+		},
+
+		id:        0,
+		transport: transport,
+		snapshotStore: &mockSnapshotStoreCfg{
+			listResult: []*SnapshotMeta{{ID: "snap-5", Index: 5, Term: 1, Size: 100}},
+			openMeta:   &SnapshotMeta{Index: 5, Term: 1, Size: 100},
+		},
+	}
+	tracker.setConfiguration([]int{0, 1}, cm.lookupTerm)
+
+	// term запроса 2, reply.Term 1 — ответ устарел.
+	cm.leaderSendSnapshot(1, 2)
+
+	if cm.leaderState.nextIndex[1] != 7 {
+		t.Errorf("nextIndex[1] = %d, want unchanged (7)", cm.leaderState.nextIndex[1])
+	}
+	if cm.leaderState.matchIndex[1] != 3 {
+		t.Errorf("matchIndex[1] = %d, want unchanged (3)", cm.leaderState.matchIndex[1])
+	}
+	if got := tracker.matchIndex[1]; got != -1 {
+		t.Errorf("commitmentTracker.matchIndex[1] = %d, want -1 (not updated)", got)
+	}
+}
+
+// TestLeaderSendSnapshot_SuccessNotLeader проверяет защиту от
+// запоздалого ответа после потери лидерства (ADR-P07-007 п.1): при
+// state != Leader состояние репликации не изменяется.
+func TestLeaderSendSnapshot_SuccessNotLeader(t *testing.T) {
+	transport := &mockTransportAE{replyTerm: 1}
+	tracker := newCommitmentTracker(0, make(chan int, 1), 1, -1)
+	cm := &ConsensusModule{
+		leaderState: leaderState{
+			nextIndex:         map[int]int{1: 7},
+			matchIndex:        map[int]int{1: 3},
+			commitmentTracker: tracker,
+		},
+		cmState: cmState{
+			state:             Follower, // лидерство уже потеряно
+			currentTerm:       1,
+			lastSnapshotIndex: 5,
+			lastSnapshotTerm:  1,
+		},
+
+		id:        0,
+		transport: transport,
+		snapshotStore: &mockSnapshotStoreCfg{
+			listResult: []*SnapshotMeta{{ID: "snap-5", Index: 5, Term: 1, Size: 100}},
+			openMeta:   &SnapshotMeta{Index: 5, Term: 1, Size: 100},
+		},
+	}
+	tracker.setConfiguration([]int{0, 1}, cm.lookupTerm)
+
+	cm.leaderSendSnapshot(1, 1)
+
+	if cm.leaderState.nextIndex[1] != 7 || cm.leaderState.matchIndex[1] != 3 {
+		t.Errorf("replication state changed after leadership loss: nextIndex=%d matchIndex=%d",
+			cm.leaderState.nextIndex[1], cm.leaderState.matchIndex[1])
+	}
+	if got := tracker.matchIndex[1]; got != -1 {
+		t.Errorf("commitmentTracker.matchIndex[1] = %d, want -1 (not updated)", got)
+	}
+}
+
+// newRejectionTestCM собирает литеральный CM-лидер для тестов обработки
+// отказа AppendEntries: nextIndex[1]=10, matchIndex[1]=5, журнал с
+// записями 9..10. Транспорт — mock с настраиваемым отказом.
+func newRejectionTestCM(transport *mockTransportAE) *ConsensusModule {
+	cm := &ConsensusModule{
+		leaderState: leaderState{
+			nextIndex:  map[int]int{1: 10},
+			matchIndex: map[int]int{1: 5},
+			inflightAE: map[int]*atomic.Bool{1: new(atomic.Bool)},
+		},
+		cmState: cmState{
+			state:             Leader,
+			currentTerm:       1,
+			lastLogIndex:      10,
+			lastLogTerm:       1,
+			lastSnapshotIndex: -1,
+			lastSnapshotTerm:  -1,
+			commitIndex:       5,
+			termIndexMap:      map[int]int{1: 10},
+			log: []LogEntry{
+				{Index: 9, Term: 1},
+				{Index: 10, Term: 1},
+			},
+			configurations: configurations{
+				committed: Configuration{ConfigServers: []ConfigServer{{ID: 0, Suffrage: Voter}, {ID: 1, Suffrage: Voter}}},
+				latest:    Configuration{ConfigServers: []ConfigServer{{ID: 0, Suffrage: Voter}, {ID: 1, Suffrage: Voter}}},
+			},
+		},
+		id:        0,
+		transport: transport,
+	}
+	cm.leaderState.inflightAE[1].Store(false)
+	return cm
+}
+
+// TestLeaderSendAEsToPeer_RejectsImpossibleConflictIndex — TASK-002 тест 2:
+// mock-ответ Success:false ConflictIndex:0 ConflictTerm:-1 при известном
+// matchIndex[1]=5 (N > 0) — отказ невозможен, nextIndex не изменяется,
+// счётчик предохранителя увеличивается, InstallSnapshot не отправляется.
+// На HEAD до ADR-P07-002 nextIndex стал бы 0 — тест падает.
+func TestLeaderSendAEsToPeer_RejectsImpossibleConflictIndex(t *testing.T) {
+	mock := &mockTransportAE{failReply: true, failConflictIndex: 0, failConflictTerm: -1, replyTerm: 1}
+	cm := newRejectionTestCM(mock)
+
+	cm.leaderSendAEsToPeer(1, 1, 0)
+
+	if cm.leaderState.nextIndex[1] != 10 {
+		t.Fatalf("nextIndex[1] = %d, want unchanged (10) — impossible rejection must be ignored",
+			cm.leaderState.nextIndex[1])
+	}
+	if got := cm.counters.nextIndexRejectionIgnored[1]; got != 1 {
+		t.Fatalf("nextIndexRejectionIgnored[1] = %d, want 1", got)
+	}
+	if got := cm.counters.appendEntriesRejected[1]; got != 1 {
+		t.Fatalf("appendEntriesRejected[1] = %d, want 1", got)
+	}
+	if n := mock.installCallCount.Load(); n != 0 {
+		t.Fatalf("InstallSnapshot sent %d times after rejected failure, want 0", n)
+	}
+}
+
+// TestLeaderSendAEsToPeer_AcceptsPlausibleRejection — контрольный случай
+// предохранителя ADR-P07-002: корректный отказ (ConflictIndex выше
+// matchIndex) НЕ отбраковывается — nextIndex обновляется штатно,
+// счётчик предохранителя остаётся нулевым.
+func TestLeaderSendAEsToPeer_AcceptsPlausibleRejection(t *testing.T) {
+	mock := &mockTransportAE{failReply: true, failConflictIndex: 8, failConflictTerm: -1, replyTerm: 1}
+	cm := newRejectionTestCM(mock)
+
+	cm.leaderSendAEsToPeer(1, 1, 0)
+
+	if cm.leaderState.nextIndex[1] != 8 {
+		t.Fatalf("nextIndex[1] = %d, want 8 (plausible rejection applied)", cm.leaderState.nextIndex[1])
+	}
+	if got := cm.counters.nextIndexRejectionIgnored[1]; got != 0 {
+		t.Fatalf("nextIndexRejectionIgnored[1] = %d, want 0", got)
+	}
+}
+
+// TestLeaderSendAEsToPeer_SnapshotPredicateBoundaries — граничные случаи
+// предиката «снапшот или AE» (TASK-006 тест 3, ADR-P07-005):
+//   - prev == lastSnapshotIndex → AE (lookupTerm даёт lastSnapshotTerm
+//     по fallback);
+//   - prev == first → AE (запись физически в срезе);
+//   - prev == first-1 при first-1 != lastSnapshotIndex → снапшот.
+func TestLeaderSendAEsToPeer_SnapshotPredicateBoundaries(t *testing.T) {
+	tests := []struct {
+		name              string
+		lastSnapshotIndex int
+		log               []LogEntry
+		nextIndex         int
+		wantInstall       bool
+		wantPrevLogTerm   int
+	}{
+		{
+			name:              "prev == lastSnapshotIndex → AE",
+			lastSnapshotIndex: 5,
+			log:               []LogEntry{{Index: 6, Term: 1}, {Index: 7, Term: 1}},
+			nextIndex:         6,
+			wantInstall:       false,
+			wantPrevLogTerm:   2, // fallback на lastSnapshotTerm
+		},
+		{
+			name:              "prev == first → AE",
+			lastSnapshotIndex: 5,
+			log:               []LogEntry{{Index: 6, Term: 1}, {Index: 7, Term: 1}},
+			nextIndex:         7,
+			wantInstall:       false,
+			wantPrevLogTerm:   1, // запись 6 в срезе
+		},
+		{
+			name:              "prev == first-1 вне границы снапшота → InstallSnapshot",
+			lastSnapshotIndex: 3,
+			log:               []LogEntry{{Index: 5, Term: 1}},
+			nextIndex:         5,
+			wantInstall:       true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// replyTerm=1 (ответы AE обрабатываются); installReplyTerm=0 —
+			// ответ InstallSnapshot не совпадает с термом запроса, ветка
+			// обновления состояния репликации (и setMatch в
+			// commitmentTracker) пропускается — литеральный CM без трекера
+			// остаётся безопасным; проверяется только ветвление
+			// «снапшот или AE».
+			mock := &mockTransportAE{
+				failReply: true, failConflictIndex: 0, failConflictTerm: -1,
+				replyTerm: 1, installReplyTermSet: true, installReplyTerm: 0,
+			}
+			cm := &ConsensusModule{
+				leaderState: leaderState{
+					nextIndex:  map[int]int{1: tt.nextIndex},
+					matchIndex: map[int]int{1: -1},
+					inflightAE: map[int]*atomic.Bool{1: new(atomic.Bool)},
+				},
+				cmState: cmState{
+					state:             Leader,
+					currentTerm:       1,
+					lastLogIndex:      7,
+					lastLogTerm:       1,
+					lastSnapshotIndex: tt.lastSnapshotIndex,
+					lastSnapshotTerm:  2,
+					commitIndex:       -1,
+					termIndexMap:      make(map[int]int),
+					log:               tt.log,
+					configurations: configurations{
+						committed: Configuration{ConfigServers: []ConfigServer{{ID: 0, Suffrage: Voter}, {ID: 1, Suffrage: Voter}}},
+						latest:    Configuration{ConfigServers: []ConfigServer{{ID: 0, Suffrage: Voter}, {ID: 1, Suffrage: Voter}}},
+					},
+				},
+				id:        0,
+				transport: mock,
+				snapshotStore: &mockSnapshotStoreCfg{
+					listResult: []*SnapshotMeta{{ID: "snap", Index: tt.lastSnapshotIndex, Term: 2, Size: 0}},
+					openMeta:   &SnapshotMeta{ID: "snap", Index: tt.lastSnapshotIndex, Term: 2, Size: 0},
+				},
+			}
+			cm.leaderState.inflightAE[1].Store(false)
+
+			cm.leaderSendAEsToPeer(1, 1, 0)
+
+			installs := mock.installCallCount.Load()
+			calls := mock.callCount.Load()
+			if tt.wantInstall {
+				if installs != 1 || calls != 0 {
+					t.Fatalf("want InstallSnapshot: installs=%d calls=%d", installs, calls)
+				}
+				return
+			}
+			if calls != 1 || installs != 0 {
+				t.Fatalf("want AppendEntries: installs=%d calls=%d", installs, calls)
+			}
+			if mock.lastArgs.PrevLogTerm != tt.wantPrevLogTerm {
+				t.Fatalf("PrevLogTerm = %d, want %d", mock.lastArgs.PrevLogTerm, tt.wantPrevLogTerm)
+			}
+		})
+	}
+}
+
+// TestReplicationBackoffDelay_Clamp — проверка формулы задержки
+// (ADR-P07-006 п.2, SA-002): delay = min(HeartbeatTimeoutMs·2^min(f,5),
+// 1000) мс; при f >= 5 задержка не превышает потолок 1000 мс
+// (33·2⁵ = 1056 без clamp).
+func TestReplicationBackoffDelay_Clamp(t *testing.T) {
+	if got := replicationBackoffDelay(0); got != 0 {
+		t.Fatalf("delay(0) = %v, want 0 (no backoff without failures)", got)
+	}
+	if got := replicationBackoffDelay(1); got != 66*time.Millisecond {
+		t.Fatalf("delay(1) = %v, want 66ms (33·2)", got)
+	}
+	if got := replicationBackoffDelay(5); got != 1000*time.Millisecond {
+		t.Fatalf("delay(5) = %v, want 1000ms (clamped ceiling)", got)
+	}
+	if got := replicationBackoffDelay(50); got != 1000*time.Millisecond {
+		t.Fatalf("delay(50) = %v, want 1000ms (clamped ceiling)", got)
+	}
+}
+
+// TestReplicationBackoff_LogicalRejectionsDoNotBackoff — TASK-007 тест 3:
+// пир доступен, но отвечает Success:false → backoff не активируется,
+// частота попыток прежняя (каждый вызов доходит до транспорта),
+// replFailures остаётся нулевым.
+func TestReplicationBackoff_LogicalRejectionsDoNotBackoff(t *testing.T) {
+	mock := &mockTransportAE{failReply: true, failConflictIndex: 0, failConflictTerm: -1, replyTerm: 1}
+	cm := &ConsensusModule{
+		leaderState: leaderState{
+			nextIndex:  map[int]int{1: 0},
+			matchIndex: map[int]int{1: -1},
+			inflightAE: map[int]*atomic.Bool{1: new(atomic.Bool)},
+		},
+		cmState: cmState{
+			state:             Leader,
+			currentTerm:       1,
+			lastLogIndex:      0,
+			lastLogTerm:       1,
+			lastSnapshotIndex: -1,
+			lastSnapshotTerm:  -1,
+			commitIndex:       -1,
+			termIndexMap:      map[int]int{1: 0},
+			log:               []LogEntry{{Index: 0, Term: 1}},
+			configurations: configurations{
+				committed: Configuration{ConfigServers: []ConfigServer{{ID: 0, Suffrage: Voter}, {ID: 1, Suffrage: Voter}}},
+				latest:    Configuration{ConfigServers: []ConfigServer{{ID: 0, Suffrage: Voter}, {ID: 1, Suffrage: Voter}}},
+			},
+		},
+		id:        0,
+		transport: mock,
+	}
+	cm.leaderState.inflightAE[1].Store(false)
+
+	const attempts = 5
+	for i := 0; i < attempts; i++ {
+		cm.leaderSendAEsToPeer(1, 1, 0)
+	}
+
+	if got := mock.callCount.Load(); got != attempts {
+		t.Fatalf("transport calls = %d, want %d — logical rejections must not trigger backoff", got, attempts)
+	}
+	cm.mu.Lock()
+	rf := cm.leaderState.replFailures[1]
+	cm.mu.Unlock()
+	if rf != 0 {
+		t.Fatalf("replFailures[1] = %d, want 0 (logical rejection is not a transport error)", rf)
+	}
+}
+
+// TestReplicationBackoff_LeaderStateReinitialized — TASK-007 тест 4:
+// жизненный цикл backoff-полей строго следует роли Leader: startLeader
+// пересоздаёт карты replFailures/lastAttempt (утечки записей прошлого
+// лидерства исключены).
+func TestReplicationBackoff_LeaderStateReinitialized(t *testing.T) {
+	defer leaktest.CheckTimeout(t, time.Second)()
+
+	cm := &ConsensusModule{}
+	cm.storage = NewMapStorage()
+	cm.shutdownCh = make(chan struct{})
+	cm.commitCh = make(chan int, 1)
+	cm.stepDown = make(chan struct{}, 1)
+	cm.cmState.state = Follower
+	cm.cmState.currentTerm = 1
+	cm.cmState.votedFor = -1
+	cm.cmState.lastLogIndex = -1
+	cm.cmState.lastLogTerm = -1
+	cm.cmState.lastSnapshotIndex = -1
+	cm.cmState.lastSnapshotTerm = -1
+	cm.cmState.termIndexMap = make(map[int]int)
+	cm.cmState.configurations = configurations{
+		committed: Configuration{ConfigServers: []ConfigServer{{ID: 0, Suffrage: Voter}}},
+		latest:    Configuration{ConfigServers: []ConfigServer{{ID: 0, Suffrage: Voter}}},
+	}
+	cm.leaderState.nextIndex = make(map[int]int)
+	cm.leaderState.matchIndex = make(map[int]int)
+	cm.leaderState.inflightAE = make(map[int]*atomic.Bool)
+	cm.leaderState.inflight = make(map[int]*logFuture)
+	defer cm.Stop()
+
+	// Загрязнённое состояние прошлого лидерства.
+	cm.leaderState.replFailures = map[int]int{1: 7}
+	cm.leaderState.lastAttempt = map[int]time.Time{1: time.Now()}
+
+	cm.mu.Lock()
+	cm.startLeader()
+	replLen := len(cm.leaderState.replFailures)
+	attemptLen := len(cm.leaderState.lastAttempt)
+	cm.mu.Unlock()
+
+	if replLen != 0 || attemptLen != 0 {
+		t.Fatalf("backoff state not reinitialized on startLeader: replFailures=%d entries, lastAttempt=%d entries",
+			replLen, attemptLen)
 	}
 }

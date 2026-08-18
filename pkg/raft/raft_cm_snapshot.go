@@ -110,6 +110,29 @@ func (cm *ConsensusModule) handleInstallSnapshot(rpc RPC, req *InstallSnapshotRe
 		return
 	}
 
+	// Идемпотентность и отбраковка устаревшего снапшота (ADR-P07-003):
+	// если узел уже владеет снапшотом не хуже запрошенного, установка —
+	// no-op с Success:true (утверждение «follower durable владеет
+	// префиксом до req.LastLogIndex» истинно). Проверка выполняется после
+	// term-проверок, обновления лидерского контакта и валидации DataSize
+	// (SA-004): drain в defer ограничен maxSnapshotDataSize — ровно
+	// границей валидации, поэтому непрочитанный хвост тела невозможен.
+	cm.mu.Lock()
+	stale := req.LastLogIndex <= cm.cmState.lastSnapshotIndex
+	if stale {
+		cm.counters.installSnapshotSkippedStale = incPeerCount(cm.counters.installSnapshotSkippedStale, req.LeaderID)
+	}
+	lastSnapshotIndex := cm.cmState.lastSnapshotIndex
+	cm.mu.Unlock()
+	if stale {
+		cm.traceLogf(
+			4, "InstallSnapshot skipped as no-op: LastLogIndex=%d <= lastSnapshotIndex=%d (leaderID=%d)",
+			req.LastLogIndex, lastSnapshotIndex, req.LeaderID,
+		)
+		resp.Success = true
+		return
+	}
+
 	sink, err := cm.snapshotStore.Create(req.LastLogIndex, req.LastLogTerm, cfg, req.ConfigIndex)
 	if err != nil {
 		rpcErr = err
@@ -187,10 +210,23 @@ func (cm *ConsensusModule) handleInstallSnapshot(rpc RPC, req *InstallSnapshotRe
 	}
 	cm.rebuildLastLog()
 	cm.rebuildTermIndexMap()
+	// Пост-условие непрерывности границы снапшота и журнала (ADR-P07-004,
+	// ADR-P07-001 п.3): non-fatal — только счётчик и трассировка уровня 0.
+	// Сама гарантия инварианта достигается конструкцией (INV-S2 в
+	// rebuildLastLog); проверка существует как защита от регрессий.
+	// Ни паники, ни log.Fatal, ни изменения resp.Success.
+	if err := cm.checkSnapshotLogContinuity(); err != nil {
+		cm.counters.snapshotLogBoundaryViolation.Add(1)
+		cm.traceLockedLogf(
+			0, "handleInstallSnapshot: snapshot/log boundary violation: %v (lastLogIndex=%d, lastSnapshotIndex=%d)",
+			err, cm.cmState.lastLogIndex, cm.cmState.lastSnapshotIndex,
+		)
+	}
 	cm.cmState.logNeedsPersist = true
 	cm.persistToStorage()
 	cm.mu.Unlock()
 
+	cm.counters.installSnapshotReceived.Add(1)
 	resp.Success = true
 }
 

@@ -16,7 +16,7 @@ const (
 	// Для тестового ускорения Quantum не меняется — используются
 	// test-only хуки (RAFT_FORCE_MORE_REELECTION и аналоги).
 	Quantum             = 3
-	HeartbeatTimeoutMs  = 31 * Quantum
+	HeartbeatTimeoutMs  = 11 * Quantum
 	ReelectionTimeoutMs = 127 * Quantum
 	TickerTimeoutMs     = 7 * Quantum
 
@@ -156,18 +156,12 @@ func (f *configurationChangeFuture) Index() int {
 }
 
 // NewConsensusModule создаёт новый экземпляр CM.
-// fsm — машина состояний клиента, к которой применяются закоммиченные записи.
-// ready уведомляет CM, что все соседи подключены.
-// snapshots — хранилище снэпшотов; если nil, снэпшоты отключены.
 //
 // Предусловие: transport не должен быть nil. Нарушение контракта приводит к
-// panic при инициализации (fail-fast) — это единственное место, где проверка
-// выполняется до старта горутин. Паника допустима только здесь (исключение
-// для инициализации по AGENTS.md), а не в рабочих горутинах. Проверка
-// обнаруживает как «чистый» nil-интерфейс, так и типизированный nil-указатель
+// os.Exit(1) при инициализации (fail-fast) — это единственное место, где проверка
+// выполняется до старта горутин. Проверка обнаруживает как «чистый» nil-интерфейс,
+// так и типизированный nil-указатель
 // (например, (*InmemTransport)(nil)) — см. isNilInterface.
-//
-//nolint:funlen
 func NewConsensusModule(
 	id int,
 	peerIds []int,
@@ -177,18 +171,10 @@ func NewConsensusModule(
 	ready <-chan any,
 	snapshots ...SnapshotStore,
 ) *ConsensusModule {
-	// Fail-fast проверка предусловия конструктора. Паника допустима в рамках
-	// исключения "инициализация программы": вызов происходит при старте узла,
-	// а не в горутине, поэтому распознать ошибку проще до создания объекта.
-	// isNilInterface дополнительно ловит типизированный nil: в Go интерфейс
-	// не равен nil, если в него положен nil-указатель (например,
-	// (*InmemTransport)(nil)) — прямое сравнение с nil такую ситуацию
-	// не обнаружило бы.
 	if isNilInterface(transport) {
 		log.Fatalln("raft: NewConsensusModule: transport is nil")
 	}
-	// Сторожевой флаг контракта трассировки: конфигурация SetTraceLogFile
-	// разрешена только до создания первого CM (строгий set-once, ADR-004).
+	// Флаг контракта трассировки: конфигурация SetTraceLogFile (строгий set-once).
 	traceCMCreated.Store(true)
 	cm := new(ConsensusModule)
 	cm.id = id

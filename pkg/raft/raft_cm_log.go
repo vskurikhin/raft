@@ -51,16 +51,22 @@ func (cm *ConsensusModule) lookupTerm(index int) int {
 // из текущего содержимого cm.cmState.log.
 // Вызывается из restoreFromStorage() и других мест, где журнал
 // мог измениться без вызова setLastLog.
+//
+// Инвариант INV-S2 (ADR-P07-001): при пустом срезе журнала последняя
+// запись логического журнала — граница снапшота, поэтому
+// lastLogIndex/lastLogTerm берутся из lastSnapshotIndex/lastSnapshotTerm.
+// Для свежего узла без снапшота (lastSnapshotIndex == -1) поведение
+// совпадает с прежним: (-1, -1).
 // Требует удержания cm.mu (Lock).
 func (cm *ConsensusModule) rebuildLastLog() {
 	if len(cm.cmState.log) > 0 {
 		last := cm.cmState.log[len(cm.cmState.log)-1]
 		cm.cmState.lastLogIndex = last.Index
 		cm.cmState.lastLogTerm = last.Term
-	} else {
-		cm.cmState.lastLogIndex = -1
-		cm.cmState.lastLogTerm = -1
+		return
 	}
+	cm.cmState.lastLogIndex = cm.cmState.lastSnapshotIndex
+	cm.cmState.lastLogTerm = cm.cmState.lastSnapshotTerm
 }
 
 // rebuildTermIndexMap перестраивает карту term→lastIndex из текущего cm.cmState.log.

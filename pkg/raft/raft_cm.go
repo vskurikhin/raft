@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -94,6 +93,11 @@ type ConsensusModule struct {
 	// Собственного мьютекса нет: поля — atomic.Int64, наблюдение корректно
 	// из любого контекста, включая удержание cm.mu (INV-M3, ADR-P06-002).
 	latency cmLatency
+
+	// counters — счётчики ключевых событий репликации и снапшотов
+	// (ADR-P07-008). Нулевое значение готово к использованию (INV-M6);
+	// per-peer карты защищены cm.mu, глобальные поля — atomic.Int64.
+	counters raftCounters
 }
 
 // leaderState — состояние, используемое только пока узел является лидером.
@@ -167,6 +171,18 @@ type leaderState struct {
 	// leadershipTransferFuture — текущий future передачи лидерства.
 	// Устанавливается в handleLeadershipTransfer, отвечается в stepDown.
 	leadershipTransferFuture *leadershipTransferFuture
+
+	// replFailures — число подряд идущих транспортных ошибок по пиру
+	// (ADR-P07-006). Владелец — leaderState; жизненный цикл строго следует
+	// роли Leader: карты создаются в startLeader и уничтожаются при
+	// выходе из роли (becomeFollower).
+	replFailures map[int]int
+
+	// lastAttempt — момент последней реальной попытки отправки RPC
+	// каждому пиру (ADR-P07-006 п.3): backoff реализуется сравнением
+	// времени, а не time.Sleep — sleep удержал бы inflightAE[peer]
+	// и задерживал восстановление узла.
+	lastAttempt map[int]time.Time
 }
 
 // cmState — состояние узла Raft (аналог raftState в HashiCorp state.go).
@@ -300,9 +316,16 @@ func (cm *ConsensusModule) goSpawn(fn func()) {
 //nolint:unused
 func (cm *ConsensusModule) debugLogf(format string, args ...any) {
 	if slog.Default().Enabled(context.Background(), slog.LevelDebug) {
-		format = fmt.Sprintf("[%c,N:%d,T:%03d] ", stateLetter(cm.cmState.state), cm.id, cm.cmState.currentTerm) + format
+		format = fmt.Sprintf("[%c,N:%d,T:%03d] ", stateLetter(cm.cmState.state), cm.id, cm.cmState.currentTerm) +
+			format
 		slog.Debug(fmt.Sprintf(format, args...))
 	}
+}
+
+func (cm *ConsensusModule) stdoutTracePrintln(msg string) {
+	cm.mu.Lock()
+	_, _ = fmt.Printf("[%c,N:%d,T:%03d] %s\n", stateLetter(cm.cmState.state), cm.id, cm.cmState.currentTerm, msg)
+	cm.mu.Unlock()
 }
 
 // traceLockedLogf выводит отладочное сообщение, если TraceCM > level.
@@ -310,7 +333,8 @@ func (cm *ConsensusModule) debugLogf(format string, args ...any) {
 // состояние (cm.cmState.state, cm.id, cm.cmState.currentTerm) читается напрямую.
 func (cm *ConsensusModule) traceLockedLogf(level int, format string, args ...any) {
 	if level < TraceCM {
-		format = fmt.Sprintf("[%c,N:%d,T:%03d] ", stateLetter(cm.cmState.state), cm.id, cm.cmState.currentTerm) + format
+		format = fmt.Sprintf("[%c,N:%d,T:%03d] ", stateLetter(cm.cmState.state), cm.id, cm.cmState.currentTerm) +
+			format
 		_traceLogger.Printf(format, args...)
 	}
 }
@@ -325,14 +349,6 @@ func (cm *ConsensusModule) traceLogf(level int, format string, args ...any) {
 		cm.traceLockedLogf(level, format, args...)
 		cm.mu.Unlock()
 	}
-}
-
-func (cm *ConsensusModule) stdoutTracePrintln(msg string) {
-	cm.mu.Lock()
-	_, _ = fmt.Fprintln(os.Stdout, fmt.Sprintf(
-		"[%c,N:%d,T:%03d] %s", stateLetter(cm.cmState.state), cm.id, cm.cmState.currentTerm, msg,
-	))
-	cm.mu.Unlock()
 }
 
 func stateLetter(s CMState) rune {

@@ -198,8 +198,6 @@ func (cm *ConsensusModule) VerifyLeader() Future {
 
 // appendConfigurationEntry записывает запись LogConfiguration в журнал лидера
 // и запускает репликацию. Вызывается из leaderLoop.
-//
-//nolint:funlen
 func (cm *ConsensusModule) appendConfigurationEntry(future *configurationChangeFuture) {
 	cm.mu.Lock()
 	nextCfg, err := nextConfiguration(
@@ -322,8 +320,6 @@ func (cm *ConsensusModule) enqueueConfigurationChange(future *configurationChang
 // Вызывается только из leaderLoop. Блокирует leaderLoop до завершения
 // передачи или таймаута. Все новые Apply и confChange во время передачи
 // отклоняются через флаг leadershipTransferInProgress.
-//
-//nolint:funlen
 func (cm *ConsensusModule) handleLeadershipTransfer(future *leadershipTransferFuture) {
 	targetID := int(future.targetID)
 
@@ -624,6 +620,11 @@ func (cm *ConsensusModule) startLeader() {
 	cm.cmState.state = Leader
 	cm.cmState.leaderLastContact = time.Now()
 	cm.cmState.leaderID = cm.id
+
+	// Создание backoff-состояния вместе с nextIndex/matchIndex
+	// (ADR-P07-006 п.1): карты свежие на каждое лидерство.
+	cm.leaderState.replFailures = make(map[int]int)
+	cm.leaderState.lastAttempt = make(map[int]time.Time)
 
 	cfg := cm.cmState.configurations.latest
 	for _, s := range cfg.ConfigServers {

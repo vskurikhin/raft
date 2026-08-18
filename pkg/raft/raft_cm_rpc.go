@@ -175,7 +175,12 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 		} else {
 			// Не найдено совпадение для PrevLogIndex/PrevLogTerm.
 			if args.PrevLogIndex > cm.cmState.lastLogIndex {
-				reply.ConflictIndex = cm.cmState.lastLogIndex + 1
+				// Нижняя граница по границе снапшота (ADR-P07-002 п.4,
+				// только эта ветка — SA-001): follower никогда не
+				// запрашивает записи, покрытые его собственным снапшотом.
+				// После ADR-P07-001 обе величины совпадают; правило —
+				// defense-in-depth.
+				reply.ConflictIndex = max(cm.cmState.lastLogIndex, cm.cmState.lastSnapshotIndex) + 1
 				reply.ConflictTerm = -1
 			} else {
 				reply.ConflictTerm = cm.lookupTerm(args.PrevLogIndex)
@@ -211,8 +216,6 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 //
 // Кандидаты, не являющиеся voter'ами в текущей конфигурации, отклоняются.
 // Nonvoter не может быть избран лидером ни при каких обстоятельствах.
-//
-//nolint:funlen
 func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
 	startTimeNow := time.Now()
 	defer func() { cm.latency.requestVote.observe(time.Since(startTimeNow)) }()

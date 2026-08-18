@@ -29,6 +29,11 @@ func (cm *ConsensusModule) becomeFollower(term int) {
 
 	cm.cmState.state = Follower
 	if wasLeader {
+		// Уничтожение backoff-состояния вместе с выходом из роли
+		// (ADR-P07-006 п.1): жизненный цикл полей строго следует роли
+		// Leader; утечки записей при смене роли исключены.
+		cm.leaderState.replFailures = nil
+		cm.leaderState.lastAttempt = nil
 		select {
 		case cm.stepDown <- struct{}{}:
 		default:
@@ -62,8 +67,6 @@ func (cm *ConsensusModule) becomeFollower(term int) {
 //
 // Nonvoter'ы исключаются из рассылки RequestVote — они не участвуют
 // в голосовании и не должны получать запросы на предоставление голоса.
-//
-//nolint:funlen
 func (cm *ConsensusModule) startElection() {
 	startTimeNow := time.Now()
 	defer func() { cm.latency.election.observe(time.Since(startTimeNow)) }()
