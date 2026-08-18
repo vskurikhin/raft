@@ -14,6 +14,24 @@ import (
 type ConsensusModule struct {
 	mu sync.Mutex
 
+	// wg — регистрация всех горутин CM (дисциплина goSpawn/goSpawnLocked,
+	// ADR-003 п.1). Регистрация выполняется атомарно с проверкой
+	// «узел не остановлен» под cm.mu; Stop() присоединяет все горутины
+	// через wg.Wait().
+	wg sync.WaitGroup
+
+	// stopOnce — постусловие идемпотентного Stop(): любой возврат из Stop()
+	// (включая повторный/параллельный) гарантирует завершение всех горутин
+	// CM (ADR-003 п.5). sync.Once.Do блокирует параллельных вызывающих до
+	// завершения первого вызова.
+	stopOnce sync.Once
+
+	// shutdownClosed — true после установки state=Dead в Stop(). Пишется
+	// и читается только под cm.mu; дублирует проверку state==Dead для
+	// goSpawnLocked (закрытие shutdownCh происходит вне cm.mu, поэтому
+	// одним каналом проверить «остановлен» атомарно нельзя).
+	shutdownClosed bool
+
 	// id — идентификатор сервера этого экземпляра CM (ConsensusModule).
 	id int
 	// peerIds содержит список идентификаторов узлов-соседей в кластере.
@@ -225,17 +243,56 @@ func (cm *ConsensusModule) Report() (id, term int, isLeader bool) {
 }
 
 // Stop останавливает этот CM. Безопасен для многократного вызова.
+//
+// Постусловие (ADR-003 п.5): любой возврат из Stop() — включая повторный
+// и параллельный вызов — гарантирует, что ни одна горутина CM не
+// выполняется. Реализация: sync.Once-обёртка вокруг {state=Dead под cm.mu;
+// close(shutdownCh); wg.Wait() вне cm.mu}; раннего возврата без wg.Wait()
+// нет. sync.Once.Do блокирует параллельных вызывающих до завершения
+// первого вызова, поэтому постусловие выполняется и для них.
 func (cm *ConsensusModule) Stop() {
-	cm.mu.Lock()
-	if cm.cmState.state == Dead {
+	cm.stopOnce.Do(func() {
+		cm.mu.Lock()
+		cm.cmState.state = Dead
+		cm.shutdownClosed = true
 		cm.mu.Unlock()
-		return
-	}
-	cm.cmState.state = Dead
-	cm.mu.Unlock()
 
-	cm.traceLogf(0, "CM.Stop called / becomes Dead")
-	close(cm.shutdownCh)
+		cm.traceLogf(0, "CM.Stop called / becomes Dead")
+		close(cm.shutdownCh)
+		cm.wg.Wait()
+	})
+}
+
+// goSpawnLocked запускает fn в горутине, зарегистрированной в cm.wg.
+// Вызывается при УЖЕ удерживаемой cm.mu (площадки becomeFollower,
+// startElection, startLeader, leaderSendAEs — ADR-003 п.1, разметка
+// площадок). Контракт: пара «проверка Dead/shutdownClosed + wg.Add»
+// атомарна относительно state=Dead под cm.mu — поэтому wg.Add не может
+// произойти после начала wg.Wait() в Stop().
+//
+// Запрет R-N1: НЕ допускается временное освобождение cm.mu внутри
+// вызывающих ради unlocked-формы — это разорвало бы атомарность
+// перехода состояния и открыло окно для конкурирующего Stop().
+func (cm *ConsensusModule) goSpawnLocked(fn func()) {
+	if cm.cmState.state == Dead || cm.shutdownClosed {
+		return // узел останавливается: горутина не стартует
+	}
+	cm.wg.Add(1)
+	go func() {
+		defer cm.wg.Done()
+		fn()
+	}()
+}
+
+// goSpawn — то же, что goSpawnLocked, для вызывающих, НЕ удерживающих
+// cm.mu (конструктор, runPreCandidate, catch-up передачи лидерства,
+// post-commit горутина конфигурации). Самостоятельно захватывает cm.mu.
+// Не вызывает пользовательский код под блокировкой (только проверка,
+// Add и go).
+func (cm *ConsensusModule) goSpawn(fn func()) {
+	cm.mu.Lock()
+	cm.goSpawnLocked(fn)
+	cm.mu.Unlock()
 }
 
 // debugLogf выводит отладочное сообщение.

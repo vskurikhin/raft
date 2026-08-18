@@ -70,6 +70,12 @@ func (t *InmemTransport) AppendEntries(peerID ServerID, args AppendEntriesArgs) 
 		return zero, ErrRaftShutdown
 	case <-peer.shutdownCh:
 		return zero, ErrRaftShutdown
+	case <-time.After(t.timeout):
+		// Ограничение блокировки отправителя (ADR-003 п.2, SA-004):
+		// при остановленном получателе с ещё открытым транспортом
+		// enqueue не должен блокироваться навсегда — join в Stop()
+		// обязан оставаться конечным.
+		return zero, ErrEnqueueTimeout
 	}
 	select {
 	case resp := <-respCh:
@@ -110,6 +116,12 @@ func (t *InmemTransport) RequestVote(peerID ServerID, args RequestVoteArgs) (Req
 		return zero, ErrRaftShutdown
 	case <-peer.shutdownCh:
 		return zero, ErrRaftShutdown
+	case <-time.After(t.timeout):
+		// Ограничение блокировки отправителя (ADR-003 п.2, SA-004):
+		// при остановленном получателе с ещё открытым транспортом
+		// enqueue не должен блокироваться навсегда — join в Stop()
+		// обязан оставаться конечным.
+		return zero, ErrEnqueueTimeout
 	}
 	select {
 	case resp := <-respCh:
@@ -150,6 +162,12 @@ func (t *InmemTransport) RequestPreVote(peerID ServerID, args RequestPreVoteArgs
 		return zero, ErrRaftShutdown
 	case <-peer.shutdownCh:
 		return zero, ErrRaftShutdown
+	case <-time.After(t.timeout):
+		// Ограничение блокировки отправителя (ADR-003 п.2, SA-004):
+		// при остановленном получателе с ещё открытым транспортом
+		// enqueue не должен блокироваться навсегда — join в Stop()
+		// обязан оставаться конечным.
+		return zero, ErrEnqueueTimeout
 	}
 	select {
 	case resp := <-respCh:
@@ -191,6 +209,12 @@ func (t *InmemTransport) TimeoutNow(peerID ServerID, args TimeoutNowRequest) (Ti
 		return zero, ErrRaftShutdown
 	case <-peer.shutdownCh:
 		return zero, ErrRaftShutdown
+	case <-time.After(t.timeout):
+		// Ограничение блокировки отправителя (ADR-003 п.2, SA-004):
+		// при остановленном получателе с ещё открытым транспортом
+		// enqueue не должен блокироваться навсегда — join в Stop()
+		// обязан оставаться конечным.
+		return zero, ErrEnqueueTimeout
 	}
 	select {
 	case resp := <-respCh:
@@ -236,6 +260,8 @@ func (t *InmemTransport) InstallSnapshot(
 		return zero, ErrRaftShutdown
 	case <-peer.shutdownCh:
 		return zero, ErrRaftShutdown
+	case <-time.After(t.timeout):
+		return zero, ErrEnqueueTimeout
 	}
 	select {
 	case resp := <-respCh:

@@ -11,6 +11,8 @@
 /tcplisten
 /testdata
 /*.go
+bootstrap.sh
+CLAUDE.md
 http-server
 fasthttpproxy-server
 tags

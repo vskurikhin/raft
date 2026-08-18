@@ -166,7 +166,12 @@ func (s *Server) VerifyLeader() Future {
 	return s.cm.VerifyLeader()
 }
 
-// Shutdown останавливает сервер.
+// Shutdown останавливает сервер: cm.Stop() (присоединяет все горутины
+// CM — join после TASK-001), затем transport.Close(). Контракт порядка
+// (ADR-003 п.2): transport.Close() выполняется до или одновременно с join
+// горутин CM; фактически — сразу после Stop(), поэтому отправители RPC
+// не блокируются навсегда на остановленном получателе с открытым
+// транспортом.
 func (s *Server) Shutdown() {
 	s.cm.Stop()
 	s.mu.Lock()

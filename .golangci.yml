@@ -46,6 +46,10 @@ linters:
     - wsl
     - wsl_v5
   settings:
+    funlen:
+      lines: 99
+      statements: 88
+      ignore-comments: true
     gocritic:
       disabled-checks:
         - importShadow

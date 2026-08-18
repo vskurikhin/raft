@@ -171,15 +171,12 @@ func TestPreVote_ReconnectStable(t *testing.T) {
 func TestPreVote_Disabled(t *testing.T) {
 	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
 
-	h := NewHarness(t, 3)
+	// Pre-Vote отключается на всех узлах кластера через опцию Harness
+	// ДО close(ready) — до старта фоновых горутин (INV-T5: никакой
+	// post-start мутации конфигурации). TickerTimeoutMs = 7*Quantum =
+	// 21ms — первый tick election timer не успевает сработать раньше.
+	h := NewHarnessWithOptions(t, 3, DisablePreVote())
 	defer h.Shutdown()
-
-	// Отключаем Pre-Vote на всех узлах сразу после создания Harness,
-	// но до того, как election timer успеет сработать (первый tick через
-	// TickerTimeoutMs = 20ms).
-	for _, cm := range h.cluster {
-		cm.preVoteDisabled = true
-	}
 
 	lid, origTerm := h.CheckSingleLeader()
 

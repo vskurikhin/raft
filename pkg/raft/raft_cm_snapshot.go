@@ -66,7 +66,6 @@ func (cm *ConsensusModule) handleInstallSnapshot(rpc RPC, req *InstallSnapshotRe
 			ProtocolVersion: ProtocolVersion,
 			ServerID:        cm.id,
 		},
-		Term:    cm.cmState.currentTerm,
 		Success: false,
 	}
 	var rpcErr error
@@ -81,6 +80,9 @@ func (cm *ConsensusModule) handleInstallSnapshot(rpc RPC, req *InstallSnapshotRe
 	}()
 
 	cm.mu.Lock()
+	// Term снимается под cm.mu (RISK-003): чтение cm.cmState.currentTerm
+	// вне критической секции — data race.
+	resp.Term = cm.cmState.currentTerm
 	if req.Term < cm.cmState.currentTerm {
 		cm.mu.Unlock()
 		return

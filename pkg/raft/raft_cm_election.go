@@ -49,7 +49,7 @@ func (cm *ConsensusModule) becomeFollower(term int) {
 		close(cm.cmState.electionTimerDone)
 	}
 	cm.cmState.electionTimerDone = make(chan struct{})
-	go cm.runElectionTimer()
+	cm.goSpawnLocked(cm.runElectionTimer)
 }
 
 // startElection запускает новые выборы с этим CM в качестве кандидата.
@@ -103,7 +103,7 @@ func (cm *ConsensusModule) startElection() {
 		if s.Suffrage != Voter {
 			continue
 		}
-		go func(peerID int, lt bool) { // TODO funlen
+		cm.goSpawnLocked(func() { // TODO funlen
 			cm.mu.Lock()
 			savedLastLogIndex, savedLastLogTerm := cm.lastLogIndexAndTerm()
 			cm.mu.Unlock()
@@ -117,7 +117,7 @@ func (cm *ConsensusModule) startElection() {
 				CandidateID:        cm.id,
 				LastLogIndex:       savedLastLogIndex,
 				LastLogTerm:        savedLastLogTerm,
-				LeadershipTransfer: lt,
+				LeadershipTransfer: isLeadershipTransfer,
 			}
 
 			cm.traceLogf(0, "sending RequestVote to %d: %+v", peerID, args)
@@ -152,11 +152,11 @@ func (cm *ConsensusModule) startElection() {
 				}
 				cm.mu.Unlock()
 			}
-		}(peerID, isLeadershipTransfer)
+		})
 	}
 
 	// Запустить новый таймер выборов на случай, если текущие выборы не завершатся успешно.
-	go cm.runElectionTimer()
+	cm.goSpawnLocked(cm.runElectionTimer)
 }
 
 // runElectionTimer реализует таймер выборов. Она должна запускаться всякий раз, когда
@@ -218,7 +218,7 @@ func (cm *ConsensusModule) runElectionTimer() {
 					return
 				}
 				cm.mu.Unlock()
-				go cm.runPreCandidate()
+				cm.goSpawn(cm.runPreCandidate)
 				return
 			}
 			cm.mu.Unlock()
@@ -293,7 +293,7 @@ func (cm *ConsensusModule) runPreCandidate() {
 		if s.Suffrage != Voter {
 			continue
 		}
-		go func(peerID int) {
+		cm.goSpawn(func() {
 			cm.mu.Lock()
 			lastLogIndex, lastLogTerm := cm.lastLogIndexAndTerm()
 			savedTerm := cm.cmState.currentTerm
@@ -352,7 +352,7 @@ func (cm *ConsensusModule) runPreCandidate() {
 			case preVoteRespCh <- &reply:
 			case <-ctx.Done():
 			}
-		}(peerID)
+		})
 	}
 
 	grantedVotes := 1 // голос за себя

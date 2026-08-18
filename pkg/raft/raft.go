@@ -187,6 +187,9 @@ func NewConsensusModule(
 	if isNilInterface(transport) {
 		log.Fatalln("raft: NewConsensusModule: transport is nil")
 	}
+	// Сторожевой флаг контракта трассировки: конфигурация SetTraceLogFile
+	// разрешена только до создания первого CM (строгий set-once, ADR-004).
+	traceCMCreated.Store(true)
 	cm := new(ConsensusModule)
 	cm.id = id
 	cm.peerIds = peerIds
@@ -254,21 +257,21 @@ func NewConsensusModule(
 		cm.setInitialConfiguration()
 	}
 
-	go cm.runFSM()
-	go cm.runRPCReader()
+	cm.goSpawn(cm.runFSM)
+	cm.goSpawn(cm.runRPCReader)
 
 	if cm.snapshotStore != nil {
-		go cm.runSnapshots()
+		cm.goSpawn(cm.runSnapshots)
 	}
 
-	go func() {
+	cm.goSpawn(func() {
 		<-ready
 		cm.mu.Lock()
 		cm.cmState.electionResetEvent = time.Now()
 		cm.mu.Unlock()
 		cm.runElectionTimer()
-	}()
-	go cm.stats(cm.shutdownCh)
+	})
+	cm.goSpawn(func() { cm.stats(cm.shutdownCh) })
 	return cm
 }
 

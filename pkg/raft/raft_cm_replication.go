@@ -175,7 +175,9 @@ func (cm *ConsensusModule) leaderSendAEs() {
 			continue
 		}
 		if cm.leaderState.inflightAE[peerID].CompareAndSwap(false, true) {
-			go cm.leaderSendAEsToPeer(peerID, savedCurrentTerm, dispatchEpoch)
+			cm.goSpawnLocked(func() {
+				cm.leaderSendAEsToPeer(peerID, savedCurrentTerm, dispatchEpoch)
+			})
 		}
 	}
 	cm.mu.Unlock()

@@ -40,7 +40,18 @@ func ParseFlags() Values {
 	traceLogLevelFlag := fs.Int("trace-log-level", 1, "Trace log level for raft.TraceCM and kvservice.TraceKV")
 	traceLogFileFlag := fs.String("trace-log-file", "", "Trace log file path (empty = stderr)")
 	dataDirFlag := fs.String("data-dir", "", "Directory for persistent storage")
-	err := fs.Parse(os.Args[1:])
+
+	// Test-бинарники пакета cmd передают собственные -test.* флаги;
+	// ParseFlags их игнорирует, чтобы `go test ./cmd` не завершался
+	// ошибкой разбора на старте (production os.Args их не содержит).
+	args := make([]string, 0, len(os.Args)-1)
+	for _, arg := range os.Args[1:] {
+		if strings.HasPrefix(arg, "-test.") {
+			continue
+		}
+		args = append(args, arg)
+	}
+	err := fs.Parse(args)
 	if err != nil {
 		log.Fatal(err)
 	}

@@ -27,15 +27,25 @@ func main() {
 	}
 }
 
+// run запускает узел с параметрами командной строки и блокируется
+// до завершения процесса.
 func run() error {
-	return runWith(&_init.Values)
+	stop, err := runWith(&_init.Values)
+	if err != nil {
+		return err
+	}
+	defer stop()
+	select {} // работа узла до завершения процесса
 }
 
 var wg sync.WaitGroup
 
-func runWith(values *config.Values) error {
+// runWith создаёт и запускает узел с заданными параметрами values и
+// возвращает stop-функцию для корректного завершения узла
+// (CM.Stop → HTTP shutdown). Позволяет тестам управлять полным
+// lifecycle узла без глобальных run-инстансов.
+func runWith(values *config.Values) (func(), error) {
 	nums := slices.Collect(maps.Keys(values.Peers))
-	done := make(chan any)
 	ready := make(chan any)
 
 	dataDir := values.DataDir
@@ -48,7 +58,7 @@ func runWith(values *config.Values) error {
 	// запас на случай повреждения последнего снапшота.
 	snapshotStore, err := raft.NewFileSnapshotStore(dataDir, 2)
 	if err != nil {
-		return fmt.Errorf("failed to create file snapshot store in %s: %w", dataDir, err)
+		return nil, fmt.Errorf("failed to create file snapshot store in %s: %w", dataDir, err)
 	}
 
 	cfg := kvservice.Config{
@@ -72,8 +82,13 @@ func runWith(values *config.Values) error {
 	wg.Wait()
 	close(ready)
 	kvs.ServeHTTP(values.HTTPAddress.String())
-	<-done
-	return nil
+
+	return func() {
+		log.Printf("stopping node %d", values.Number)
+		if err := kvs.Shutdown(); err != nil {
+			log.Printf("warning: shutting down node %d: %v", values.Number, err)
+		}
+	}, nil
 }
 
 var (

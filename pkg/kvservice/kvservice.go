@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/vskurikhin/raft/pkg/api"
@@ -29,18 +30,37 @@ var _traceLogger = log.Default()
 // _traceLogFile — открытый файл трассировки; nil, если вывод в stderr.
 var _traceLogFile *os.File
 
-// SetTraceLogFile перенаправляет отладочные сообщения (traceLogf) в файл
-// с указанным путём. Файл открывается в режиме добавления и создаётся
-// при необходимости. Пустая строка возвращает вывод в стандартный логгер.
+// traceConfigured — сторожевой флаг строгого set-once: единственная
+// успешная конфигурация трассировки на процесс уже выполнена.
+// Устанавливается только успешным вызовом SetTraceLogFile
+// (вызов, завершившийся ошибкой I/O, окно не расходует).
+var traceConfigured atomic.Bool
+
+// traceCMCreated — сторожевой флаг: в процессе уже создавался
+// KVService. Устанавливается конструктором New/NewKVService.
+var traceCMCreated atomic.Bool
+
+// SetTraceLogFile конфигурирует трассировку (traceLogf): путь к файлу
+// журнала; пустая строка — вывод в стандартный логгер. Файл открывается
+// в режиме добавления и создаётся при необходимости.
 //
-// Должна вызываться до старта горутин, использующих трассировку.
+// Контракт (строгий set-once-before-first-service, симметрично pkg/raft):
+// функция успешна ровно один раз на процесс, до создания первого
+// KVService. Первый успешный вызов выигрывает и замораживает
+// конфигурацию; состояние трассировки после этого read-only. Любой
+// повторный вызов — детерминированная ошибка контракта, в том числе
+// до создания сервиса; вызов после создания — та же ошибка. Вызов,
+// завершившийся ошибкой I/O, окно конфигурации не расходует.
 func SetTraceLogFile(path string) error {
-	if _traceLogFile != nil {
-		_ = _traceLogFile.Close()
-		_traceLogFile = nil
+	if traceConfigured.Load() || traceCMCreated.Load() {
+		return fmt.Errorf(
+			"kvservice: trace configuration must be set exactly once, " +
+				"before the first KVService is created; repeated calls are forbidden",
+		)
 	}
 	if path == "" {
 		_traceLogger = log.Default()
+		traceConfigured.Store(true)
 		return nil
 	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
@@ -49,6 +69,7 @@ func SetTraceLogFile(path string) error {
 	}
 	_traceLogFile = f
 	_traceLogger = log.New(f, "", log.LstdFlags|log.Lmicroseconds)
+	traceConfigured.Store(true)
 	return nil
 }
 
@@ -93,6 +114,10 @@ type Config struct {
 // непосредственно к DataStore через метод Apply.
 func New(cfg *Config, readyChan <-chan any) *KVService {
 	gob.Register(Command{})
+
+	// Сторожевой флаг контракта трассировки: конфигурация SetTraceLogFile
+	// разрешена только до создания первого сервиса (строгий set-once).
+	traceCMCreated.Store(true)
 
 	kvs := &KVService{
 		id:                   cfg.ServerID,

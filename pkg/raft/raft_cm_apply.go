@@ -177,6 +177,14 @@ func (cm *ConsensusModule) sendBatch(start, end int) {
 	}
 	cm.mu.Unlock()
 	if len(batch) > 0 {
-		cm.fsmMutateCh <- batch
+		// Отправка с веткой shutdownCh (ADR-003 п.3, NEW-03): после выхода
+		// runFSM по shutdownCh канал fsmMutateCh не дренируется, и при
+		// заполненном буфере (1024) простая отправка блокировалась бы
+		// навсегда — wg.Wait() в Stop() не завершился бы.
+		select {
+		case cm.fsmMutateCh <- batch:
+		case <-cm.shutdownCh:
+			return
+		}
 	}
 }

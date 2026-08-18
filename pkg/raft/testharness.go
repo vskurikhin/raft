@@ -9,6 +9,41 @@ import (
 
 const submitTimeout = 5 * time.Second
 
+// Test-only константы бюджетов (единственный владелец — TASK-009; ADR-002,
+// ADR-003 п.8). Разделение Protocol timeout / Test deadline / Poll interval:
+// бюджеты — Test deadline, выведенный из worst-case фаз протокола.
+
+const (
+	// maxElectionTimeout — максимальный election timeout:
+	// 2*ReelectionTimeoutMs = 762ms.
+	maxElectionTimeout = 2 * ReelectionTimeoutMs * time.Millisecond
+
+	// preVoteRound — worst-case раунда Pre-Vote (≈ maxElectionTimeout).
+	preVoteRound = maxElectionTimeout
+
+	// inmemRPCTimeout — именованная копия значения InmemTransport.timeout
+	// (transport_inmem.go:35). При рассинхроне с транспортом источник
+	// истины — транспорт.
+	inmemRPCTimeout = 500 * time.Millisecond
+
+	// commitBudgetSteady — бюджет ожидания коммита при устоявшемся лидере:
+	// 4*(applyBatchInterval + inmemRPCTimeout) = 4*(50ms+500ms) = 2.2s.
+	commitBudgetSteady = 4 * (applyBatchInterval + inmemRPCTimeout)
+
+	// failoverBudgetMargin — запас бюджета after-failover для поглощения
+	// межфазных задержек (worst-case 2*762 + 762 + 50 + 200 ≈ 2.5s).
+	failoverBudgetMargin = 200 * time.Millisecond
+
+	// commitBudgetAfterFailover — бюджет ожидания коммита для сценариев
+	// с возможными перевыборами (disconnect/restart/leadership transfer):
+	// 2*maxElectionTimeout + preVoteRound + applyBatchInterval + запас ≈ 2.5–3s.
+	commitBudgetAfterFailover = 2*maxElectionTimeout + preVoteRound + applyBatchInterval + failoverBudgetMargin
+
+	// LeaktestBudget — единый бюджет leaktest:
+	// max(inmemRPCTimeout, TCPRPCTimeout) + 100ms = 600ms.
+	LeaktestBudget = 600 * time.Millisecond
+)
+
 func init() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 }
@@ -45,14 +80,44 @@ type Harness struct {
 	// shutdownOnce защищает Shutdown() от повторного вызова.
 	shutdownOnce sync.Once
 
+	// wg — регистрация коллекторов collectCommits; Shutdown() закрывает
+	// каналы и присоединяет коллекторы через wg.Wait() (INV-T3: закрытие
+	// каналов — только после гарантированного завершения producers).
+	wg sync.WaitGroup
+
+	// collectorDone содержит по одному каналу завершения коллектора
+	// текущей incarnation каждого узла. Используется quiesce-барьером
+	// CrashPeer (ADR-003 п.7): коллектор старой incarnation
+	// присоединяется до очистки h.commits[id].
+	collectorDone []chan struct{}
+
 	n int
 	t *testing.T
+}
+
+// HarnessOption — опция конфигурации узлов Harness. Применяется к
+// каждому созданному ConsensusModule ДО close(ready), т.е. до старта
+// фоновых горутин (INV-T5: конфигурация — до старта, без post-start
+// мутаций). Поддерживает кластерное применение (ADR-005).
+type HarnessOption func(cm *ConsensusModule)
+
+// DisablePreVote — опция Harness: отключение Pre-Vote на узле
+// (preVoteDisabled=true до старта горутин). При передаче в
+// NewHarnessWithOptions применяется ко всем узлам кластера.
+func DisablePreVote() HarnessOption {
+	return func(cm *ConsensusModule) { cm.preVoteDisabled = true }
 }
 
 // NewHarness создаёт новую тестовую запряжку,
 // инициализированную n серверами, соединёнными друг с другом
 // через InmemTransport.
 func NewHarness(t *testing.T, n int) *Harness {
+	return NewHarnessWithOptions(t, n)
+}
+
+// NewHarnessWithOptions создаёт Harness с опциями opts, применяемыми
+// к каждому узлу до close(ready) (до старта фоновых горутин).
+func NewHarnessWithOptions(t *testing.T, n int, opts ...HarnessOption) *Harness {
 	cluster := make([]*ConsensusModule, n)
 	transports := make([]*InmemTransport, n)
 	connected := make([]bool, n)
@@ -92,30 +157,47 @@ func NewHarness(t *testing.T, n int) *Harness {
 			i, peerIds, transports[i],
 			storage[i], NewCommitChannelFSM(commitChans[i]), ready,
 		)
+		// Опции применяются до close(ready) — до старта фоновых
+		// горутин узла (INV-T5); никакой post-start мутации.
+		for _, opt := range opts {
+			opt(cluster[i])
+		}
 		alive[i] = true
 		connected[i] = true
 	}
 	close(ready)
 
 	h := &Harness{
-		cluster:     cluster,
-		transports:  transports,
-		storage:     storage,
-		commitChans: commitChans,
-		commits:     commits,
-		connected:   connected,
-		alive:       alive,
-		n:           n,
-		t:           t,
+		cluster:       cluster,
+		transports:    transports,
+		storage:       storage,
+		commitChans:   commitChans,
+		commits:       commits,
+		connected:     connected,
+		alive:         alive,
+		collectorDone: make([]chan struct{}, n),
+		n:             n,
+		t:             t,
 	}
 	for i := 0; i < n; i++ {
-		go h.collectCommits(i)
+		h.collectorDone[i] = h.startCollector(i, commitChans[i])
 	}
 	return h
 }
 
 // Shutdown останавливает все серверы в тестовом окружении.
 // Идемпотентен — повторные вызовы безопасны.
+//
+// Последовательность (ADR-003 п.9 / ADR-011 п.2): cm.Stop() (join) →
+// transports[i].Close() → close(commitChans[i]) → join коллекторов.
+// Контракт порядка: transport.Close() выполняется до или одновременно
+// с join горутин CM — фактически сразу после Stop(), поэтому
+// отправители RPC не могут блокироваться навсегда.
+// Инвариант границ критических секций h.mu (NEW-02): h.mu удерживается
+// только короткими секциями над полями Harness и НИКОГДА не удерживается
+// через cm.Stop(), transport.Close(), close(commitChans[i]) и join
+// коллекторов (цикл h.mu → join runFSM → Apply в канал → collectCommits
+// ждёт h.mu = вечный deadlock).
 func (h *Harness) Shutdown() {
 	h.shutdownOnce.Do(func() {
 		for i := 0; i < h.n; i++ {
@@ -156,14 +238,35 @@ func (h *Harness) ReconnectPeer(id int) {
 
 // CrashPeer «аварийно завершает работу» сервера, отключая его
 // и останавливая CM. Хранилище сохраняется.
-// TODO имеет гонку между collectCommits и очисткой h.commits[id].
+//
+// Quiesce-барьер (ADR-003 п.7, SA-005): канал commitChans[id] пересоздаётся
+// per-incarnation под владением Harness — закрытие старого канала → join
+// коллектора старой incarnation → новый канал → новый коллектор → очистка
+// h.commits[id] под h.mu после join. Инвариант: в момент возврата ни одна
+// горутина не держит ссылку на старый канал, h.commits[id] пуст и остаётся
+// пустым. Инвариант границ h.mu (NEW-02): блокирующие lifecycle-операции
+// выполняются ВНЕ h.mu.
 func (h *Harness) CrashPeer(id int) {
 	tlog("Crash %d", id)
 	h.DisconnectPeer(id)
+
+	// [h.mu: alive[id]=false] release — короткая секция.
+	h.mu.Lock()
 	h.alive[id] = false
+	h.mu.Unlock()
+
 	h.cluster[id].Stop()
 	h.transports[id].Close()
 
+	// Quiesce-барьер: join коллектора старой incarnation до очистки.
+	oldCh := h.commitChans[id]
+	close(oldCh)
+	<-h.collectorDone[id]
+
+	h.commitChans[id] = make(chan CommitEntry)
+	h.collectorDone[id] = h.startCollector(id, h.commitChans[id])
+
+	// [h.mu: очистка commits[id]] release — после join старого коллектора.
 	h.mu.Lock()
 	h.commits[id] = h.commits[id][:0]
 	h.mu.Unlock()
@@ -202,7 +305,33 @@ func (h *Harness) RestartPeer(id int) {
 	close(ready)
 	h.alive[id] = true
 	h.connected[id] = true
-	sleepMs(20)
+	h.waitForPeerReady(id)
+}
+
+// waitForPeerReady ожидает готовность перезапущенного узла: CM отвечает
+// на Report() (CM создан и restore завершён синхронно в конструкторе)
+// и транспорт узла подключён ко всем живым соседям. Бюджет —
+// commitBudgetSteady (условия обычно истинны сразу — poll немедленный).
+func (h *Harness) waitForPeerReady(id int) {
+	h.t.Helper()
+	deadline := time.Now().Add(commitBudgetSteady)
+	for time.Now().Before(deadline) {
+		reportID, _, _ := h.cluster[id].Report()
+		ready := reportID == id
+		if ready {
+			for j := 0; j < h.n; j++ {
+				if j != id && h.alive[j] && h.transports[id].IsDisconnected(ServerID(j)) {
+					ready = false
+					break
+				}
+			}
+		}
+		if ready {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	h.t.Fatalf("restarted peer %d did not become ready within %v", id, commitBudgetSteady)
 }
 
 // PeerDropCallsAfterN — больше не поддерживается (RPCProxy удалён).
@@ -412,9 +541,24 @@ func sleepMs(n int) {
 	time.Sleep(time.Duration(n) * time.Millisecond)
 }
 
-// collectCommits читает сообщения из канала commitChans[i].
-func (h *Harness) collectCommits(i int) {
-	for c := range h.commitChans[i] {
+// startCollector запускает коллектор узла i для канала ch и возвращает
+// канал завершения коллектора. Коллектор регистрируется в h.wg (join в
+// Shutdown) и закрывает done по завершении (quiesce-барьер CrashPeer).
+func (h *Harness) startCollector(i int, ch chan CommitEntry) chan struct{} {
+	done := make(chan struct{})
+	h.wg.Add(1)
+	go func() {
+		defer h.wg.Done()
+		defer close(done)
+		h.collectCommits(i, ch)
+	}()
+	return done
+}
+
+// collectCommits читает сообщения из канала ch и добавляет их в
+// h.commits[i] под h.mu. Завершается по закрытию канала (range).
+func (h *Harness) collectCommits(i int, ch <-chan CommitEntry) {
+	for c := range ch {
 		h.mu.Lock()
 		tlog("collectCommits(%d) got %+v", i, c)
 		h.commits[i] = append(h.commits[i], c)

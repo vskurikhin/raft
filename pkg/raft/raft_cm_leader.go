@@ -252,14 +252,17 @@ func (cm *ConsensusModule) appendConfigurationEntry(future *configurationChangeF
 		cm.traceLockedLogf(2, "leader sets commitIndex := %d", newCI)
 		cm.cmState.commitIndex = newCI
 	}
+	// Значение снимается в критической секции до Unlock (RISK-002):
+	// чтение cm.cmState.commitIndex вне cm.mu — data race.
+	commitIndex := cm.cmState.commitIndex
 	cm.mu.Unlock()
 
-	if cm.cmState.commitIndex > savedCommitIndex {
-		cm.processLogs(cm.cmState.commitIndex)
+	if commitIndex > savedCommitIndex {
+		cm.processLogs(commitIndex)
 	}
 	cm.leaderSendAEs()
 
-	go func() {
+	cm.goSpawn(func() {
 		err := entry.Error()
 		if err == nil {
 			cm.mu.Lock()
@@ -270,7 +273,7 @@ func (cm *ConsensusModule) appendConfigurationEntry(future *configurationChangeF
 			cm.leaderSendAEs()
 		}
 		future.respond(err)
-	}()
+	})
 }
 
 // configurationChangeChIfStable возвращает канал confChangeCh только когда
@@ -344,7 +347,7 @@ func (cm *ConsensusModule) handleLeadershipTransfer(future *leadershipTransferFu
 	// 3. Если цель отстаёт по журналу — догоняем.
 	if targetNextIdx <= lastIdx {
 		done := make(chan error, 1)
-		go func() {
+		cm.goSpawn(func() {
 			for {
 				// Отправляем сигнал репликации целевому узлу.
 				// Эпоха верификации снимается под cm.mu для каждого
@@ -371,7 +374,7 @@ func (cm *ConsensusModule) handleLeadershipTransfer(future *leadershipTransferFu
 				}
 				cm.mu.Unlock()
 			}
-		}()
+		})
 
 		// Таймаут догоняющей репликации.
 		select {
@@ -671,7 +674,7 @@ func (cm *ConsensusModule) startLeader() {
 	// commit выполняется под новой конфигурацией трекера — :229).
 	cm.leaderState.commitmentTracker.commit(cm.cmState.lastLogIndex, cm.lookupTerm)
 
-	go cm.runLeaderLoop()
+	cm.goSpawnLocked(cm.runLeaderLoop)
 }
 
 // ensureReplicationFor добавляет репликационные структуры (nextIndex,

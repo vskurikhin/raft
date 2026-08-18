@@ -267,17 +267,18 @@ func testFSMHarness(t *testing.T) (*Harness, *CaptureFSM) {
 	close(ready)
 
 	h := &Harness{
-		cluster:     cluster,
-		transports:  transports,
-		storage:     storage,
-		commitChans: commitChans,
-		commits:     commits,
-		connected:   connected,
-		alive:       alive,
-		n:           n,
-		t:           t,
+		cluster:       cluster,
+		transports:    transports,
+		storage:       storage,
+		commitChans:   commitChans,
+		commits:       commits,
+		connected:     connected,
+		alive:         alive,
+		collectorDone: make([]chan struct{}, n),
+		n:             n,
+		t:             t,
 	}
-	go h.collectCommits(0)
+	h.collectorDone[0] = h.startCollector(0, commitChans[0])
 	return h, capture
 }
 

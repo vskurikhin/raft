@@ -578,10 +578,6 @@ func TestCrashAfterSubmit(t *testing.T) {
 	sleepMs(10)
 	h.CheckSingleLeader()
 
-	// CrashPeer может оставить «висячий» commit entry
-	// (гонка между collectCommits и очисткой в CrashPeer).
-	h.commits[origLeaderId] = h.commits[origLeaderId][:0]
-
 	h.RestartPeer(origLeaderId)
 	sleepMs(100)
 	newLeaderId, _ := h.CheckSingleLeader()
