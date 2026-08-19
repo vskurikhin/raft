@@ -37,11 +37,27 @@ RAFT3_PORT=9993
 TEMP_FILE=$(shell mktemp)
 MAIN_GO=./$(CMD_SERVER)/main.go
 
+# Test related variables.
+# PKG ограничивает набор пакетов, TESTFLAGS — дополнительные флаги go test.
+# Пример: make test PKG=./pkg/raft TESTFLAGS="-run TestElection -count=1"
+PKG?=./...
+TESTFLAGS?=
+LINTFLAGS?=
+
 # Make is verbose in Linux. Make it silent.
 MAKEFLAGS += --silent
 
 ## coverage: Calculate coverage
 coverage: go-coverage
+
+## test: Run all tests (PKG=./... TESTFLAGS="")
+test: go-test
+
+## test-race: Run all tests with the race detector (PKG=./... TESTFLAGS="")
+test-race: go-test-race
+
+## lint: Run golangci-lint (config .golangci.yml, requires v2.12.2)
+lint: go-lint
 
 ## start: Start in development mode. Auto-starts when code changes.
 start: start-raft
@@ -112,6 +128,23 @@ go-coverage:
 	# 3. (Optional) Generate the HTML report
 	@GOPATH=$(GOPATH) GOBIN=$(GOBIN) go tool cover -html=coverage.out -o docs/coverage.html
 
+# Тестовые и lint-цели НЕ переопределяют GOPATH: проект — Go-модуль,
+# GOPATH для него не нужен, а значение "$(GOBASE)/vendor:..." заставляет
+# go создать каталог $(GOBASE)/vendor как GOPATH-корень. Появление
+# vendor/ в корне модуля переводит go в vendor-режим и ломает любую
+# сборку ошибкой "inconsistent vendoring".
+go-test:
+	@echo "  >  Running tests: $(PKG) $(TESTFLAGS)"
+	@go test $(TESTFLAGS) $(PKG)
+
+go-test-race:
+	@echo "  >  Running tests with -race: $(PKG) $(TESTFLAGS)"
+	@go test -race $(TESTFLAGS) $(PKG)
+
+go-lint:
+	@echo "  >  Running golangci-lint: $(PKG) $(LINTFLAGS)"
+	@golangci-lint run $(LINTFLAGS) $(PKG)
+
 go-get:
 	@echo "  >  Checking if there is any missing dependencies..."
 	@GOPATH=$(GOPATH) GOBIN=$(GOBIN) go get $(get)
@@ -133,6 +166,8 @@ go-install:
 go-clean:
 	@echo "  >  Cleaning build cache"
 	@GOPATH=$(GOPATH) GOBIN=$(GOBIN) go clean
+
+.PHONY: test test-race lint go-test go-test-race go-lint
 
 .PHONY: help
 all: help
