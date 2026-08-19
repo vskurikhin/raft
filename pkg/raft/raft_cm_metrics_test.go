@@ -116,7 +116,7 @@ func TestLatencyObserveUnderMutexDoesNotBlock(t *testing.T) {
 // election-агрегата без паники и блокировки. Положительные утверждения о
 // счётчиках допустимы: stats на таком CM не запущена.
 func TestLatencyZeroValueCMMetricPaths(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	cm := &ConsensusModule{}
 	cm.storage = NewMapStorage()
@@ -284,7 +284,7 @@ func TestRaftCountersReportFormat(t *testing.T) {
 // предохранитель ADR-P07-002: повторная отсылка снапшота блокируется,
 // nextIndex остаётся согласованным (snapshotIndex+1, а не 0).
 func TestCounters_DistinguishSnapshotLoop(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	mock := &mockTransportAE{
 		failReply: true, failConflictIndex: 0, failConflictTerm: -1,
@@ -364,7 +364,7 @@ func TestCounters_DistinguishSnapshotLoop(t *testing.T) {
 // повторный Stop() безопасен, observe после Stop() не паникует и не
 // блокируется.
 func TestLatencyStopShutdownLifecycle(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	cm := new(ConsensusModule)
 	cm.shutdownCh = make(chan struct{})
@@ -385,7 +385,7 @@ func TestLatencyStopShutdownLifecycle(t *testing.T) {
 // лидера. Искусственная остановка потребителя метрик не эмулируется
 // (буфера больше нет).
 func TestLatencyRPCStormSmoke(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 10*time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -426,7 +426,7 @@ func TestLatencyRPCStormSmoke(t *testing.T) {
 // жизни горутины. T9b: после Stop() (выхода runFSM по shutdownCh)
 // дополнительные замеры fsmApply не появляются.
 func TestLatencyFsmApplyCountsBatches(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	fsm := &countBatchesFSM{}
 	cm := new(ConsensusModule)
@@ -452,6 +452,7 @@ func TestLatencyFsmApplyCountsBatches(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatalf("FSM применила %d батчей, want >= 2", fsm.appliedCount())
 		}
+		// poll-интервал condition-wait (не фиксированная пауза).
 		time.Sleep(time.Millisecond)
 	}
 
@@ -477,6 +478,7 @@ func TestLatencyFsmApplyCountsBatches(t *testing.T) {
 		if got := cm.latency.fsmApply.count.Load(); got != countBefore {
 			t.Fatalf("fsmApply.count изменился после Stop(): %d -> %d", countBefore, got)
 		}
+		// poll-интервал condition-wait (не фиксированная пауза).
 		time.Sleep(10 * time.Millisecond)
 	}
 }
@@ -495,6 +497,8 @@ type countBatchesFSM struct {
 // проверить sumUs > 0. Потокобезопасно: вызывается из горутины runFSM,
 // читается из горутины теста.
 func (f *countBatchesFSM) ApplyBatch(logs []*LogEntry) []any {
+	// keep: timing — окно является предметом проверки в этом месте;
+	// наблюдаемого признака состояния здесь нет.
 	time.Sleep(time.Millisecond)
 	f.mu.Lock()
 	f.applied++

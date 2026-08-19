@@ -81,7 +81,12 @@ func runWith(values *config.Values) (func(), error) {
 	}
 	wg.Wait()
 	close(ready)
-	kvs.ServeHTTP(values.HTTPAddress.String())
+	if err := kvs.ServeHTTP(values.HTTPAddress.String()); err != nil {
+		if shutdownErr := kvs.Shutdown(); shutdownErr != nil {
+			log.Printf("warning: shutting down node %d: %v", values.Number, shutdownErr)
+		}
+		return nil, fmt.Errorf("failed to serve HTTP on %s: %w", values.HTTPAddress, err)
+	}
 
 	return func() {
 		log.Printf("stopping node %d", values.Number)

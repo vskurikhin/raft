@@ -4,12 +4,14 @@ package kvservice
 import (
 	"context"
 	"encoding/gob"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -91,11 +93,31 @@ type KVService struct {
 	ds *DataStore
 
 	// srv — HTTP-сервер, через который сервис предоставляет внешний API.
+	// Устанавливается один раз в ServeHTTP до старта Serve-горутины и
+	// после этого не мутируется (ADR-012: владение сервером и listener'ом
+	// закреплено за структурой KVService; прежнее присваивание nil из
+	// Serve-горутины было data race).
 	srv *http.Server
+
+	// ln — listener HTTP-сервера. Устанавливается один раз в ServeHTTP
+	// до старта Serve-горутины и не мутируется. Позволяет узнать
+	// фактический адрес при address == ":0" (GetHTTPListenAddr).
+	ln net.Listener
+
+	// serveErrCh — канал доставки ошибки http.Server.Serve (кроме
+	// штатного ErrServerClosed). Буфер 1: Serve завершается один раз.
+	// Заменяет прежний log.Fatal из Serve-горутины, недопустимый
+	// в тестах (ADR-012).
+	serveErrCh chan error
+
+	// shutdownOnce обеспечивает идемпотентность Shutdown.
+	shutdownOnce sync.Once
 
 	// httpResponsesEnabled controls whether this service returns HTTP responses
 	// to the client. It's only used for testing and debugging.
-	httpResponsesEnabled bool
+	// atomic.Bool: пишется из тестовой горутины
+	// (ToggleHTTPResponsesEnabled), читается из HTTP-обработчиков.
+	httpResponsesEnabled atomic.Bool
 }
 
 // Config — конфигурация для создания нового KVService.
@@ -122,10 +144,11 @@ func New(cfg *Config, readyChan <-chan any) *KVService {
 	traceCMCreated.Store(true)
 
 	kvs := &KVService{
-		id:                   cfg.ServerID,
-		ds:                   NewDataStore(),
-		httpResponsesEnabled: true,
+		id:         cfg.ServerID,
+		ds:         NewDataStore(),
+		serveErrCh: make(chan error, 1),
 	}
+	kvs.httpResponsesEnabled.Store(true)
 	cfg.Fsm = kvs
 
 	// raft.Server обрабатывает RPC-вызовы протокола Raft в кластере.
@@ -239,12 +262,19 @@ func (kvs *KVService) IsLeader() bool {
 }
 
 // ServeHTTP запускает HTTP-сервер, предоставляющий REST API KV-сервиса
-// на указанном TCP-порту. Метод не блокирует выполнение: он запускает
-// HTTP-сервер в отдельной горутине и сразу возвращает управление.
+// на указанном TCP-адресе. Метод не блокирует выполнение: listener
+// открывается синхронно (поэтому фактический порт известен сразу после
+// возврата — см. GetHTTPListenAddr, в том числе при address == ":0"),
+// а обслуживание запускается в отдельной горутине.
+//
+// Ошибка открытия listener'а возвращается вызывающему; ошибка Serve
+// (кроме штатного http.ErrServerClosed) доставляется через ServeErr()
+// — log.Fatal из горутины недопустим (ADR-012).
+//
 // Для корректной остановки сервера вызовите метод Shutdown.
-func (kvs *KVService) ServeHTTP(address string) {
+func (kvs *KVService) ServeHTTP(address string) error {
 	if kvs.srv != nil {
-		panic("ServeHTTP called with existing server")
+		return fmt.Errorf("kvservice %d: ServeHTTP called with existing server", kvs.id)
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /get/", kvs.handleGet)
@@ -252,38 +282,69 @@ func (kvs *KVService) ServeHTTP(address string) {
 	mux.HandleFunc("POST /cas/", kvs.handleCAS)
 	mux.HandleFunc("POST /verifyleader/", kvs.handleVerifyLeader)
 
+	ln, err := net.Listen("tcp", address)
+	if err != nil {
+		return fmt.Errorf("kvservice %d: listen %q: %w", kvs.id, address, err)
+	}
+
+	// srv и ln устанавливаются ДО старта Serve-горутины и далее
+	// не мутируются — читатели (GetHTTPListenAddr, Shutdown) видят
+	// неизменяемые значения.
+	kvs.ln = ln
 	kvs.srv = &http.Server{
 		Addr:    address,
 		Handler: mux,
 	}
 
+	kvs.traceLogf("serving HTTP on %s", ln.Addr().String())
 	go func() {
-		kvs.traceLogf("serving HTTP on %s", kvs.srv.Addr)
-		if err := kvs.srv.ListenAndServe(); err != http.ErrServerClosed {
-			log.Fatal(err)
+		if err := kvs.srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			kvs.serveErrCh <- err
 		}
-		kvs.srv = nil
+		close(kvs.serveErrCh)
 	}()
+	return nil
+}
+
+// GetHTTPListenAddr возвращает фактический адрес HTTP-listener'а
+// (актуально при address == ":0"). Пустая строка — ServeHTTP не вызывался.
+func (kvs *KVService) GetHTTPListenAddr() string {
+	if kvs.ln == nil {
+		return ""
+	}
+	return kvs.ln.Addr().String()
+}
+
+// ServeErr возвращает канал ошибок HTTP-сервера. Канал закрывается
+// после завершения Serve; штатное завершение (http.ErrServerClosed)
+// ошибкой не считается и в канал не отправляется.
+func (kvs *KVService) ServeErr() <-chan error {
+	return kvs.serveErrCh
 }
 
 // Shutdown корректно завершает работу сервиса: останавливает RPC-сервер
 // Raft и основной HTTP-сервер. Метод возвращает управление только после
-// полного завершения процедуры остановки.
+// полного завершения процедуры остановки. Идемпотентен — повторные
+// вызовы безопасны и возвращают nil.
 //
 // Примечание: перед вызовом Shutdown необходимо вызвать
 // DisconnectFromRaftPeers для всех узлов кластера.
 func (kvs *KVService) Shutdown() error {
-	kvs.traceLogf("shutting down Raft server")
-	kvs.rs.Shutdown()
+	kvs.shutdownOnce.Do(func() {
+		kvs.traceLogf("shutting down Raft server")
+		kvs.rs.Shutdown()
 
-	if kvs.srv != nil {
-		kvs.traceLogf("shutting down HTTP server")
-		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-		defer cancel()
-		_ = kvs.srv.Shutdown(ctx)
-		kvs.traceLogf("HTTP shutdown complete")
-		return nil
-	}
+		if kvs.srv != nil {
+			kvs.traceLogf("shutting down HTTP server")
+			ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+			defer cancel()
+			// srv.Shutdown закрывает listener; ln.Close() дополнительно
+			// гарантирует освобождение порта при истечении ctx.
+			_ = kvs.srv.Shutdown(ctx)
+			_ = kvs.ln.Close()
+			kvs.traceLogf("HTTP shutdown complete")
+		}
+	})
 
 	return nil
 }
@@ -294,11 +355,11 @@ func (kvs *KVService) Shutdown() error {
 // со значением false; в этом случае сервис не будет отвечать клиентам
 // по HTTP.
 func (kvs *KVService) ToggleHTTPResponsesEnabled(enable bool) {
-	kvs.httpResponsesEnabled = enable
+	kvs.httpResponsesEnabled.Store(enable)
 }
 
 func (kvs *KVService) sendHTTPResponse(w http.ResponseWriter, v any) {
-	if kvs.httpResponsesEnabled {
+	if kvs.httpResponsesEnabled.Load() {
 		renderJSON(w, v)
 	}
 }

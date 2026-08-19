@@ -28,7 +28,7 @@ import (
 // Это ключевое преимущество Pre-Vote перед классическим Raft: в классическом
 // Raft отключённый follower увеличил бы term при каждой попытке выборов.
 func TestPreVote_DisconnectedFollower_NoElection(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -39,9 +39,14 @@ func TestPreVote_DisconnectedFollower_NoElection(t *testing.T) {
 	otherID := (lid + 1) % 3
 	h.DisconnectPeer(otherID)
 
-	// Ждём несколько election timeout, чтобы отключённый узел успел
-	// несколько раз запустить PreVote.
-	time.Sleep(time.Duration(ReelectionTimeoutMs) * time.Millisecond * 2)
+	// keep: budgeted negative window — проверяется, что за целый
+	// worst-case election timeout (maxElectionTimeout = 2*ReelectionTimeoutMs)
+	// отключённый узел НЕ увеличил term и не сменил лидера. Опрос
+	// не доказывает отсутствия события — окно осознанно временное;
+	// его уменьшение ослабило бы assert.
+	// keep: timing — окно является предметом проверки в этом месте;
+	// наблюдаемого признака состояния здесь нет.
+	time.Sleep(maxElectionTimeout)
 	newLid, newTerm := h.CheckSingleLeader()
 	if newLid != lid {
 		t.Errorf("leader changed from %d to %d, want same", lid, newLid)
@@ -62,7 +67,7 @@ func TestPreVote_DisconnectedFollower_NoElection(t *testing.T) {
 //     и запускает настоящие выборы
 //  5. Проверяем: выбран новый лидер (не crashed)
 func TestPreVote_CrashedLeader_NewElection(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -73,10 +78,9 @@ func TestPreVote_CrashedLeader_NewElection(t *testing.T) {
 	h.CrashPeer(lid)
 	h.CheckNoLeader()
 
-	// Ждём, чтобы PreVote + настоящие выборы завершились.
-	time.Sleep(time.Duration(ReelectionTimeoutMs) * time.Millisecond * 2)
-
-	// Должен быть выбран новый лидер (не crashed).
+	// replace: позитивное ожидание — CheckSingleLeader сам опрашивает
+	// состояние до leaderElectionBudget (worst-case выборов), поэтому
+	// отдельная фиксированная пауза не нужна.
 	newLid, _ := h.CheckSingleLeader()
 	if newLid == lid {
 		t.Errorf("same leader after crash")
@@ -95,7 +99,7 @@ func TestPreVote_CrashedLeader_NewElection(t *testing.T) {
 //     от majority (leader known)
 //  5. Проверяем: лидер из majority, term не изменился
 func TestPreVote_MajorityPartition(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -106,9 +110,10 @@ func TestPreVote_MajorityPartition(t *testing.T) {
 	otherID := (lid + 1) % 3
 	h.DisconnectPeer(otherID)
 
-	// Ждём несколько election timeout, чтобы minority успел попытаться
-	// несколько раз запустить PreVote.
-	time.Sleep(time.Duration(ReelectionTimeoutMs) * time.Millisecond * 2)
+	// keep: budgeted negative window — за worst-case election timeout
+	// (maxElectionTimeout) minority не должен ни выиграть выборы,
+	// ни увеличить term. Окно осознанно временное (см. выше).
+	time.Sleep(maxElectionTimeout)
 	newLid, newTerm := h.CheckSingleLeader()
 	if newLid == otherID {
 		t.Errorf("minority node became leader, want majority")
@@ -134,7 +139,7 @@ func TestPreVote_MajorityPartition(t *testing.T) {
 //
 // Это стресс-тест стабильности Pre-Vote при повторяющихся сетевых сбоях.
 func TestPreVote_ReconnectStable(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -169,7 +174,7 @@ func TestPreVote_ReconnectStable(t *testing.T) {
 //     что приводит к stepDown текущего лидера и новым выборам
 //  5. Проверяем: term вырос (выборы состоялись)
 func TestPreVote_Disabled(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	// Pre-Vote отключается на всех узлах кластера через опцию Harness
 	// ДО close(ready) — до старта фоновых горутин (INV-T5: никакой
@@ -185,15 +190,18 @@ func TestPreVote_Disabled(t *testing.T) {
 	otherID := (lid + 1) % 3
 	h.DisconnectPeer(otherID)
 
-	// Ждём несколько election timeout, чтобы отключённый узел успел
-	// несколько раз увеличить term.
-	time.Sleep(time.Duration(ReelectionTimeoutMs) * time.Millisecond * 2)
-
-	// В классическом Raft отключённый узел увеличивает term.
-	// Проверяем, что term отключённого узла вырос относительно origTerm.
+	// replace: позитивное ожидание — poll GetTerm с дедлайном вместо
+	// фиксированной паузы. В классическом Raft отключённый узел
+	// увеличивает term на каждом election timeout.
+	deadline := time.Now().Add(commitBudgetAfterFailover)
 	disconnectedTerm := h.GetTerm(otherID)
-	if disconnectedTerm <= origTerm {
-		t.Errorf("disconnected node term = %d, want > %d", disconnectedTerm, origTerm)
+	for disconnectedTerm <= origTerm {
+		if !time.Now().Before(deadline) {
+			t.Fatalf("disconnected node term = %d, want > %d within %v",
+				disconnectedTerm, origTerm, commitBudgetAfterFailover)
+		}
+		time.Sleep(pollInterval)
+		disconnectedTerm = h.GetTerm(otherID)
 	}
 }
 
@@ -237,7 +245,7 @@ func (m *mockPreVoteGrant) RequestVote(_ ServerID, _ RequestVoteArgs) (RequestVo
 // выигрывает PreVote, запускает настоящие выборы и увеличивает терм; если
 // runPreCandidate выходит сразу (старое поведение) — терм остаётся прежним.
 func TestPreVote_CandidateRetry(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 500*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	cm := &ConsensusModule{
 		id:         0,

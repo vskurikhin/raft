@@ -85,6 +85,7 @@ func waitForClusterLeader(t *testing.T, nodes []*clusterNode) *clusterNode {
 				return n
 			}
 		}
+		// poll-интервал condition-wait (не фиксированная пауза).
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("no leader elected")
@@ -104,6 +105,7 @@ func applyClusterCommand(t *testing.T, nodes []*clusterNode, cmd string) {
 		if err := future.Error(); err == nil {
 			return
 		}
+		// poll-интервал condition-wait (не фиксированная пауза).
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatalf("Apply %q failed after retries", cmd)
@@ -114,7 +116,7 @@ func applyClusterCommand(t *testing.T, nodes []*clusterNode, cmd string) {
 // кластера обязан восстановить FSM каждого узла из его durable-снапшота,
 // а кластер — продолжить принимать записи.
 func TestSnapshot_ClusterFullRestart(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 60*time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	const (
 		numNodes      = 3
@@ -165,6 +167,7 @@ func TestSnapshot_ClusterFullRestart(t *testing.T) {
 			if allPresent {
 				break
 			}
+			// poll-интервал condition-wait (не фиксированная пауза).
 			time.Sleep(20 * time.Millisecond)
 		}
 		for i := 0; i < numCommands; i++ {
@@ -209,6 +212,7 @@ func TestSnapshot_ClusterFullRestart(t *testing.T) {
 				n.fsm.getState("k40") == "v40" {
 				break
 			}
+			// poll-интервал condition-wait (не фиксированная пауза).
 			time.Sleep(20 * time.Millisecond)
 		}
 		if v := n.fsm.getState("k0"); v != "v0" {

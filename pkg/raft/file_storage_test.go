@@ -8,7 +8,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/fortytw2/leaktest"
 )
@@ -163,7 +162,7 @@ func TestFileStorage_CrashSafety_OrphanTmpIgnored(t *testing.T) {
 
 // TestFileStorage_ConcurrentSet проверяет конкурентную запись разных ключей.
 func TestFileStorage_ConcurrentSet(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 30*time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	fs := NewFileStorage(t.TempDir())
 

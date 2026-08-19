@@ -28,7 +28,7 @@ func waitFuture(t *testing.T, f Future, timeout time.Duration) error {
 // команда лидера НЕ коммитится и FSM её не применяет; после
 // восстановления связи коммит проходит на реальном кворуме.
 func TestCommitmentE2E_FourNodes_TwoDownNoCommit(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 200*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 4)
 	defer h.Shutdown()
 
@@ -59,14 +59,19 @@ func TestCommitmentE2E_FourNodes_TwoDownNoCommit(t *testing.T) {
 	if err := waitFuture(t, future, 3*time.Second); err != nil {
 		t.Fatalf("Apply failed after reconnect: %v", err)
 	}
-	h.WaitForCommit(cmd, 3)
+	// После реконнекта подключены все 4 узла: assert CheckCommittedN
+	// (выполняется WaitForCommit после ожидания сходимости) требует
+	// точного числа подключённых узлов. Прежнее значение 3 не
+	// проверялось — старый WaitForCommit возвращался по «nc >= n»
+	// без assert'а (SA-001).
+	h.WaitForCommit(cmd, 4)
 }
 
 // TestCommitmentE2E_FourNodes_OneDownStillCommits — n=4 positive control:
 // при одном отключённом follower (живы 3/4 = кворум) коммит проходит —
 // фикс не «перетянул» порог в обратную сторону.
 func TestCommitmentE2E_FourNodes_OneDownStillCommits(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 200*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 4)
 	defer h.Shutdown()
 
@@ -87,7 +92,7 @@ func TestCommitmentE2E_FourNodes_OneDownStillCommits(t *testing.T) {
 // при отключённом follower (жив 1/2) команда НЕ коммитится — старый код
 // коммитил её в одиночку (дефект P0-2). После восстановления — 2/2.
 func TestCommitmentE2E_TwoNodes_FollowerDownNoCommit(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 200*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 2)
 	defer h.Shutdown()
 
@@ -123,7 +128,7 @@ func TestCommitmentE2E_TwoNodes_FollowerDownNoCommit(t *testing.T) {
 // ВНИМАНИЕ: форма «отключить follower ПОСЛЕ избрания» не дискриминирует
 // (noop успевает закоммититься тремя живыми follower'ами) и запрещена.
 func TestCommitmentE2E_NoopCommitsAfterFailover(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 200*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 4)
 	defer h.Shutdown()
 
@@ -146,6 +151,7 @@ func TestCommitmentE2E_NoopCommitsAfterFailover(t *testing.T) {
 			}
 		}
 		if newLeader < 0 {
+			// poll-интервал condition-wait (не фиксированная пауза).
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
@@ -164,6 +170,7 @@ func TestCommitmentE2E_NoopCommitsAfterFailover(t *testing.T) {
 		committed = cm.cmState.commitIndex >= cm.leaderState.leaderStartIndex+1
 		cm.mu.Unlock()
 		if !committed {
+			// poll-интервал condition-wait (не фиксированная пауза).
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
@@ -190,7 +197,7 @@ func TestCommitmentE2E_NoopCommitsAfterFailover(t *testing.T) {
 // зацикливается: config entry не реплицируется на B, а его ack входит
 // в кворум 2/2 — future не завершается (дедлайн обязателен).
 func TestConfiguration_AddVoterFromSingleVoter(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 200*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	transportA := NewInmemTransport(ServerAddress("raft-A"))
 	transportB := NewInmemTransport(ServerAddress("raft-B"))
@@ -221,6 +228,7 @@ func TestConfiguration_AddVoterFromSingleVoter(t *testing.T) {
 		if _, _, isLeader := cmA.Report(); isLeader {
 			break
 		}
+		// poll-интервал condition-wait (не фиксированная пауза).
 		time.Sleep(10 * time.Millisecond)
 	}
 	if _, _, isLeader := cmA.Report(); !isLeader {
@@ -279,7 +287,7 @@ func TestConfiguration_AddVoterFromSingleVoter(t *testing.T) {
 // удаляемый сервер не получает запись о собственном удалении и
 // остаётся «сиротой» (видит себя voter'ом).
 func TestConfiguration_RemovedServerSeesRemoval(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 200*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
@@ -299,6 +307,7 @@ func TestConfiguration_RemovedServerSeesRemoval(t *testing.T) {
 		cfg := h.cluster[victim].GetConfiguration().Configuration()
 		removed = !hasVote(cfg, victim)
 		if !removed {
+			// poll-интервал condition-wait (не фиксированная пауза).
 			time.Sleep(10 * time.Millisecond)
 		}
 	}

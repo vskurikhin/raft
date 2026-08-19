@@ -28,8 +28,8 @@ func TestElectionLeaderDisconnect(t *testing.T) {
 	origLeaderId, origTerm := h.CheckSingleLeader()
 
 	h.DisconnectPeer(origLeaderId)
-	sleepMs(ReelectionTimeoutMs + HeartbeatTimeoutMs)
-
+	// remove: CheckSingleLeader опрашивает состояние до leaderElectionBudget,
+	// а отключённый лидер исключён из опроса (connected == false).
 	newLeaderId, newTerm := h.CheckSingleLeader()
 	if newLeaderId == origLeaderId {
 		t.Errorf("want new leader to be different from orig leader")
@@ -40,7 +40,7 @@ func TestElectionLeaderDisconnect(t *testing.T) {
 }
 
 func TestElectionLeaderAndAnotherDisconnect(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
@@ -55,7 +55,10 @@ func TestElectionLeaderAndAnotherDisconnect(t *testing.T) {
 
 	// Нет кворума: единственный оставшийся узел (2) не может получить
 	// кворум PreVote → возвращается в Follower, term не растёт.
-	sleepMs(450)
+	// keep: negative window — бюджет maxElectionTimeout (worst-case
+	// election timeout). Опрос не доказывает отсутствия лидера; окно
+	// осознанно временное, его уменьшение ослабило бы assert.
+	time.Sleep(maxElectionTimeout)
 	h.CheckNoLeader()
 
 	// Повторно подключаем отключённый узел. Два узла (1 и 2) могут
@@ -69,12 +72,15 @@ func TestDisconnectAllThenRestore(t *testing.T) {
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
-	sleepMs(100)
+	// remove: разрыв связи выполняется сразу; минимальный election timeout
+	// (ReelectionTimeoutMs) заведомо больше времени старта узлов, поэтому
+	// лидер не успевает быть избран до разрыва.
 	// Отключаем все серверы с самого начала. Лидера не будет.
 	for i := 0; i < 3; i++ {
 		h.DisconnectPeer(i)
 	}
-	sleepMs(450)
+	// keep: negative window — бюджет maxElectionTimeout (см. выше).
+	time.Sleep(maxElectionTimeout)
 	h.CheckNoLeader()
 
 	// Повторно подключаем все серверы. Будет выбран лидер.
@@ -91,13 +97,15 @@ func TestElectionLeaderDisconnectThenReconnect(t *testing.T) {
 
 	h.DisconnectPeer(origLeaderId)
 
-	sleepMs(200 * Quantum)
+	// remove: CheckSingleLeader опрашивает состояние сам.
 	newLeaderId, newTerm := h.CheckSingleLeader()
 
 	h.ReconnectPeer(origLeaderId)
-	sleepMs(100 * Quantum)
-
-	againLeaderId, againTerm := h.CheckSingleLeader()
+	// replace: после реконнекта прежний лидер узнаёт о более высоком term'е
+	// только с первым дошедшим AppendEntries (backoff репликации
+	// ADR-P07-006), поэтому окно «два лидера» ожидается через
+	// WaitForSingleLeader, а не фиксированной паузой.
+	againLeaderId, againTerm := h.WaitForSingleLeader(leaderElectionBudget)
 
 	if newLeaderId != againLeaderId {
 		t.Errorf("again leader id got %d; want %d", againLeaderId, newLeaderId)
@@ -108,7 +116,7 @@ func TestElectionLeaderDisconnectThenReconnect(t *testing.T) {
 }
 
 func TestElectionLeaderDisconnectThenReconnect5(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 5)
 	defer h.Shutdown()
@@ -116,13 +124,13 @@ func TestElectionLeaderDisconnectThenReconnect5(t *testing.T) {
 	origLeaderId, _ := h.CheckSingleLeader()
 
 	h.DisconnectPeer(origLeaderId)
-	sleepMs(100 * Quantum)
+	// remove: CheckSingleLeader опрашивает состояние сам.
 	newLeaderId, newTerm := h.CheckSingleLeader()
 
 	h.ReconnectPeer(origLeaderId)
-	sleepMs(100 * Quantum)
-
-	againLeaderId, againTerm := h.CheckSingleLeader()
+	// replace: см. TestElectionLeaderDisconnectThenReconnect — окно
+	// «два лидера» после реконнекта.
+	againLeaderId, againTerm := h.WaitForSingleLeader(leaderElectionBudget)
 
 	if newLeaderId != againLeaderId {
 		t.Errorf("again leader id got %d; want %d", againLeaderId, newLeaderId)
@@ -145,7 +153,7 @@ func TestElectionLeaderDisconnectThenReconnect5(t *testing.T) {
 // TestPreVote_ReconnectStable.
 
 func TestElectionDisconnectLoop(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -160,10 +168,13 @@ func TestElectionDisconnectLoop(t *testing.T) {
 		// Ждём, пока кластер не обнаружит потерю кворума.
 		// После отключения 2 из 3 узлов ни один не может получить quorum,
 		// так что лидера быть не должно.
+		// poll-интервал condition-wait (не фиксированная пауза):
+		// ждём наблюдаемого состояния «лидера нет».
 		for r := 0; r < 10; r++ {
+			connected := h.connectedSnapshot()
 			hasLeader := false
 			for i := 0; i < 3; i++ {
-				if h.connected[i] {
+				if connected[i] {
 					_, _, isLeader := h.cluster[i].Report()
 					if isLeader {
 						hasLeader = true
@@ -173,7 +184,7 @@ func TestElectionDisconnectLoop(t *testing.T) {
 			if !hasLeader {
 				break
 			}
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(pollInterval)
 		}
 		h.CheckNoLeader()
 
@@ -185,7 +196,7 @@ func TestElectionDisconnectLoop(t *testing.T) {
 }
 
 func TestCommitOneCommand(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -198,12 +209,14 @@ func TestCommitOneCommand(t *testing.T) {
 		t.Errorf("want id=%d leader, but it's not", origLeaderId)
 	}
 
-	sleepMs(250)
+	// replace: ожидание сходимости коммита вместо фиксированной паузы.
+	// Сценарий без сбоев — бюджет steady.
+	h.WaitForCommitBudget(42, 3, commitBudgetSteady)
 	h.CheckCommittedN(42, 3)
 }
 
 func TestCommitAfterCallDrops(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -211,10 +224,13 @@ func TestCommitAfterCallDrops(t *testing.T) {
 	lid, _ := h.CheckSingleLeader()
 	h.PeerDropCallsAfterN(lid, 2)
 	h.SubmitToServer(lid, 99)
-	sleepMs(30 * Quantum)
+	// remove: PeerDropCallsAfterN/PeerDontDropCalls — no-op после удаления
+	// RPCProxy, ждать между ними нечего; SubmitToServer блокируется
+	// до коммита.
 	h.PeerDontDropCalls(lid)
 
-	sleepMs(60 * Quantum)
+	// replace: сценарий без сбоев (PeerDropCallsAfterN — no-op) — steady.
+	h.WaitForCommitBudget(99, 3, commitBudgetSteady)
 	h.CheckCommittedN(99, 3)
 }
 
@@ -229,11 +245,12 @@ func TestSubmitNonLeaderFails(t *testing.T) {
 	if isLeader {
 		t.Errorf("want id=%d !leader, but it is", sid)
 	}
-	sleepMs(10)
+	// remove: пауза в конце теста ничего не проверяет; корректное
+	// завершение узлов обеспечивает h.Shutdown().
 }
 
 func TestCommitMultipleCommands(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -247,10 +264,13 @@ func TestCommitMultipleCommands(t *testing.T) {
 		if !isLeader {
 			t.Errorf("want id=%d leader, but it's not", origLeaderId)
 		}
-		sleepMs(100)
+		// remove: SubmitToServer блокируется до коммита, разделять
+		// отправки паузой не требуется.
 	}
 
-	sleepMs(250 * Quantum)
+	// replace: сходимость последней команды влечёт коммит предыдущих;
+	// сценарий без сбоев — steady.
+	h.WaitForCommitBudget(81, 3, commitBudgetSteady)
 	nc, i1 := h.CheckCommitted(42)
 	_, i2 := h.CheckCommitted(55)
 	if nc != 3 {
@@ -267,7 +287,7 @@ func TestCommitMultipleCommands(t *testing.T) {
 }
 
 func TestCommitWithDisconnectionAndRecover(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -277,31 +297,34 @@ func TestCommitWithDisconnectionAndRecover(t *testing.T) {
 	h.SubmitToServer(origLeaderId, 5)
 	h.SubmitToServer(origLeaderId, 6)
 
-	sleepMs(HeartbeatTimeoutMs * 3)
+	// replace: до первого сбоя сценария — steady.
+	h.WaitForCommitBudget(6, 3, commitBudgetSteady)
 	h.CheckCommittedN(6, 3)
 
 	dPeerId := (origLeaderId + 1) % 3
+	// remove: CrashPeer возвращается после join горутин узла (ADR-003 п.7).
 	h.CrashPeer(dPeerId)
-	sleepMs(100 * Quantum)
 
 	// SubmitToServer блокируется до коммита. Теперь кластер из 2 живых узлов:
 	// лидер + один follower = кворум (2/3). Команда будет закоммичена.
 	if idx := h.SubmitToServer(origLeaderId, 7); idx < 0 {
 		t.Fatal("Submit 7 failed")
 	}
-	sleepMs(HeartbeatTimeoutMs * 3)
+	// replace: после CrashPeer подключены 2 узла; сценарий со сбоем —
+	// бюджет after-failover.
+	h.WaitForCommit(7, 2)
 
 	// Перезапускаем отключённый узел и ждём синхронизации.
 	h.RestartPeer(dPeerId)
-	sleepMs(100 * Quantum)
 	h.CheckSingleLeader()
 
-	sleepMs(HeartbeatTimeoutMs * 2)
+	// replace: после рестарта возможны перевыборы — after-failover.
+	h.WaitForCommit(7, 3)
 	h.CheckCommittedN(7, 3)
 }
 
 func TestNoCommitWithNoQuorum(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -312,25 +335,54 @@ func TestNoCommitWithNoQuorum(t *testing.T) {
 
 	h.WaitForCommit(6, 3)
 
+	// Изолируем обоих follower'ов: у лидера остаётся 1/3 — кворума нет.
+	// Прежняя схема опиралась на инвариант «время изоляции < min election
+	// timeout» (комментарий «246ms < 254ms»); фактические константы
+	// (ReelectionTimeoutMs=381ms) его нарушали — изоляция 300+93ms
+	// превышала минимальный election timeout, и тест был flaky (FINDING-09).
+	// Инвариант снят: тест больше не зависит от того, начнут ли изолированные
+	// follower'ы выборы.
 	dPeer1 := (origLeaderId + 1) % 3
 	dPeer2 := (origLeaderId + 2) % 3
 	h.DisconnectPeer(dPeer1)
 	h.DisconnectPeer(dPeer2)
-	sleepMs(100 * Quantum)
+	h.waitForIsolated(origLeaderId, commitBudgetSteady)
 
-	go h.SubmitToServer(origLeaderId, 8)
-	// HeartbeatTimeoutMs (46ms): общее время изоляции 246ms < min
-	// election timeout (254ms) → follower не начинает выборы до реконнекта.
-	sleepMs(HeartbeatTimeoutMs)
+	// Submit под явным lifecycle: результат доставляется через канал,
+	// горутина join'ится до конца теста (INV-T2) — она не переживает тест.
+	submitDone := make(chan int, 1)
+	go func() { submitDone <- h.SubmitToServer(origLeaderId, 8) }()
+
+	// keep: budgeted negative window — 2*maxElectionTimeout, заведомо больше
+	// любого election timeout и нескольких раундов репликации, т.е. если
+	// бы кворум был, команда 8 успела бы закоммититься.
+	//
+	// Инвариант окна: корректен, пока в реализации отсутствует CheckQuorum
+	// (изолированный лидер не выполняет step-down — raft_cm_leader.go,
+	// цикл runLeaderLoop). При добавлении CheckQuorum окно необходимо
+	// пересмотреть: лидер сложит полномочия сам, и команда 8 завершится
+	// ошибкой раньше окончания окна.
+	time.Sleep(2 * maxElectionTimeout)
 	h.CheckNotCommitted(8)
 
 	h.ReconnectPeer(dPeer1)
 	h.ReconnectPeer(dPeer2)
 
-	h.WaitForCommit(8, 3)
+	// Join Submit-горутины до конца теста. Оба исхода протокольно
+	// корректны: изолированный лидер мог сохранить полномочия (команда 8
+	// коммитится после реконнекта) либо уступить их новому лидеру
+	// (команда 8 не входит в журнал нового лидера и теряется —
+	// Raft этого не запрещает). Assert выполняется только для исхода,
+	// в котором Submit сообщил об успехе.
+	submitIdx := <-submitDone
+	if submitIdx >= 0 {
+		h.WaitForCommit(8, 3)
+	} else {
+		t.Logf("submit of 8 did not complete (leadership lost during isolation) — допустимый исход")
+	}
 
-	leaderId, againTerm := h.CheckSingleLeader()
-	_ = againTerm
+	// Кластер обязан восстановиться и коммитить новые команды.
+	leaderId, _ := h.CheckSingleLeader()
 
 	h.SubmitToServer(leaderId, 9)
 	h.SubmitToServer(leaderId, 10)
@@ -349,22 +401,30 @@ func TestDisconnectLeaderBriefly(t *testing.T) {
 	origLeaderId, _ := h.CheckSingleLeader()
 	h.SubmitToServer(origLeaderId, 5)
 	h.SubmitToServer(origLeaderId, 6)
-	sleepMs(250)
+	// replace: до отключения лидера сбоев нет — steady.
+	h.WaitForCommitBudget(6, 3, commitBudgetSteady)
 	h.CheckCommittedN(6, 3)
 
 	// Отключаем лидера на короткое время (меньше тайм-аута выборов у соседей).
+	// keep: timing — предмет теста. Длительность разрыва (90 мс) заведомо
+	// меньше минимального election timeout (ReelectionTimeoutMs = 381 мс),
+	// поэтому соседи не начинают выборы.
 	h.DisconnectPeer(origLeaderId)
 	sleepMs(90)
 	h.ReconnectPeer(origLeaderId)
-	sleepMs(200)
+	// replace: перед отправкой команды ждём наблюдаемого состояния —
+	// в кластере ровно один лидер.
+	h.WaitForSingleLeader(leaderElectionBudget)
 
 	h.SubmitToServer(origLeaderId, 7)
-	sleepMs(250)
+	// replace: после disconnect/reconnect возможны перевыборы —
+	// after-failover.
+	h.WaitForCommit(7, 3)
 	h.CheckCommittedN(7, 3)
 }
 
 func TestCommitsWithLeaderDisconnects(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 5)
 	defer h.Shutdown()
@@ -375,12 +435,19 @@ func TestCommitsWithLeaderDisconnects(t *testing.T) {
 
 	h.WaitForCommit(6, 5)
 
+	// replace: ждём фактического вступления изоляции лидера в силу.
 	h.DisconnectPeer(origLeaderId)
-	sleepMs(10 * Quantum)
+	h.waitForIsolated(origLeaderId, commitBudgetSteady)
 
-	go h.SubmitToServer(origLeaderId, 7)
+	// Submit под явным lifecycle: горутина join'ится до конца теста
+	// (INV-T2), результат доставляется через канал.
+	submit7 := make(chan int, 1)
+	go func() { submit7 <- h.SubmitToServer(origLeaderId, 7) }()
 
-	sleepMs(100)
+	// keep: negative window — бюджет inmemRPCTimeout: при наличии кворума
+	// команда успела бы закоммититься за один RPC-раунд. Опрос не
+	// доказывает отсутствия коммита; окно осознанно временное.
+	time.Sleep(inmemRPCTimeout)
 	h.CheckNotCommitted(7)
 
 	newLeaderId, _ := h.CheckSingleLeader()
@@ -389,9 +456,9 @@ func TestCommitsWithLeaderDisconnects(t *testing.T) {
 	h.WaitForCommit(8, 4)
 
 	h.ReconnectPeer(origLeaderId)
-	sleepMs(200)
-
-	finalLeaderId, _ := h.CheckSingleLeader()
+	// replace: после реконнекта ждём схождения к единственному лидеру
+	// (окно «два лидера» — backoff репликации ADR-P07-006).
+	finalLeaderId, _ := h.WaitForSingleLeader(leaderElectionBudget)
 	if finalLeaderId == origLeaderId {
 		t.Errorf("got finalLeaderId==origLeaderId==%d, want them different", finalLeaderId)
 	}
@@ -401,11 +468,14 @@ func TestCommitsWithLeaderDisconnects(t *testing.T) {
 	h.CheckCommittedN(8, 5)
 
 	h.CheckNotCommitted(7)
+
+	// Join Submit-горутины команды 7: она не переживает тест.
+	<-submit7
 }
 
 func TestCrashFollower(t *testing.T) {
 	// Базовый тест, проверяющий, что сбой одного узла не приводит к отказу системы.
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -413,16 +483,18 @@ func TestCrashFollower(t *testing.T) {
 	origLeaderId, _ := h.CheckSingleLeader()
 	h.SubmitToServer(origLeaderId, 5)
 
-	sleepMs(350)
+	// replace: до сбоя — steady.
+	h.WaitForCommitBudget(5, 3, commitBudgetSteady)
 	h.CheckCommittedN(5, 3)
 
 	h.CrashPeer((origLeaderId + 1) % 3)
-	sleepMs(350)
+	// replace: после CrashPeer подключены 2 узла — after-failover.
+	h.WaitForCommit(5, 2)
 	h.CheckCommittedN(5, 2)
 }
 
 func TestCrashThenRestartFollower(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -434,28 +506,31 @@ func TestCrashThenRestartFollower(t *testing.T) {
 
 	vals := []int{5, 6, 7}
 
-	sleepMs(250)
+	// replace: до сбоя — steady.
+	h.WaitForCommitBudget(7, 3, commitBudgetSteady)
 	for _, v := range vals {
 		h.CheckCommittedN(v, 3)
 	}
 
 	h.CrashPeer((origLeaderId + 1) % 3)
-	sleepMs(250)
+	// replace: после CrashPeer подключены 2 узла — after-failover.
+	h.WaitForCommit(7, 2)
 	for _, v := range vals {
 		h.CheckCommittedN(v, 2)
 	}
 
-	// Перезапускаем завершившийся с ошибкой ведомый узел и даём ему время
-	// синхронизироваться с остальными.
+	// Перезапускаем завершившийся с ошибкой ведомый узел и ждём, пока он
+	// догонит остальных.
 	h.RestartPeer((origLeaderId + 1) % 3)
-	sleepMs(400)
+	// replace: после рестарта возможны перевыборы — after-failover.
+	h.WaitForCommit(7, 3)
 	for _, v := range vals {
 		h.CheckCommittedN(v, 3)
 	}
 }
 
 func TestCrashThenRestartLeader(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -467,26 +542,30 @@ func TestCrashThenRestartLeader(t *testing.T) {
 
 	vals := []int{5, 6, 7}
 
-	sleepMs(250)
+	// replace: до сбоя — steady.
+	h.WaitForCommitBudget(7, 3, commitBudgetSteady)
 	for _, v := range vals {
 		h.CheckCommittedN(v, 3)
 	}
 
 	h.CrashPeer(origLeaderId)
-	sleepMs(200 * Quantum)
+	// replace: аварийно остановлен лидер — обязательны перевыборы,
+	// бюджет after-failover.
+	h.WaitForCommit(7, 2)
 	for _, v := range vals {
 		h.CheckCommittedN(v, 2)
 	}
 
 	h.RestartPeer(origLeaderId)
-	sleepMs(400)
+	// replace: after-failover.
+	h.WaitForCommit(7, 3)
 	for _, v := range vals {
 		h.CheckCommittedN(v, 3)
 	}
 }
 
 func TestCrashThenRestartAll(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -498,7 +577,8 @@ func TestCrashThenRestartAll(t *testing.T) {
 
 	vals := []int{5, 6, 7}
 
-	sleepMs(250)
+	// replace: до сбоя — steady.
+	h.WaitForCommitBudget(7, 3, commitBudgetSteady)
 	for _, v := range vals {
 		h.CheckCommittedN(v, 3)
 	}
@@ -507,17 +587,17 @@ func TestCrashThenRestartAll(t *testing.T) {
 		h.CrashPeer((origLeaderId + i) % 3)
 	}
 
-	sleepMs(250)
-
+	// remove: CrashPeer возвращается только после join горутин узла
+	// (ADR-003 п.7), поэтому ждать между остановкой и перезапуском нечего.
 	for i := 0; i < 3; i++ {
 		h.RestartPeer((origLeaderId + i) % 3)
 	}
 
-	sleepMs(100 * Quantum)
 	newLeaderId, _ := h.CheckSingleLeader()
 
 	h.SubmitToServer(newLeaderId, 8)
-	sleepMs(200)
+	// replace: после перезапуска всего кластера — after-failover.
+	h.WaitForCommit(8, 3)
 
 	vals = []int{5, 6, 7, 8}
 	for _, v := range vals {
@@ -538,10 +618,13 @@ func TestReplaceMultipleLogEntries(t *testing.T) {
 
 	h.DisconnectPeer(origLeaderId)
 
-	go h.SubmitToServer(origLeaderId, 21)
-	go h.SubmitToServer(origLeaderId, 22)
-	go h.SubmitToServer(origLeaderId, 23)
-	go h.SubmitToServer(origLeaderId, 24)
+	// Submit'ы к изолированному лидеру — под явным lifecycle: горутины
+	// join'ятся до конца теста (INV-T2), результаты не проверяются
+	// (команды заведомо не могут быть закоммичены без кворума).
+	staleSubmits := make(chan int, 4)
+	for _, cmd := range []int{21, 22, 23, 24} {
+		go func() { staleSubmits <- h.SubmitToServer(origLeaderId, cmd) }()
+	}
 
 	newLeaderId, _ := h.CheckSingleLeader()
 
@@ -563,10 +646,15 @@ func TestReplaceMultipleLogEntries(t *testing.T) {
 
 	h.CheckNotCommitted(21)
 	h.CheckCommittedN(10, 3)
+
+	// Join Submit-горутин: они не переживают тест.
+	for range 4 {
+		<-staleSubmits
+	}
 }
 
 func TestCrashAfterSubmit(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
@@ -575,15 +663,16 @@ func TestCrashAfterSubmit(t *testing.T) {
 	h.SubmitToServer(origLeaderId, 5)
 	h.CrashPeer(origLeaderId)
 
-	sleepMs(10)
+	// remove: CheckSingleLeader опрашивает состояние сам.
 	h.CheckSingleLeader()
 
 	h.RestartPeer(origLeaderId)
-	sleepMs(100)
-	newLeaderId, _ := h.CheckSingleLeader()
+	// replace: после рестарта прежнего лидера возможно окно «два лидера».
+	newLeaderId, _ := h.WaitForSingleLeader(leaderElectionBudget)
 
 	h.SubmitToServer(newLeaderId, 6)
-	sleepMs(50)
+	// replace: сценарий с CrashPeer/RestartPeer — after-failover.
+	h.WaitForCommit(6, 3)
 	h.CheckCommittedN(5, 3)
 	h.CheckCommittedN(6, 3)
 }
@@ -601,7 +690,7 @@ func TestDisconnectAfterSubmit(t *testing.T) {
 	h.SubmitToServer(origLeaderId, 5)
 	h.DisconnectPeer(origLeaderId)
 
-	sleepMs(10)
+	// remove: CheckSingleLeader опрашивает состояние сам.
 	h.CheckSingleLeader()
 
 	h.ReconnectPeer(origLeaderId)
@@ -634,8 +723,21 @@ func getPersistedTerm(storage *MapStorage) int {
 	return term
 }
 
+// startElectionPersistIncrements — число наблюдаемых инкрементов term,
+// после каждого из которых проверяется persist-путь startElection.
+const startElectionPersistIncrements = 2
+
 func TestBug_StartElectionMissingPersist(t *testing.T) {
-	h := NewHarness(t, 3)
+	// Тест покрывает persist-путь startElection при PreVote=off.
+	// При включённом Pre-Vote изолированный узел остаётся PreCandidate
+	// и НЕ увеличивает currentTerm, поэтому assert «persisted >= in-memory»
+	// был бы тривиально истинен и не ловил бы дефект (FINDING-13).
+	// Путь PreVote=on покрывается prevote-тестами.
+	//
+	// Victim выбирается уже ПОСЛЕ выборов, поэтому настройка отдельного
+	// узла неприменима: PreVote отключается кластерно, до старта горутин
+	// (механизм TASK-003/ADR-005, решение ADR-009).
+	h := NewHarnessWithOptions(t, 3, DisablePreVote())
 	defer h.Shutdown()
 
 	// Ждём, пока будет выбран лидер, затем выбираем ведомый узел,
@@ -645,23 +747,45 @@ func TestBug_StartElectionMissingPersist(t *testing.T) {
 
 	h.DisconnectPeer(victim)
 
-	// Даём узлу достаточно времени, чтобы он выполнил несколько выборов
-	// (каждые выборы увеличивают currentTerm).
-	time.Sleep(800 * time.Millisecond)
-
-	// Считываем значение терма жертвы из памяти и из постоянного хранилища.
+	// Condition-wait вместо фиксированных 800 мс: ждём наблюдаемых
+	// инкрементов currentTerm у изолированного узла (каждые выборы
+	// увеличивают term) и после КАЖДОГО инкремента сверяем persisted
+	// term с in-memory.
+	//
+	// Оба значения снимаются под cm.mu: startElection увеличивает
+	// currentTerm и вызывает persistToStorage в одной критической секции,
+	// поэтому под cm.mu снимок согласован (без cm.mu возможно ложное
+	// срабатывание в окне между инкрементом и записью).
 	cm := h.cluster[victim]
-	cm.mu.Lock()
-	inMemoryTerm := cm.cmState.currentTerm
-	cm.mu.Unlock()
+	deadline := time.Now().Add(commitBudgetAfterFailover)
+	observed := 0
+	prevTerm := -1
+	for observed < startElectionPersistIncrements {
+		cm.mu.Lock()
+		inMemoryTerm := cm.cmState.currentTerm
+		persistedTerm := getPersistedTerm(h.storage[victim])
+		cm.mu.Unlock()
 
-	persistedTerm := getPersistedTerm(h.storage[victim])
+		if inMemoryTerm != prevTerm {
+			if prevTerm >= 0 {
+				observed++
+			}
+			prevTerm = inMemoryTerm
+			t.Logf("server %d: in-memory term = %d, persisted term = %d",
+				victim, inMemoryTerm, persistedTerm)
+			if persistedTerm < inMemoryTerm {
+				t.Fatalf("persisted term (%d) is behind in-memory term (%d); "+
+					"startElection is not persisting state", persistedTerm, inMemoryTerm)
+			}
+		}
 
-	t.Logf("server %d: in-memory term = %d, persisted term = %d", victim, inMemoryTerm, persistedTerm)
-
-	if persistedTerm < inMemoryTerm {
-		t.Errorf("persisted term (%d) is behind in-memory term (%d); "+
-			"startElection is not persisting state", persistedTerm, inMemoryTerm)
+		if !time.Now().Before(deadline) {
+			t.Fatalf("observed only %d of %d term increments on isolated server %d "+
+				"within %v (last term %d)",
+				observed, startElectionPersistIncrements, victim,
+				commitBudgetAfterFailover, prevTerm)
+		}
+		time.Sleep(pollInterval)
 	}
 }
 
@@ -687,7 +811,7 @@ func waitForNewLeaderExcept(t *testing.T, h *Harness, excludedID int, timeout ti
 				return i, term
 			}
 		}
-		time.Sleep(50 * Quantum * time.Millisecond)
+		time.Sleep(pollInterval)
 	}
 	t.Fatalf("leader not found among servers != %d within %v", excludedID, timeout)
 	return -1, -1
@@ -708,7 +832,7 @@ func waitForStepDown(t *testing.T, h *Harness, id, wantTerm int, timeout time.Du
 		if !isLeader && term == wantTerm {
 			return
 		}
-		time.Sleep(50 * Quantum * time.Millisecond)
+		time.Sleep(pollInterval)
 	}
 	t.Fatalf("server %d did not step down to term %d within %v", id, wantTerm, timeout)
 }
@@ -736,7 +860,7 @@ func waitForStepDown(t *testing.T, h *Harness, id, wantTerm int, timeout time.Du
 // терм нового лидера — максимальный, поэтому старый лидер не может перейти в
 // терм выше newTerm, а любой способ достижения терма newTerm персистит его.
 func TestBug_BecomeFollowerMissingPersist(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -844,22 +968,22 @@ func TestStaleVoteReplyIgnored(t *testing.T) {
 
 	origLeaderId, origTerm := h.CheckSingleLeader()
 
+	// remove: CheckSingleLeader опрашивает состояние сам; отключённые
+	// узлы исключены из опроса.
 	h.DisconnectPeer(origLeaderId)
-	sleepMs(350)
-
 	newLeaderId, newTerm := h.CheckSingleLeader()
 	if newTerm <= origTerm {
 		t.Fatalf("expected newTerm > origTerm, got %d <= %d", newTerm, origTerm)
 	}
 
 	h.DisconnectPeer(newLeaderId)
-	sleepMs(350)
+	h.CheckSingleLeader()
 
+	// replace: после реконнекта двух прежних лидеров ждём схождения
+	// к единственному лидеру (окно «два лидера» — backoff ADR-P07-006).
 	h.ReconnectPeer(origLeaderId)
 	h.ReconnectPeer(newLeaderId)
-	sleepMs(350)
-
-	h.CheckSingleLeader()
+	h.WaitForSingleLeader(leaderElectionBudget)
 }
 
 // Ведомый узел, который уже проголосовал за лидера в текущем терме, должен
@@ -988,19 +1112,25 @@ func TestElectionSafetyStress(t *testing.T) {
 // завершается при получении AppendEntries с более высоким term.
 // Изолируем лидера от followers, чтобы Apply() блокировался в inflight.
 func TestLeader_StepDown_AppendEntriesHigherTerm(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
 	lid, _ := h.CheckSingleLeader()
 
-	// Изолируем лидера, чтобы Apply() не мог закоммититься
+	// Изолируем лидера, чтобы Apply() не мог закоммититься.
+	// replace (не commit-ожидание): ждём фактического вступления
+	// изоляции в силу вместо фиксированной паузы.
 	h.DisconnectPeer((lid + 1) % 3)
 	h.DisconnectPeer((lid + 2) % 3)
-	sleepMs(50)
+	h.waitForIsolated(lid, commitBudgetSteady)
 
+	// База отсчёта inflight снимается ДО Apply: у только что избранного
+	// лидера в inflight может оставаться собственная noop-запись.
+	inflightBefore := h.applyInflightCount(lid)
 	future := h.cluster[lid].Apply(42, 0)
-	sleepMs(50)
+	// replace (не commit-ожидание): ждём попадания Apply в inflight.
+	h.waitForApplyInflight(lid, inflightBefore+1, commitBudgetSteady)
 
 	// Отправляем AppendEntries с более высоким term
 	args := AppendEntriesArgs{
@@ -1017,8 +1147,8 @@ func TestLeader_StepDown_AppendEntriesHigherTerm(t *testing.T) {
 	if err := h.cluster[lid].AppendEntries(args, &AppendEntriesReply{}); err != nil {
 		t.Fatal(err)
 	}
-	sleepMs(100)
-
+	// remove: future.Error() блокируется до разрешения future и сам
+	// является ожиданием результата.
 	if err := future.Error(); err != ErrLeadershipLost {
 		t.Fatalf("got %v, want ErrLeadershipLost", err)
 	}
@@ -1028,19 +1158,24 @@ func TestLeader_StepDown_AppendEntriesHigherTerm(t *testing.T) {
 // завершается при получении RequestVote с более высоким term.
 // Изолируем лидера от followers, чтобы Apply() блокировался в inflight.
 func TestLeader_StepDown_RequestVoteHigherTerm(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
 	lid, _ := h.CheckSingleLeader()
 
-	// Изолируем лидера, чтобы Apply() не мог закоммититься
+	// Изолируем лидера, чтобы Apply() не мог закоммититься.
+	// replace (не commit-ожидание): ждём фактического вступления
+	// изоляции в силу вместо фиксированной паузы.
 	h.DisconnectPeer((lid + 1) % 3)
 	h.DisconnectPeer((lid + 2) % 3)
-	sleepMs(50)
+	h.waitForIsolated(lid, commitBudgetSteady)
 
+	// База отсчёта inflight снимается ДО Apply (см. выше).
+	inflightBefore := h.applyInflightCount(lid)
 	future := h.cluster[lid].Apply(42, 0)
-	sleepMs(50)
+	// replace (не commit-ожидание): ждём попадания Apply в inflight.
+	h.waitForApplyInflight(lid, inflightBefore+1, commitBudgetSteady)
 
 	// Отправляем RequestVote с более высоким term
 	args := RequestVoteArgs{
@@ -1055,8 +1190,8 @@ func TestLeader_StepDown_RequestVoteHigherTerm(t *testing.T) {
 	if err := h.cluster[lid].RequestVote(args, &RequestVoteReply{}); err != nil {
 		t.Fatal(err)
 	}
-	sleepMs(100)
-
+	// remove: future.Error() блокируется до разрешения future и сам
+	// является ожиданием результата.
 	if err := future.Error(); err != ErrLeadershipLost {
 		t.Fatalf("got %v, want ErrLeadershipLost", err)
 	}
@@ -1065,7 +1200,7 @@ func TestLeader_StepDown_RequestVoteHigherTerm(t *testing.T) {
 // TestLeader_StepDown_NoInflight проверяет, что leaderLoop выходит без ошибок,
 // если inflight пуст.
 func TestLeader_StepDown_NoInflight(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
@@ -1086,8 +1221,8 @@ func TestLeader_StepDown_NoInflight(t *testing.T) {
 	if err := h.cluster[lid].AppendEntries(args, &AppendEntriesReply{}); err != nil {
 		t.Fatal(err)
 	}
-	sleepMs(100)
-
+	// remove: CheckSingleLeader опрашивает состояние до
+	// leaderElectionBudget.
 	// После stepDown должен быть новый лидер
 	h.CheckSingleLeader()
 }
@@ -1095,7 +1230,7 @@ func TestLeader_StepDown_NoInflight(t *testing.T) {
 // TestLeader_StepDown_ReElection проверяет, что после stepDown проводятся
 // новые выборы и избирается лидер (старый лидер может быть переизбран).
 func TestLeader_StepDown_ReElection(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 200*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
@@ -1116,8 +1251,8 @@ func TestLeader_StepDown_ReElection(t *testing.T) {
 	if err := h.cluster[lid].AppendEntries(args, &AppendEntriesReply{}); err != nil {
 		t.Fatal(err)
 	}
-	sleepMs(500)
-
+	// remove: CheckSingleLeader опрашивает состояние до
+	// leaderElectionBudget.
 	// После stepDown и выборов должен быть лидер
 	h.CheckSingleLeader()
 }
@@ -1125,7 +1260,7 @@ func TestLeader_StepDown_ReElection(t *testing.T) {
 // TestLeader_Heartbeat_StopsAfterStepDown проверяет, что после stepDown
 // heartbeat прекращается (нет утечек).
 func TestLeader_Heartbeat_StopsAfterStepDown(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
@@ -1145,15 +1280,14 @@ func TestLeader_Heartbeat_StopsAfterStepDown(t *testing.T) {
 	if err := h.cluster[lid].AppendEntries(args, &AppendEntriesReply{}); err != nil {
 		t.Fatal(err)
 	}
-	sleepMs(ReelectionTimeoutMs)
-
+	// remove: CheckSingleLeader опрашивает состояние сам.
 	// Проверяем, что старый лидер не утек — leaktest сделает это
 	h.CheckSingleLeader()
 }
 
 // TestLeader_AddVoter_Basic проверяет добавление нового voter через API.
 func TestLeader_AddVoter_Basic(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 200*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 2)
 	defer h.Shutdown()
 
@@ -1168,7 +1302,9 @@ func TestLeader_AddVoter_Basic(t *testing.T) {
 		t.Fatalf("AddVoter returned invalid index %d", idx)
 	}
 
-	sleepMs(100 * Quantum)
+	// replace: ждём наблюдаемого признака — сервер 2 виден лидеру
+	// как Voter в актуальной конфигурации.
+	h.waitForSuffrage(lid, ServerID(2), Voter, commitBudgetAfterFailover)
 
 	// Проверить, что конфигурация содержит сервер 2.
 	cfgFuture := h.cluster[lid].GetConfiguration()
@@ -1187,7 +1323,7 @@ func TestLeader_AddVoter_Basic(t *testing.T) {
 
 // TestConfiguration_RemoveServer проверяет удаление сервера из конфигурации.
 func TestConfiguration_RemoveServer(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 200*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
@@ -1215,7 +1351,8 @@ func TestConfiguration_RemoveServer(t *testing.T) {
 		if !found {
 			return
 		}
-		time.Sleep(25 * time.Millisecond)
+		// poll-интервал condition-wait (не фиксированная пауза).
+		time.Sleep(pollInterval)
 	}
 	cfg := h.cluster[lid].GetConfiguration().Configuration()
 	for _, s := range cfg.ConfigServers {
@@ -1228,7 +1365,7 @@ func TestConfiguration_RemoveServer(t *testing.T) {
 // TestConfiguration_GetConfigurationOnFollower проверяет, что follower
 // может прочитать конфигурацию.
 func TestConfiguration_GetConfigurationOnFollower(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 200*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
@@ -1250,7 +1387,7 @@ func TestConfiguration_GetConfigurationOnFollower(t *testing.T) {
 // TestConfiguration_RejectNotLeader проверяет, что запрос к не-лидеру
 // возвращает ошибку.
 func TestConfiguration_RejectNotLeader(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
@@ -1266,7 +1403,7 @@ func TestConfiguration_RejectNotLeader(t *testing.T) {
 // TestConfiguration_RejectDemoteLastVoter проверяет, что последний voter
 // не может быть демотирован.
 func TestConfiguration_RejectDemoteLastVoter(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
@@ -1283,7 +1420,7 @@ func TestConfiguration_RejectDemoteLastVoter(t *testing.T) {
 // TestConfiguration_RejectAddNonvoterEmptyAddress проверяет валидацию
 // пустого адреса при добавлении сервера.
 func TestConfiguration_RejectAddNonvoterEmptyAddress(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 1)
 	defer h.Shutdown()
 
@@ -1307,7 +1444,7 @@ func TestConfiguration_RejectAddNonvoterEmptyAddress(t *testing.T) {
 // Оба шага имеют нулевой запас отказоустойчивости: ожидания futures —
 // только через дедлайн-обёртку waitFuture (SA-014), не голый Error().
 func TestConfiguration_SequentialChanges(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 200*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
@@ -1527,7 +1664,7 @@ func TestConfiguration_EncodeDecode(t *testing.T) {
 
 // TestLeader_Shutdown_NoInflight проверяет, что shutdown без inflight чист.
 func TestLeader_Shutdown_NoInflight(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
@@ -1538,7 +1675,7 @@ func TestLeader_Shutdown_NoInflight(t *testing.T) {
 // Из-за гонки между Apply() (проверка cm.cmState.state) и Stop() (установка state=Dead)
 // допускается ErrNotLeader — Stop может успеть раньше.
 func TestLeader_Shutdown_DuringApply(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
@@ -1557,12 +1694,12 @@ func TestLeader_Shutdown_DuringApply(t *testing.T) {
 // при применении нескольких команд. Индексы доступны только после завершения
 // future (через Error()).
 func TestLeader_DispatchLogs_IndexSequence(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
 	lid, _ := h.CheckSingleLeader()
-	sleepMs(100)
+	// remove: CheckSingleLeader уже дождался устойчивого лидера.
 
 	f1 := h.cluster[lid].Apply(1, 0)
 	f2 := h.cluster[lid].Apply(2, 0)
@@ -1581,14 +1718,14 @@ func TestLeader_DispatchLogs_IndexSequence(t *testing.T) {
 	if !(i1 < i2 && i2 < i3) {
 		t.Fatalf("indices not increasing: %d, %d, %d", i1, i2, i3)
 	}
-
-	sleepMs(100)
+	// remove: пауза в конце теста ничего не проверяет; остановку узлов
+	// выполняет h.Shutdown().
 }
 
 // TestCommitmentInteg_CommitOnMajority проверяет, что commit происходит
 // при репликации на большинство узлов.
 func TestCommitmentInteg_CommitOnMajority(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
@@ -1598,7 +1735,8 @@ func TestCommitmentInteg_CommitOnMajority(t *testing.T) {
 	if err := future.Error(); err != nil {
 		t.Fatalf("Apply failed: %v", err)
 	}
-	sleepMs(50)
+	// replace: устоявшийся лидер, сбоев нет — steady.
+	h.WaitForCommitBudget(42, 3, commitBudgetSteady)
 
 	h.CheckCommitted(42)
 }
@@ -1607,19 +1745,22 @@ func TestCommitmentInteg_CommitOnMajority(t *testing.T) {
 // происходит без кворума. Изолируем лидера от обоих followers — кворума нет,
 // команда не коммитится. Ожидаем, что future блокируется, а не возвращает nil.
 func TestCommitmentInteg_NoCommitWithoutMajority(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 200*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
 	lid, _ := h.CheckSingleLeader()
 
 	// Отключаем лидера от обоих followers и followers друг от друга.
+	// replace: ждём фактического вступления изоляции в силу.
 	h.DisconnectPeer((lid + 1) % 3)
 	h.DisconnectPeer((lid + 2) % 3)
-	sleepMs(50)
+	h.waitForIsolated(lid, commitBudgetSteady)
 
+	inflightBefore := h.applyInflightCount(lid)
 	future := h.cluster[lid].Apply(42, 0)
-	sleepMs(100)
+	// replace: ждём попадания Apply в inflight лидера.
+	h.waitForApplyInflight(lid, inflightBefore+1, commitBudgetSteady)
 
 	// Проверяем, что future не завершился успехом в течение таймаута.
 	errCh := make(chan error, 1)
@@ -1640,7 +1781,7 @@ func TestCommitmentInteg_NoCommitWithoutMajority(t *testing.T) {
 // TestCommitmentInteg_CommitAfterReconnect проверяет, что после реконнекта
 // отключённого узла коммит происходит.
 func TestCommitmentInteg_CommitAfterReconnect(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 300*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
@@ -1648,18 +1789,22 @@ func TestCommitmentInteg_CommitAfterReconnect(t *testing.T) {
 	follower := (lid + 1) % 3
 	otherFollower := (lid + 2) % 3
 
-	// Отключаем одного follower
+	// Отключаем одного follower.
+	// remove: DisconnectPeer применяет разрыв синхронно (мутация
+	// транспортов завершена к моменту возврата).
 	h.DisconnectPeer(follower)
-	sleepMs(HeartbeatTimeoutMs * 2)
 
 	// Apply с оставшимся кворумом (leader + один follower)
 	// Но нужно отключить ещё одного follower, чтобы кворума не было,
-	// иначе команда закоммитится сразу
+	// иначе команда закоммитится сразу.
+	// replace: ждём фактической изоляции лидера.
 	h.DisconnectPeer(otherFollower)
-	sleepMs(HeartbeatTimeoutMs * 2)
+	h.waitForIsolated(lid, commitBudgetSteady)
 
+	inflightBefore := h.applyInflightCount(lid)
 	future := h.cluster[lid].Apply(42, 0)
-	sleepMs(HeartbeatTimeoutMs)
+	// replace: ждём попадания Apply в inflight лидера.
+	h.waitForApplyInflight(lid, inflightBefore+1, commitBudgetSteady)
 
 	// Подключаем одного follower -> должен быть кворум.
 	// Backoff репликации (ADR-P07-006, потолок 1000 мс) может задержать
@@ -1678,7 +1823,7 @@ func TestCommitmentInteg_CommitAfterReconnect(t *testing.T) {
 
 // TestCommitmentInteg_SingleNode проверяет single-node акселератор.
 func TestCommitmentInteg_SingleNode(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 1)
 	defer h.Shutdown()
 
@@ -1688,7 +1833,8 @@ func TestCommitmentInteg_SingleNode(t *testing.T) {
 	if err := future.Error(); err != nil {
 		t.Fatalf("Apply failed: %v", err)
 	}
-	sleepMs(50)
+	// replace: одноузловой кластер, сбоев нет — steady.
+	h.WaitForCommitBudget(42, 1, commitBudgetSteady)
 
 	h.CheckCommitted(42)
 }
@@ -1696,7 +1842,7 @@ func TestCommitmentInteg_SingleNode(t *testing.T) {
 // TestRaftSafety_NewLeaderCommitNoop проверяет, что после выборов
 // лидер коммитит noop запись.
 func TestRaftSafety_NewLeaderCommitNoop(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 200*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
@@ -1708,7 +1854,8 @@ func TestRaftSafety_NewLeaderCommitNoop(t *testing.T) {
 	if err := future.Error(); err != nil {
 		t.Fatalf("Apply failed: %v", err)
 	}
-	sleepMs(50)
+	// replace: устоявшийся лидер, сбоев нет — steady.
+	h.WaitForCommitBudget(42, 3, commitBudgetSteady)
 
 	h.CheckCommitted(42)
 }
@@ -1716,13 +1863,14 @@ func TestRaftSafety_NewLeaderCommitNoop(t *testing.T) {
 // TestRace_ApplyAndStepDown проверяет, что нет гонок между Apply
 // и stepDown.
 func TestRace_ApplyAndStepDown(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
 	lid, _ := h.CheckSingleLeader()
 
 	// Apply в одной горутине
+	inflightBefore := h.applyInflightCount(lid)
 	done := make(chan struct{})
 	go func() {
 		future := h.cluster[lid].Apply(42, 0)
@@ -1730,7 +1878,9 @@ func TestRace_ApplyAndStepDown(t *testing.T) {
 		close(done)
 	}()
 
-	sleepMs(20)
+	// replace: ждём попадания Apply в inflight лидера вместо
+	// фиксированной паузы.
+	h.waitForApplyInflight(lid, inflightBefore+1, commitBudgetSteady)
 
 	// stepDown в другой горутине
 	args := AppendEntriesArgs{
@@ -1757,7 +1907,7 @@ func TestRace_ApplyAndStepDown(t *testing.T) {
 
 // TestCommitmentInteg_FiveNodes проверяет 5-node кластер.
 func TestCommitmentInteg_FiveNodes(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 200*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 5)
 	defer h.Shutdown()
 
@@ -1767,7 +1917,8 @@ func TestCommitmentInteg_FiveNodes(t *testing.T) {
 	if err := future.Error(); err != nil {
 		t.Fatalf("Apply failed: %v", err)
 	}
-	sleepMs(100)
+	// replace: 5 узлов, сбоев нет — steady.
+	h.WaitForCommitBudget(42, 5, commitBudgetSteady)
 
 	h.CheckCommitted(42)
 }
@@ -1775,13 +1926,15 @@ func TestCommitmentInteg_FiveNodes(t *testing.T) {
 // TestCommitmentInteg_FiveNodesDisconnectTwo проверяет, что при отключении
 // 2 из 5 узлов кворум сохраняется.
 func TestCommitmentInteg_FiveNodesDisconnectTwo(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 300*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 5)
 	defer h.Shutdown()
 
 	lid, _ := h.CheckSingleLeader()
 
-	// Отключаем 2 узла (3/5 — кворум есть)
+	// Отключаем 2 узла (3/5 — кворум есть).
+	// remove: DisconnectPeer применяет разрыв синхронно; Apply ниже
+	// блокируется до коммита и сам является ожиданием.
 	disconnected := 0
 	for i := 0; i < 5; i++ {
 		if i != lid && disconnected < 2 {
@@ -1789,13 +1942,14 @@ func TestCommitmentInteg_FiveNodesDisconnectTwo(t *testing.T) {
 			disconnected++
 		}
 	}
-	sleepMs(100)
 
 	future := h.cluster[lid].Apply(42, 0)
 	if err := future.Error(); err != nil {
 		t.Fatalf("Apply should succeed with 3/5 quorum: %v", err)
 	}
-	sleepMs(100)
+	// replace: подключены 3 из 5 узлов; отключение — часть сценария,
+	// возможны перевыборы — after-failover.
+	h.WaitForCommit(42, 3)
 
 	h.CheckCommittedN(42, 3)
 }
@@ -1803,13 +1957,14 @@ func TestCommitmentInteg_FiveNodesDisconnectTwo(t *testing.T) {
 // TestCommitmentInteg_FiveNodesDisconnectThree проверяет, что при отключении
 // 3 из 5 узлов кворум теряется (future блокируется).
 func TestCommitmentInteg_FiveNodesDisconnectThree(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 300*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 5)
 	defer h.Shutdown()
 
 	lid, _ := h.CheckSingleLeader()
 
-	// Отключаем 3 узла (2/5 — кворума нет)
+	// Отключаем 3 узла (2/5 — кворума нет).
+	// remove: DisconnectPeer применяет разрыв синхронно.
 	disconnected := 0
 	for i := 0; i < 5; i++ {
 		if i != lid && disconnected < 3 {
@@ -1817,10 +1972,11 @@ func TestCommitmentInteg_FiveNodesDisconnectThree(t *testing.T) {
 			disconnected++
 		}
 	}
-	sleepMs(HeartbeatTimeoutMs * 2)
 
+	inflightBefore := h.applyInflightCount(lid)
 	future := h.cluster[lid].Apply(42, 0)
-	sleepMs(HeartbeatTimeoutMs * 3)
+	// replace: ждём попадания Apply в inflight лидера.
+	h.waitForApplyInflight(lid, inflightBefore+1, commitBudgetSteady)
 
 	// Проверяем, что future не завершился успехом в течение таймаута.
 	errCh := make(chan error, 1)
@@ -1842,7 +1998,7 @@ func TestStability_1kCommands(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping 1k commands stability test in short mode")
 	}
-	defer leaktest.CheckTimeout(t, 600*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
@@ -1854,7 +2010,8 @@ func TestStability_1kCommands(t *testing.T) {
 			t.Fatalf("Apply %d failed: %v", i, err)
 		}
 	}
-	sleepMs(HeartbeatTimeoutMs * 2)
+	// replace: сходимость последней команды влечёт коммит предыдущих.
+	h.WaitForCommitBudget(99, 3, commitBudgetSteady)
 
 	for i := 0; i < 100; i++ {
 		h.CheckCommitted(i)
@@ -1866,7 +2023,7 @@ func TestStability_ConcurrentClients(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping concurrent clients test in short mode")
 	}
-	defer leaktest.CheckTimeout(t, 600*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
@@ -1884,7 +2041,10 @@ func TestStability_ConcurrentClients(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
-	sleepMs(100)
+	// replace: ждём сходимости обеих проверяемых команд (порядок
+	// коммита конкурентных Apply не определён) — steady.
+	h.WaitForCommitBudget(0, 3, commitBudgetSteady)
+	h.WaitForCommitBudget(9, 3, commitBudgetSteady)
 
 	// Проверяем, что все 10 команд закоммичены
 	h.CheckCommittedN(0, 3)
@@ -1967,7 +2127,7 @@ func (f *RecordingBatchingFSM) MaxBatchSize() int {
 // команд на одноузловой кластер — этого достаточно, чтобы processLogs
 // создал более одного под-батча при обработке закоммиченных записей.
 func TestNonBatchingFSM_ProcessLogsSubBatching(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 120*time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 1)
 	defer h.Shutdown()
 
@@ -1990,7 +2150,7 @@ func TestNonBatchingFSM_ProcessLogsSubBatching(t *testing.T) {
 // внедрения sub-batching и type assertion в runFSM. Отправляет 10 команд
 // и проверяет, что все future получают корректные ответы.
 func TestNonBatchingFSM_UnchangedBehavior(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 120*time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
@@ -2001,8 +2161,8 @@ func TestNonBatchingFSM_UnchangedBehavior(t *testing.T) {
 		f := h.cluster[lid].Apply(i, 5*time.Second)
 		futures = append(futures, f)
 	}
-	sleepMs(100 * Quantum)
-
+	// remove: f.Error() блокируется до разрешения future (таймаут 5s
+	// задан при Apply) и сам является ожиданием результата.
 	for i, f := range futures {
 		if err := f.Error(); err != nil {
 			t.Errorf("future %d error: %v", i, err)
@@ -2015,7 +2175,7 @@ func TestNonBatchingFSM_UnchangedBehavior(t *testing.T) {
 // получает записи через ApplyBatch, а Apply не вызывается для LogCommand.
 // Использует RecordingBatchingFSM на одноузловом кластере.
 func TestBatchingFSM_Basic(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 60*time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	fsm := NewRecordingBatchingFSM()
 	cm := testServerWithFSM(t, fsm)
 	defer cm.Stop()
@@ -2042,7 +2202,7 @@ func TestBatchingFSM_Basic(t *testing.T) {
 // записей. Запускает RecordingBatchingFSM на одноузловом кластере
 // и отправляет maxApplyBatchSize*3 команд.
 func TestBatchingFSM_BatchBoundary(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 120*time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	fsm := NewRecordingBatchingFSM()
 	cm := testServerWithFSM(t, fsm)
 	defer cm.Stop()
@@ -2072,7 +2232,7 @@ func TestBatchingFSM_BatchBoundary(t *testing.T) {
 // RecordingBatchingFSM возвращает индекс записи в качестве ответа;
 // проверяем, что future.Response() возвращает ожидаемый индекс.
 func TestBatchingFSM_ApplyBatchResponseMatching(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 60*time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	fsm := NewRecordingBatchingFSM()
 	cm := testServerWithFSM(t, fsm)
 	defer cm.Stop()
@@ -2154,7 +2314,7 @@ func (f *mismatchBatchingFSM) ApplyBatch(logs []*LogEntry) []any {
 // ошибку проверяется каждый future из первоначальной пачки команд;
 // последующая команда после ошибки подтверждает живучесть runFSM.
 func TestBatchingFSM_ApplyBatchResponseMismatch(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 60*time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	fsm := &mismatchBatchingFSM{inner: NewRecordingBatchingFSM()}
 	cm := testServerWithFSM(t, fsm)
@@ -2202,13 +2362,13 @@ func TestBatchingFSM_ApplyBatchResponseMismatch(t *testing.T) {
 // демотируется в nonvoter, затем лидер отключается. Nonvoter остаётся
 // Follower, кластер избирает нового лидера из оставшихся voter'ов.
 func TestNonvoter_DoesNotStartElection(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 200*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 4)
 	defer h.Shutdown()
 
 	// Ждём стабилизации лидера.
 	lid, _ := h.CheckSingleLeader()
-	sleepMs(100)
+	// remove: CheckSingleLeader уже дождался устойчивого лидера.
 
 	// Демотировать не-лидера.
 	demoteID := (lid + 1) % 4
@@ -2216,13 +2376,17 @@ func TestNonvoter_DoesNotStartElection(t *testing.T) {
 	if err := f.Error(); err != nil {
 		t.Fatalf("DemoteVoter failed: %v", err)
 	}
-	sleepMs(100)
+	// replace: DemoteVoter.Error() гарантирует коммит записи конфигурации,
+	// но не её применение на конкретном узле — ждём наблюдаемого признака.
+	h.waitForSuffrage(demoteID, ServerID(demoteID), Nonvoter, commitBudgetAfterFailover)
 
 	// Отключаем лидера.
 	h.DisconnectPeer(lid)
 
-	// Ждём выборы.
-	sleepMs(50)
+	// keep: negative window — за окно, превышающее минимальный election
+	// timeout, nonvoter не должен стать лидером. Опрос не доказывает
+	// отсутствия события; окно осознанно временное.
+	sleepMs(ReelectionTimeoutMs)
 
 	// Nonvoter не должен быть лидером.
 	_, _, isLeader := h.cluster[demoteID].Report()
@@ -2244,12 +2408,12 @@ func TestNonvoter_DoesNotStartElection(t *testing.T) {
 // Отключаем одного voter'а и nonvoter — кворум (2 из 3 voter'ов) сохраняется,
 // команда коммитится.
 func TestNonvoter_DoesNotAffectCommitIndex(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 300*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 4)
 	defer h.Shutdown()
 
 	lid, _ := h.CheckSingleLeader()
-	sleepMs(100)
+	// remove: CheckSingleLeader уже дождался устойчивого лидера.
 
 	// Демотировать не-лидера в nonvoter.
 	demoteID := (lid + 1) % 4
@@ -2257,7 +2421,9 @@ func TestNonvoter_DoesNotAffectCommitIndex(t *testing.T) {
 	if err := f.Error(); err != nil {
 		t.Fatalf("DemoteVoter failed: %v", err)
 	}
-	sleepMs(100)
+	// replace: DemoteVoter.Error() гарантирует коммит записи конфигурации,
+	// но не её применение на конкретном узле — ждём наблюдаемого признака.
+	h.waitForSuffrage(demoteID, ServerID(demoteID), Nonvoter, commitBudgetAfterFailover)
 
 	// Определяем ID другого voter'а (не лидер, не nonvoter).
 	otherVoter := (lid + 1) % 4
@@ -2271,9 +2437,10 @@ func TestNonvoter_DoesNotAffectCommitIndex(t *testing.T) {
 	}
 
 	// Отключаем одного voter'а и nonvoter.
+	// remove: DisconnectPeer применяет разрыв синхронно; Apply ниже
+	// блокируется до коммита и сам является ожиданием.
 	h.DisconnectPeer(otherVoter)
 	h.DisconnectPeer(demoteID)
-	sleepMs(50)
 
 	// Отправляем команду — должна закоммититься (2 из 3 voter'ов = кворум).
 	future := h.cluster[lid].Apply(42, 0)
@@ -2281,20 +2448,22 @@ func TestNonvoter_DoesNotAffectCommitIndex(t *testing.T) {
 		t.Fatalf("Apply failed: %v", err)
 	}
 
-	// Проверяем, что команда закоммичена на лидере.
-	h.WaitForCommit(42, 1)
+	// Подключены лидер и второй voter — оба обязаны закоммитить
+	// команду. Прежнее значение 1 не проверялось: старый WaitForCommit
+	// возвращался по «nc >= n» без assert'а (SA-001).
+	h.WaitForCommit(42, 2)
 }
 
 // TestNonvoter_AppliesLogs проверяет, что nonvoter получает и применяет
 // все закоммиченные записи к FSM. Кластер из 4 серверов; сервер 3 —
 // nonvoter. Отправляем 3 команды — nonvoter должен иметь те же записи.
 func TestNonvoter_AppliesLogs(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 300*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 4)
 	defer h.Shutdown()
 
 	lid, _ := h.CheckSingleLeader()
-	sleepMs(HeartbeatTimeoutMs * 2)
+	// remove: CheckSingleLeader уже дождался устойчивого лидера.
 
 	// Демотировать не-лидера в nonvoter.
 	demoteID := (lid + 1) % 4
@@ -2302,7 +2471,9 @@ func TestNonvoter_AppliesLogs(t *testing.T) {
 	if err := f.Error(); err != nil {
 		t.Fatalf("DemoteVoter failed: %v", err)
 	}
-	sleepMs(HeartbeatTimeoutMs * 2)
+	// replace: DemoteVoter.Error() гарантирует коммит записи конфигурации,
+	// но не её применение на конкретном узле — ждём наблюдаемого признака.
+	h.waitForSuffrage(demoteID, ServerID(demoteID), Nonvoter, commitBudgetAfterFailover)
 
 	for _, cmd := range []int{10, 20, 30} {
 		f := h.cluster[lid].Apply(cmd, 0)
@@ -2310,7 +2481,9 @@ func TestNonvoter_AppliesLogs(t *testing.T) {
 			t.Fatalf("Apply %d failed: %v", cmd, err)
 		}
 	}
-	sleepMs(HeartbeatTimeoutMs * 3)
+	// replace: подключены все 4 узла (nonvoter применяет закоммиченные
+	// записи), сбоев нет — steady.
+	h.WaitForCommitBudget(30, 4, commitBudgetSteady)
 
 	// Проверить, что nonvoter закоммитил все команды.
 	for _, cmd := range []int{10, 20, 30} {
@@ -2323,12 +2496,12 @@ func TestNonvoter_AppliesLogs(t *testing.T) {
 // Лидер демотирует один сервер, затем отключается — демотированный сервер
 // не начинает выборы, кластер избирает нового лидера из оставшихся voter'ов.
 func TestNonvoter_DemotedVoterDoesNotStartElection(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 200*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 4)
 	defer h.Shutdown()
 
 	lid, _ := h.CheckSingleLeader()
-	sleepMs(50)
+	// remove: CheckSingleLeader уже дождался устойчивого лидера.
 
 	// Демотировать другого voter'а, не лидера.
 	demoteID := (lid + 1) % 4
@@ -2336,7 +2509,9 @@ func TestNonvoter_DemotedVoterDoesNotStartElection(t *testing.T) {
 	if err := f.Error(); err != nil {
 		t.Fatalf("DemoteVoter failed: %v", err)
 	}
-	sleepMs(50)
+	// replace: DemoteVoter.Error() гарантирует коммит записи конфигурации,
+	// но не её применение на конкретном узле — ждём наблюдаемого признака.
+	h.waitForSuffrage(demoteID, ServerID(demoteID), Nonvoter, commitBudgetAfterFailover)
 
 	// Проверить, что сервер demoteID теперь nonvoter.
 	cfg := h.cluster[lid].GetConfiguration().Configuration()
@@ -2356,8 +2531,10 @@ func TestNonvoter_DemotedVoterDoesNotStartElection(t *testing.T) {
 	// Отключаем лидера.
 	h.DisconnectPeer(lid)
 
-	// Ждём выборы.
-	sleepMs(50)
+	// keep: negative window — за окно, превышающее минимальный election
+	// timeout, nonvoter не должен стать лидером. Опрос не доказывает
+	// отсутствия события; окно осознанно временное.
+	sleepMs(ReelectionTimeoutMs)
 
 	// Nonvoter не должен стать лидером.
 	_, _, isLeader := h.cluster[demoteID].Report()
@@ -2376,12 +2553,12 @@ func TestNonvoter_DemotedVoterDoesNotStartElection(t *testing.T) {
 // отклоняет запрос от nonvoter-кандидата. Nonvoter отправляет RequestVote
 // voter'у — VoteGranted должен быть false.
 func TestNonvoter_RejectsRequestVote(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 150*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 4)
 	defer h.Shutdown()
 
 	lid, _ := h.CheckSingleLeader()
-	sleepMs(100)
+	// remove: CheckSingleLeader уже дождался устойчивого лидера.
 
 	// Демотировать не-лидера в nonvoter.
 	demoteID := (lid + 1) % 4
@@ -2389,7 +2566,9 @@ func TestNonvoter_RejectsRequestVote(t *testing.T) {
 	if err := f.Error(); err != nil {
 		t.Fatalf("DemoteVoter failed: %v", err)
 	}
-	sleepMs(100)
+	// replace: DemoteVoter.Error() гарантирует коммит записи конфигурации,
+	// но не её применение на конкретном узле — ждём наблюдаемого признака.
+	h.waitForSuffrage(demoteID, ServerID(demoteID), Nonvoter, commitBudgetAfterFailover)
 
 	// Nonvoter (demoteID) отправляет RequestVote лидеру.
 	voterID := lid
@@ -2418,12 +2597,12 @@ func TestNonvoter_RejectsRequestVote(t *testing.T) {
 // получивший TimeoutNow, не начинает выборы. TimeoutNow отправляется
 // от лидера nonvoter'у — nonvoter остаётся Follower.
 func TestNonvoter_TimeoutNowDoesNotStartElection(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 150*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 4)
 	defer h.Shutdown()
 
 	lid, _ := h.CheckSingleLeader()
-	sleepMs(100)
+	// remove: CheckSingleLeader уже дождался устойчивого лидера.
 
 	// Демотировать не-лидера в nonvoter.
 	demoteID := (lid + 1) % 4
@@ -2431,7 +2610,9 @@ func TestNonvoter_TimeoutNowDoesNotStartElection(t *testing.T) {
 	if err := f.Error(); err != nil {
 		t.Fatalf("DemoteVoter failed: %v", err)
 	}
-	sleepMs(100)
+	// replace: DemoteVoter.Error() гарантирует коммит записи конфигурации,
+	// но не её применение на конкретном узле — ждём наблюдаемого признака.
+	h.waitForSuffrage(demoteID, ServerID(demoteID), Nonvoter, commitBudgetAfterFailover)
 
 	// Nonvoter получает TimeoutNow.
 	_, err := h.SendTimeoutNow(lid, demoteID)
@@ -2449,12 +2630,12 @@ func TestNonvoter_TimeoutNowDoesNotStartElection(t *testing.T) {
 // TestNonvoter_NoGoroutineLeak проверяет, что кластер с nonvoter
 // корректно выполняет операции и завершается без утечек горутин.
 func TestNonvoter_NoGoroutineLeak(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 150*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 4)
 	defer h.Shutdown()
 
 	lid, _ := h.CheckSingleLeader()
-	sleepMs(100)
+	// remove: CheckSingleLeader уже дождался устойчивого лидера.
 
 	// Демотировать не-лидера в nonvoter.
 	demoteID := (lid + 1) % 4
@@ -2462,7 +2643,9 @@ func TestNonvoter_NoGoroutineLeak(t *testing.T) {
 	if err := f.Error(); err != nil {
 		t.Fatalf("DemoteVoter failed: %v", err)
 	}
-	sleepMs(100)
+	// replace: DemoteVoter.Error() гарантирует коммит записи конфигурации,
+	// но не её применение на конкретном узле — ждём наблюдаемого признака.
+	h.waitForSuffrage(demoteID, ServerID(demoteID), Nonvoter, commitBudgetAfterFailover)
 
 	// Отправить команду.
 	f = h.cluster[lid].Apply(42, 0)
@@ -2470,14 +2653,16 @@ func TestNonvoter_NoGoroutineLeak(t *testing.T) {
 		t.Fatalf("Apply failed: %v", err)
 	}
 
-	// Проверить, что команда закоммичена.
-	h.WaitForCommit(42, 1)
+	// Подключены все 4 узла (nonvoter тоже применяет закоммиченные
+	// записи) — assert CheckCommittedN требует точного числа
+	// подключённых узлов. Прежнее значение 1 не проверялось (SA-001).
+	h.WaitForCommit(42, 4)
 }
 
 // TestVerifyLeader_SingleNode проверяет, что VerifyLeader на одноузловом
 // кластере немедленно завершается успехом (собственный голос = кворум).
 func TestVerifyLeader_SingleNode(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 60*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 1)
 	defer h.Shutdown()
 
@@ -2492,7 +2677,7 @@ func TestVerifyLeader_SingleNode(t *testing.T) {
 // TestVerifyLeader_LeaderSucceeds проверяет, что лидер multi-node кластера
 // успешно подтверждает своё лидерство через VerifyLeader.
 func TestVerifyLeader_LeaderSucceeds(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
@@ -2508,7 +2693,7 @@ func TestVerifyLeader_LeaderSucceeds(t *testing.T) {
 // TestVerifyLeader_NonLeaderFails проверяет, что VerifyLeader на non-leader
 // немедленно возвращает ErrNotLeader без блокировки.
 func TestVerifyLeader_NonLeaderFails(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
@@ -2527,7 +2712,7 @@ func TestVerifyLeader_NonLeaderFails(t *testing.T) {
 // блокируется (или возвращает ошибку) после потери лидерства и разрыва
 // связи с кворумом.
 func TestVerifyLeader_AfterLeadershipLossFails(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 200*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
@@ -2556,7 +2741,7 @@ func TestVerifyLeader_AfterLeadershipLossFails(t *testing.T) {
 // TestVerifyLeader_Concurrent проверяет, что несколько concurrent вызовов
 // VerifyLeader работают корректно. Использует ErrorCh для select-стиля.
 func TestVerifyLeader_Concurrent(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
@@ -2577,7 +2762,7 @@ func TestVerifyLeader_Concurrent(t *testing.T) {
 
 // TestVerifyLeader_Timeout проверяет ErrorCh для VerifyLeader.
 func TestVerifyLeader_Timeout(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 60*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 1)
 	defer h.Shutdown()
 
@@ -2592,7 +2777,7 @@ func TestVerifyLeader_Timeout(t *testing.T) {
 // TestApply_Timeout проверяет, что Apply с ненулевым таймаутом возвращает
 // ErrEnqueueTimeout при недоступности лидера.
 func TestApply_Timeout(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 60*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 1)
 	defer h.Shutdown()
 
@@ -2605,7 +2790,7 @@ func TestApply_Timeout(t *testing.T) {
 // TestApply_TimeoutDoesNotBlock проверяет, что Apply с timeout=0
 // не блокируется навсегда при закрытии shutdownCh.
 func TestApply_TimeoutDoesNotBlock(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 60*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 1)
 	h.Shutdown()
 	future := h.cluster[0].Apply(42, 0)
@@ -2629,7 +2814,7 @@ func TestApply_TimeoutDoesNotBlock(t *testing.T) {
 //  4. Проверить, что все команды закоммичены.
 //  5. Проверить, что нет утечек горутин (leaktest в defer).
 func TestDedup_NoStaleResponseRace(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 300*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
@@ -2646,7 +2831,8 @@ func TestDedup_NoStaleResponseRace(t *testing.T) {
 		}
 	}
 
-	sleepMs(50 * Quantum)
+	// replace: сходимость последней команды влечёт коммит предыдущих.
+	h.WaitForCommitBudget(99, 3, commitBudgetSteady)
 
 	// Проверяем, что все команды закоммичены (100 = последняя команда).
 	h.CheckCommitted(99)
@@ -2668,7 +2854,7 @@ func TestDedup_NoStaleResponseRace(t *testing.T) {
 //  5. Переподключить S1.
 //  6. Проверить, что кластер восстанавливается и новые команды коммитятся.
 func TestDedup_LeaderStepDownClearsFlags(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 300*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -2681,8 +2867,9 @@ func TestDedup_LeaderStepDownClearsFlags(t *testing.T) {
 	h.WaitForCommit(20, 3)
 
 	// Изолируем лидера от всех follower.
+	// remove: CheckSingleLeader опрашивает состояние сам, изолированный
+	// лидер исключён из опроса.
 	h.DisconnectPeer(origLeaderId)
-	sleepMs(ReelectionTimeoutMs + HeartbeatTimeoutMs)
 
 	// Должен появиться новый лидер.
 	newLeaderId, _ := h.CheckSingleLeader()
@@ -2698,11 +2885,12 @@ func TestDedup_LeaderStepDownClearsFlags(t *testing.T) {
 	h.WaitForCommit(30, 2)
 
 	// Переподключаем старого лидера.
+	// replace: после реконнекта окно «два лидера» ожидается через
+	// WaitForSingleLeader (backoff репликации ADR-P07-006).
 	h.ReconnectPeer(origLeaderId)
-	sleepMs(100 * Quantum)
 
 	// Кластер должен продолжать работать.
-	finalLeaderId, _ := h.CheckSingleLeader()
+	finalLeaderId, _ := h.WaitForSingleLeader(leaderElectionBudget)
 
 	// Отправляем команду текущему лидеру.
 	h.SubmitToServer(finalLeaderId, 40)
@@ -2724,7 +2912,7 @@ func TestDedup_LeaderStepDownClearsFlags(t *testing.T) {
 //  3. Работать 5 секунд.
 //  4. Проверить, что кластер жив и все команды закоммичены.
 func TestDedup_ConcurrentHeartbeatAndDispatch(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 300*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	if testing.Short() {
 		t.Skip("skipping concurrent heartbeat test in short mode")
@@ -2743,10 +2931,13 @@ func TestDedup_ConcurrentHeartbeatAndDispatch(t *testing.T) {
 			lid = newLid
 			continue
 		}
+		// keep: timing — интервал подачи нагрузки является предметом
+		// стресс-теста (пересечение с heartbeat/apply-тикерами).
 		time.Sleep(time.Duration(TickerTimeoutMs/4) * time.Millisecond)
 	}
 
-	sleepMs(50 * Quantum)
+	// replace: ждём сходимости последней команды вместо фиксированной паузы.
+	h.WaitForCommit(49, 3)
 
 	// Проверяем, что кластер жив и последняя команда закоммичена.
 	h.CheckSingleLeader()
@@ -2767,7 +2958,7 @@ func TestDedup_ConcurrentHeartbeatAndDispatch(t *testing.T) {
 //  6. Дождаться, пока сервер догонит лог.
 //  7. Проверить, что все серверы имеют одинаковые committed-записи.
 func TestDedup_AllServersConsistentAfterCrash(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 300*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -2785,8 +2976,8 @@ func TestDedup_AllServersConsistentAfterCrash(t *testing.T) {
 
 	// Crash follower.
 	followerID := (lid + 1) % 3
+	// remove: CrashPeer возвращается после join горутин узла (ADR-003 п.7).
 	h.CrashPeer(followerID)
-	sleepMs(HeartbeatTimeoutMs * 2)
 
 	// Отправляем ещё 30 команд (без follower).
 	for i := 30; i < 60; i++ {
@@ -2819,7 +3010,7 @@ func TestDedup_AllServersConsistentAfterCrash(t *testing.T) {
 //  3. После каждого цикла отправить 10 команд и проверить коммит.
 //  4. После всех циклов проверить целостность.
 func TestDedup_RapidLeadershipChange(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 600*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	if testing.Short() {
 		t.Skip("skipping rapid leadership change test in short mode")
@@ -2832,8 +3023,8 @@ func TestDedup_RapidLeadershipChange(t *testing.T) {
 		lid, _ := h.CheckSingleLeader()
 
 		// Crash текущего лидера.
+		// remove: CheckSingleLeader опрашивает состояние сам.
 		h.CrashPeer(lid)
-		sleepMs(ReelectionTimeoutMs + HeartbeatTimeoutMs)
 
 		// Дождаться нового лидера.
 		newLid, _ := h.CheckSingleLeader()
@@ -2851,8 +3042,9 @@ func TestDedup_RapidLeadershipChange(t *testing.T) {
 		h.WaitForCommit(cycle*100+9, 2)
 
 		// Восстанавливаем crashed лидера для следующего цикла.
+		// remove: RestartPeer завершает ready-wait перезапущенного узла
+		// (TASK-009), дополнительная пауза не требуется.
 		h.RestartPeer(lid)
-		sleepMs(HeartbeatTimeoutMs * 3)
 	}
 
 	// Проверяем целостность: последняя команда закоммичена на всех
@@ -2874,7 +3066,7 @@ func TestDedup_RapidLeadershipChange(t *testing.T) {
 //
 // Запуск: только с -race флагом.
 func TestRace_ReplicateLoopLeadershipChange(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -2883,14 +3075,17 @@ func TestRace_ReplicateLoopLeadershipChange(t *testing.T) {
 
 	// Отправляем команду, чтобы заполнить журнал.
 	h.SubmitToServer(lid, 42)
-	sleepMs(50)
+	// replace: до изоляции сбоев нет — steady.
+	h.WaitForCommitBudget(42, 3, commitBudgetSteady)
 
 	// Изолируем лидера — Apply блокируется.
+	// replace (не commit-ожидание): ждём вступления изоляции в силу.
 	h.DisconnectPeer((lid + 1) % 3)
 	h.DisconnectPeer((lid + 2) % 3)
-	sleepMs(50)
+	h.waitForIsolated(lid, commitBudgetSteady)
 
 	// Запускаем Apply в фоне.
+	inflightBefore := h.applyInflightCount(lid)
 	done := make(chan struct{})
 	go func() {
 		future := h.cluster[lid].Apply(43, 0)
@@ -2898,7 +3093,8 @@ func TestRace_ReplicateLoopLeadershipChange(t *testing.T) {
 		close(done)
 	}()
 
-	sleepMs(20)
+	// replace (не commit-ожидание): ждём попадания Apply в inflight.
+	h.waitForApplyInflight(lid, inflightBefore+1, commitBudgetSteady)
 
 	// Шлём stepDown через AppendEntries с более высоким term.
 	args := AppendEntriesArgs{
@@ -2925,9 +3121,8 @@ func TestRace_ReplicateLoopLeadershipChange(t *testing.T) {
 	// После stepDown должен появиться новый лидер.
 	h.ReconnectPeer((lid + 1) % 3)
 	h.ReconnectPeer((lid + 2) % 3)
-	sleepMs(200)
-
-	h.CheckSingleLeader()
+	// replace: после реконнекта ждём схождения к единственному лидеру.
+	h.WaitForSingleLeader(leaderElectionBudget)
 }
 
 // TestRace_ConcurrentLeaderSendAEs проверяет отсутствие data race
@@ -2938,7 +3133,7 @@ func TestRace_ReplicateLoopLeadershipChange(t *testing.T) {
 //  2. Вызвать leaderSendAEs из 10 параллельных горутин.
 //  3. Проверить, что нет panic и data race.
 func TestRace_ConcurrentLeaderSendAEs(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -2970,7 +3165,7 @@ func TestRace_ConcurrentLeaderSendAEs(t *testing.T) {
 //
 // Ожидание: для каждой записи в cm.cmState.log termIndexMap содержит её терм.
 func TestIntegration_TermIndexConsistency(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 30*time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -2980,7 +3175,8 @@ func TestIntegration_TermIndexConsistency(t *testing.T) {
 		lid, _ := h.CheckSingleLeader()
 		h.SubmitToServer(lid, 100+i)
 	}
-	time.Sleep(Quantum * 100 * time.Millisecond)
+	// replace: ждём сходимости последней команды вместо фиксированной паузы.
+	h.WaitForCommit(102, 3)
 
 	// Проверяем termIndexMap на лидере.
 	lid, _ := h.CheckSingleLeader()
@@ -3028,7 +3224,7 @@ func TestIntegration_TermIndexConsistency(t *testing.T) {
 //
 // Ожидание: termIndexMap содержит все термы из обновлённого лога.
 func TestIntegration_TermIndexAfterLogTruncation(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 30*time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -3038,7 +3234,8 @@ func TestIntegration_TermIndexAfterLogTruncation(t *testing.T) {
 		lid, _ := h.CheckSingleLeader()
 		h.SubmitToServer(lid, 100+i)
 	}
-	time.Sleep(Quantum * 100 * time.Millisecond)
+	// replace: ждём сходимости последней команды вместо фиксированной паузы.
+	h.WaitForCommit(102, 3)
 
 	lid, _ := h.CheckSingleLeader()
 
@@ -3054,15 +3251,22 @@ func TestIntegration_TermIndexAfterLogTruncation(t *testing.T) {
 	defer h.ReconnectPeer(victimID)
 
 	// Смена лидера и фаза 2: 3 команды в новом терме.
+	// keep: окно без наблюдаемого состояния — victim уже отключён,
+	// поэтому после отключения лидера подключённым остаётся ровно
+	// один узел и кворума нет: ни лидер, ни коммит не могут появиться.
+	// Бюджет — ReelectionTimeoutMs (минимальный election timeout):
+	// оставшийся узел успевает выйти из состояния «лидер известен».
 	h.DisconnectPeer(lid)
-	time.Sleep(Quantum * 100 * time.Millisecond)
+	sleepMs(ReelectionTimeoutMs)
 	h.ReconnectPeer(lid)
 
 	for i := 0; i < 3; i++ {
-		lid, _ := h.CheckSingleLeader()
+		lid, _ := h.WaitForSingleLeader(leaderElectionBudget)
 		h.SubmitToServer(lid, 200+i)
 	}
-	time.Sleep(Quantum * 100 * time.Millisecond)
+	// replace: ждём сходимости последней команды фазы 2 (жертва
+	// отключена — подключены 2 узла).
+	h.WaitForCommit(202, 2)
 
 	// Подключаем жертву — триггерим репликацию с конфликтом.
 	h.ReconnectPeer(victimID)
@@ -3088,7 +3292,8 @@ func TestIntegration_TermIndexAfterLogTruncation(t *testing.T) {
 			t.Fatalf("timed out: victim %d lastIdx=%d, want >=%d",
 				victimID, lastIdx, targetIdx)
 		}
-		time.Sleep(50 * time.Millisecond)
+		// poll-интервал condition-wait (не фиксированная пауза).
+		time.Sleep(pollInterval)
 	}
 
 	// Проверяем termIndexMap на жертве.
@@ -3115,7 +3320,7 @@ func TestIntegration_TermIndexAfterLogTruncation(t *testing.T) {
 //
 // Ожидание: -race не обнаруживает data race.
 func TestRace_TermIndexMapDispatchAndConflict(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 10*time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	storage := NewMapStorage()
 	mock := &mockTransportConflict{replyTerm: 1, success: false, conflictTerm: 1}
@@ -3157,8 +3362,15 @@ func TestRace_TermIndexMapDispatchAndConflict(t *testing.T) {
 	defer cm.Stop()
 
 	done := make(chan struct{})
+	var wg sync.WaitGroup
+	// Счётчики итераций: стресс-тест обязан выполнить хотя бы по одной
+	// итерации в каждой горутине, иначе он ложно-зелёный (SA-007).
+	var dispatchIters, conflictIters atomic.Int64
+
 	// Горутина dispatch: пишет в termIndexMap.
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for {
 			select {
 			case <-done:
@@ -3171,24 +3383,37 @@ func TestRace_TermIndexMapDispatchAndConflict(t *testing.T) {
 				cm.mu.Lock()
 				cm.dispatchLogsUnsafe([]*logFuture{f})
 				cm.mu.Unlock()
+				dispatchIters.Add(1)
 			}
 		}
 	}()
 
 	// Горутина conflict: читает termIndexMap (через leaderSendAEsToPeer).
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for {
 			select {
 			case <-done:
 				return
 			default:
 				cm.leaderSendAEsToPeer(1, 1, 0)
+				conflictIters.Add(1)
 			}
 		}
 	}()
 
-	time.Sleep(100 * time.Millisecond)
+	// keep: timing — окно нагрузки является предметом стресс-теста
+	// (детектор гонок наблюдает конкурентные обращения). Достаточность
+	// окна проверяется assert'ом на число итераций ниже.
+	sleepMs(100)
 	close(done)
+	wg.Wait()
+
+	if dispatchIters.Load() == 0 || conflictIters.Load() == 0 {
+		t.Fatalf("stress window produced no iterations: dispatch=%d conflict=%d",
+			dispatchIters.Load(), conflictIters.Load())
+	}
 }
 
 // TestRace_TermIndexMapCompactAndRead проверяет, что конкурентное
@@ -3203,7 +3428,7 @@ func TestRace_TermIndexMapDispatchAndConflict(t *testing.T) {
 //
 // Ожидание: -race не обнаруживает data race.
 func TestRace_TermIndexMapCompactAndRead(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 10*time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	cm := &ConsensusModule{
 		leaderState: leaderState{
@@ -3232,8 +3457,15 @@ func TestRace_TermIndexMapCompactAndRead(t *testing.T) {
 	defer cm.Stop()
 
 	done := make(chan struct{})
+	var wg sync.WaitGroup
+	// Счётчики итераций: стресс-тест обязан выполнить хотя бы по одной
+	// итерации в каждой горутине, иначе он ложно-зелёный (SA-007).
+	var compactIters, readerIters atomic.Int64
+
 	// Горутина compact: перестраивает termIndexMap.
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for {
 			select {
 			case <-done:
@@ -3242,12 +3474,15 @@ func TestRace_TermIndexMapCompactAndRead(t *testing.T) {
 				cm.mu.Lock()
 				cm.compactLogs(5)
 				cm.mu.Unlock()
+				compactIters.Add(1)
 			}
 		}
 	}()
 
 	// Горутина reader: читает termIndexMap.
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for {
 			select {
 			case <-done:
@@ -3256,10 +3491,18 @@ func TestRace_TermIndexMapCompactAndRead(t *testing.T) {
 				cm.mu.Lock()
 				_ = cm.cmState.termIndexMap[1]
 				cm.mu.Unlock()
+				readerIters.Add(1)
 			}
 		}
 	}()
 
-	time.Sleep(100 * time.Millisecond)
+	// keep: timing — окно нагрузки является предметом стресс-теста.
+	sleepMs(100)
 	close(done)
+	wg.Wait()
+
+	if compactIters.Load() == 0 || readerIters.Load() == 0 {
+		t.Fatalf("stress window produced no iterations: compact=%d reader=%d",
+			compactIters.Load(), readerIters.Load())
+	}
 }

@@ -22,7 +22,7 @@ import (
 //  5. Команды 5 и 6 остаются закоммичены на всех узлах.
 //  6. Новый лидер принимает новые команды (7).
 func TestLeadershipTransfer_Basic(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -76,7 +76,7 @@ func TestLeadershipTransfer_Basic(t *testing.T) {
 //  3. Подключаем follower обратно, немедленно вызываем LeadershipTransfer.
 //  4. Лидер ждёт, пока target догонит, затем передаёт лидерство.
 func TestLeadershipTransfer_CatchUp(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -121,7 +121,7 @@ func TestLeadershipTransfer_CatchUp(t *testing.T) {
 // TestLeadershipTransfer_ToSelf_Fails проверяет, что LeadershipTransfer(ownID)
 // возвращает ошибку.
 func TestLeadershipTransfer_ToSelf_Fails(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -140,7 +140,7 @@ func TestLeadershipTransfer_ToSelf_Fails(t *testing.T) {
 // TestLeadershipTransfer_FromFollower_Fails проверяет, что вызов
 // LeadershipTransfer на узле-последователе возвращает ErrNotLeader.
 func TestLeadershipTransfer_FromFollower_Fails(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -160,7 +160,7 @@ func TestLeadershipTransfer_FromFollower_Fails(t *testing.T) {
 // TestLeadershipTransfer_ToUnknown_Fails проверяет, что передача лидерства
 // узлу, не входящему в конфигурацию, возвращает ошибку.
 func TestLeadershipTransfer_ToUnknown_Fails(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -186,7 +186,7 @@ func TestLeadershipTransfer_ToUnknown_Fails(t *testing.T) {
 //  3. Вторая future должна вернуть ErrLeadershipTransferInProgress.
 //  4. После завершения первой, можно снова передать лидерство.
 func TestLeadershipTransfer_Concurrent_SecondFails(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 200*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -204,8 +204,10 @@ func TestLeadershipTransfer_Concurrent_SecondFails(t *testing.T) {
 		firstCh <- future.Error()
 	}()
 
-	// Даём горутине время отправить запрос в leadershipTransferCh.
-	time.Sleep(50 * time.Millisecond)
+	// replace: ждём наблюдаемого состояния — передача лидерства принята
+	// leaderLoop (leadershipTransferInProgress != 0), а не фиксированной
+	// паузы.
+	waitForTransferInProgress(t, h, origLeaderID, commitBudgetAfterFailover)
 
 	// Вторая передача должна вернуть ErrLeadershipTransferInProgress
 	// (если первая ещё не завершилась) или ErrNotLeader (если первая
@@ -235,7 +237,7 @@ func TestLeadershipTransfer_Concurrent_SecondFails(t *testing.T) {
 // catch-up блокируется (target отключён), Apply проверяется во время
 // блокировки, затем target подключается, передача завершается.
 func TestLeadershipTransfer_ApplyBlocked(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 200*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -263,13 +265,7 @@ func TestLeadershipTransfer_ApplyBlocked(t *testing.T) {
 	}()
 
 	// Ждём, пока leadershipTransferInProgress установится в leaderLoop.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if atomic.LoadInt32(&h.cluster[origLeaderID].leaderState.leadershipTransferInProgress) != 0 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	waitForTransferInProgress(t, h, origLeaderID, commitBudgetAfterFailover)
 
 	// Apply во время catch-up должен вернуть ErrLeadershipTransferInProgress.
 	future := h.cluster[origLeaderID].Apply(44, 0)
@@ -305,7 +301,7 @@ func TestLeadershipTransfer_ApplyBlocked(t *testing.T) {
 //  2. Отправляем TimeoutNow лидеру через транспорт.
 //  3. Проверяем, что лидер остался прежним и term не изменился.
 func TestTimeoutNow_OnLeader_Noop(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -344,7 +340,7 @@ func TestTimeoutNow_OnLeader_Noop(t *testing.T) {
 //  2. Отправляем TimeoutNow выбранному follower через транспорт.
 //  3. Целевой узел становится лидером, term увеличивается.
 func TestTimeoutNow_OnFollower_ImmediateElection(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -353,6 +349,12 @@ func TestTimeoutNow_OnFollower_ImmediateElection(t *testing.T) {
 
 	// Выбираем follower для отправки TimeoutNow.
 	targetID := (origLeaderID + 1) % 3
+
+	// Предусловие обработчика timeoutNow: целевой узел обязан быть
+	// в состоянии Follower — из PreCandidate/Candidate он отвечает
+	// Success=false (raft_cm_election.go, timeoutNow). Признак того,
+	// что узел вернулся в Follower, — получение AppendEntries от лидера.
+	waitForKnownLeader(t, h, targetID, origLeaderID, commitBudgetAfterFailover)
 
 	// Отправляем TimeoutNow целевому узлу от текущего лидера.
 	reply, err := h.SendTimeoutNow(origLeaderID, targetID)
@@ -384,7 +386,7 @@ func TestTimeoutNow_OnFollower_ImmediateElection(t *testing.T) {
 			newTerm = term
 			break
 		}
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(pollInterval)
 	}
 
 	// Проверяем, что новый лидер — targetID.
@@ -410,7 +412,7 @@ func TestTimeoutNow_OnFollower_ImmediateElection(t *testing.T) {
 //  3. Запускаем LeadershipTransfer на отключённый узел.
 //  4. Передача завершается с ошибкой по таймауту.
 func TestLeadershipTransfer_TargetDisconnected(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 200*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -446,7 +448,7 @@ func TestLeadershipTransfer_TargetDisconnected(t *testing.T) {
 //  4. Проверяем, что голос отдан (VoteGranted == true), несмотря на наличие
 //     известного лидера.
 func TestLeadershipTransfer_VoteBypass(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -454,8 +456,9 @@ func TestLeadershipTransfer_VoteBypass(t *testing.T) {
 	origLeaderID, origTerm := h.CheckSingleLeader()
 	followerID := (origLeaderID + 1) % 3
 
-	// Ждём, пока follower узнает о лидере (получит heartbeat).
-	time.Sleep(100 * time.Millisecond)
+	// replace: ждём наблюдаемого состояния — follower узнал о лидере
+	// (получил heartbeat), а не фиксированной паузы.
+	waitForKnownLeader(t, h, followerID, origLeaderID, commitBudgetAfterFailover)
 
 	// Отправляем RequestVote с LeadershipTransfer=true и term+1 (реальный
 	// leadership transfer increment term). follower должен проголосовать,
@@ -497,13 +500,17 @@ func TestLeadershipTransfer_VoteBypass(t *testing.T) {
 // В тесте TestTimeoutNow_OnFollower_ImmediateElection это уже проверяется.
 // Данный тест — дополнительная прямая проверка флага.
 func TestLeadershipTransfer_SkipPreVote(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
 	origLeaderID, origTerm := h.CheckSingleLeader()
 	followerID := (origLeaderID + 1) % 3
+
+	// Предусловие обработчика timeoutNow: целевой узел обязан быть
+	// в состоянии Follower (см. TestTimeoutNow_OnFollower_ImmediateElection).
+	waitForKnownLeader(t, h, followerID, origLeaderID, commitBudgetAfterFailover)
 
 	// Simulate the beginning of a leadership transfer: send TimeoutNow to follower.
 	reply, err := h.SendTimeoutNow(origLeaderID, followerID)
@@ -514,8 +521,13 @@ func TestLeadershipTransfer_SkipPreVote(t *testing.T) {
 		t.Fatal("TimeoutNow on follower: expected Success=true")
 	}
 
-	// Ждём немного, чтобы узел перешёл в Candidate.
-	time.Sleep(300 * time.Millisecond)
+	// replace: ждём наблюдаемого роста term у целевого узла (TimeoutNow
+	// переводит его в Candidate, что увеличивает term). Оба исхода
+	// протокольно корректны: старый лидер не отключён, поэтому целевой
+	// узел может как выиграть выборы, так и вернуться в Follower по
+	// AppendEntries прежнего лидера — поэтому ожидание ограничено
+	// бюджетом и не является assert'ом.
+	waitForTermAbove(h, followerID, origTerm, commitBudgetAfterFailover)
 
 	// Проверяем, что узел стал лидером (выборы прошли успешно).
 	// Поскольку лидер отключён не был, возможны два сценария:
@@ -533,34 +545,91 @@ func TestLeadershipTransfer_SkipPreVote(t *testing.T) {
 // CheckSingleLeaderNoFail — версия CheckSingleLeader, которая не вызывает
 // t.Fatalf при отсутствии лидера, а возвращает -1, -1.
 func (h *Harness) CheckSingleLeaderNoFail() (int, int) {
-	for r := 0; r < 8; r++ {
+	deadline := time.Now().Add(leaderElectionBudget)
+	for {
+		// connected снимается под h.mu, Report() опрашивается вне её
+		// (инвариант границ NEW-02).
+		connected := h.connectedSnapshot()
 		leaderID := -1
 		leaderTerm := -1
 		for i := 0; i < h.n; i++ {
-			if h.connected[i] {
-				_, term, isLeader := h.cluster[i].Report()
-				if isLeader {
-					if leaderID < 0 {
-						leaderID = i
-						leaderTerm = term
-					} else {
-						return -1, -1
-					}
+			if !connected[i] {
+				continue
+			}
+			_, term, isLeader := h.cluster[i].Report()
+			if isLeader {
+				if leaderID < 0 {
+					leaderID = i
+					leaderTerm = term
+				} else {
+					return -1, -1
 				}
 			}
 		}
 		if leaderID >= 0 {
 			return leaderID, leaderTerm
 		}
-		time.Sleep(150 * Quantum * time.Millisecond)
+		if !time.Now().Before(deadline) {
+			return -1, -1
+		}
+		time.Sleep(pollInterval)
 	}
-	return -1, -1
+}
+
+// waitForTransferInProgress ждёт, пока leaderLoop узла id примет запрос
+// на передачу лидерства (leadershipTransferInProgress != 0).
+func waitForTransferInProgress(t *testing.T, h *Harness, id int, budget time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(budget)
+	for {
+		if atomic.LoadInt32(&h.cluster[id].leaderState.leadershipTransferInProgress) != 0 {
+			return
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatalf("server %d did not enter leadership transfer within %v", id, budget)
+		}
+		time.Sleep(pollInterval)
+	}
+}
+
+// waitForKnownLeader ждёт, пока узел id не узнает о лидере leaderID
+// (получит от него AppendEntries).
+func waitForKnownLeader(t *testing.T, h *Harness, id, leaderID int, budget time.Duration) {
+	t.Helper()
+	cm := h.cluster[id]
+	deadline := time.Now().Add(budget)
+	for {
+		cm.mu.Lock()
+		known := cm.cmState.leaderID
+		cm.mu.Unlock()
+		if known == leaderID {
+			return
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatalf("server %d does not know leader %d within %v (leaderID=%d)",
+				id, leaderID, budget, known)
+		}
+		time.Sleep(pollInterval)
+	}
+}
+
+// waitForTermAbove ждёт роста term узла id выше want в пределах бюджета.
+// Не является assert'ом: вызывающий сам решает, обязателен ли рост
+// (оба исхода могут быть протокольно корректны).
+func waitForTermAbove(h *Harness, id, want int, budget time.Duration) {
+	deadline := time.Now().Add(budget)
+	for h.GetTerm(id) <= want {
+		if !time.Now().Before(deadline) {
+			return
+		}
+		time.Sleep(pollInterval)
+	}
 }
 
 // TestLeadershipTransfer_AfterShutdown проверяет, что LeadershipTransfer
 // после остановки модуля возвращает ошибку (ErrNotLeader или ErrRaftShutdown).
 func TestLeadershipTransfer_AfterShutdown(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -580,7 +649,7 @@ func TestLeadershipTransfer_AfterShutdown(t *testing.T) {
 // TestLeadershipTransfer_FutureConcurrentAccess проверяет, что несколько
 // горутин могут одновременно ожидать один LeadershipTransferFuture.
 func TestLeadershipTransfer_FutureConcurrentAccess(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 200*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -608,7 +677,7 @@ func TestLeadershipTransfer_FutureConcurrentAccess(t *testing.T) {
 // catch-up блокируется (target отключён), конфигурационное изменение
 // проверяется во время блокировки, затем target подключается.
 func TestLeadershipTransfer_EnqueueConfigurationChangeBlocked(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 200*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -634,13 +703,7 @@ func TestLeadershipTransfer_EnqueueConfigurationChangeBlocked(t *testing.T) {
 	}()
 
 	// Ждём, пока leadershipTransferInProgress установится в leaderLoop.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if atomic.LoadInt32(&h.cluster[origLeaderID].leaderState.leadershipTransferInProgress) != 0 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	waitForTransferInProgress(t, h, origLeaderID, commitBudgetAfterFailover)
 
 	// Попытка изменения конфигурации должна вернуть ErrLeadershipTransferInProgress.
 	future := h.cluster[origLeaderID].AddVoter(ServerID(100), ServerAddress("new-node"))

@@ -81,6 +81,8 @@ func TestDeferErrorConcurrent(t *testing.T) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
+		// keep: timing — окно является предметом проверки в этом месте;
+		// наблюдаемого признака состояния здесь нет.
 		time.Sleep(10 * time.Millisecond)
 		d.respond(nil)
 	}()
@@ -298,12 +300,13 @@ func waitForLeader(t testing.TB, cm *ConsensusModule, timeout time.Duration) {
 			t.Fatalf("timeout waiting for leader election")
 		default:
 		}
+		// poll-интервал condition-wait (не фиксированная пауза).
 		time.Sleep(10 * time.Millisecond)
 	}
 }
 
 func TestSingleNodeApply(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 500*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	capture := &CaptureFSM{}
 	cm := testServerWithFSM(t, capture)
 	defer cm.Stop()
@@ -320,7 +323,7 @@ func TestSingleNodeApply(t *testing.T) {
 }
 
 func TestSingleNodeApplyOrder(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 500*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	capture := &CaptureFSM{}
 	cm := testServerWithFSM(t, capture)
 	defer cm.Stop()
@@ -348,7 +351,7 @@ func TestSingleNodeApplyOrder(t *testing.T) {
 }
 
 func TestSingleNodeApplyResponse(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 500*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h, capture := testFSMHarness(t)
 	defer h.Shutdown()
 	waitForLeader(t, h.cluster[0], 800*time.Millisecond)
@@ -365,7 +368,7 @@ func TestSingleNodeApplyResponse(t *testing.T) {
 }
 
 func TestApplyOnFollower(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
@@ -379,12 +382,16 @@ func TestApplyOnFollower(t *testing.T) {
 }
 
 func TestApplyAfterShutdown(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	capture := &CaptureFSM{}
 	cm := testServerWithFSM(t, capture)
+	// keep: timing — окно является предметом проверки в этом месте;
+	// наблюдаемого признака состояния здесь нет.
 	time.Sleep(50 * time.Millisecond)
 
 	cm.Stop()
+	// keep: timing — окно является предметом проверки в этом месте;
+	// наблюдаемого признака состояния здесь нет.
 	time.Sleep(10 * time.Millisecond)
 
 	future := cm.Apply("cmd", 0)
@@ -407,6 +414,8 @@ func TestMultipleErrorCall(t *testing.T) {
 		}(i)
 	}
 
+	// keep: timing — окно является предметом проверки в этом месте;
+	// наблюдаемого признака состояния здесь нет.
 	time.Sleep(10 * time.Millisecond)
 	d.respond(nil)
 	wg.Wait()
@@ -419,7 +428,7 @@ func TestMultipleErrorCall(t *testing.T) {
 }
 
 func TestFSMApplyInOrder(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 500*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	capture := &CaptureFSM{}
 	cm := testServerWithFSM(t, capture)
 	defer cm.Stop()
@@ -448,7 +457,7 @@ func TestFSMApplyInOrder(t *testing.T) {
 }
 
 func TestFutureNoGoroutineLeak(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 500*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	capture := &CaptureFSM{}
 	cm := testServerWithFSM(t, capture)
@@ -460,7 +469,7 @@ func TestFutureNoGoroutineLeak(t *testing.T) {
 }
 
 func TestFutureErrorNoLeak(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -473,7 +482,7 @@ func TestFutureErrorNoLeak(t *testing.T) {
 }
 
 func TestBatchApplyOrderAndIndices(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 500*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h, capture := testFSMHarness(t)
 	defer h.Shutdown()
 	waitForLeader(t, h.cluster[0], 800*time.Millisecond)
@@ -513,7 +522,7 @@ func TestBatchApplyOrderAndIndices(t *testing.T) {
 }
 
 func TestApplyInflightOnLeaderCrash(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
@@ -524,12 +533,14 @@ func TestApplyInflightOnLeaderCrash(t *testing.T) {
 			h.DisconnectPeer(i)
 		}
 	}
-	sleepMs(50)
+	// keep-класс (TASK-005 группа C: не commit-ожидание), но состояние
+	// наблюдаемо напрямую — ждём фактической изоляции лидера.
+	h.waitForIsolated(origLeaderId, commitBudgetSteady)
 
+	inflightBefore := h.applyInflightCount(origLeaderId)
 	future := h.cluster[origLeaderId].Apply(42, 0)
-	// Даём runLeaderLoop время применить future до CrashPeer,
-	// чтобы future оказалась в inflight перед остановкой.
-	sleepMs(50)
+	// Ждём, пока runLeaderLoop поместит future в inflight, — до CrashPeer.
+	h.waitForApplyInflight(origLeaderId, inflightBefore+1, commitBudgetSteady)
 	h.CrashPeer(origLeaderId)
 
 	if err := future.Error(); err != ErrLeadershipLost && err != ErrRaftShutdown {
@@ -538,7 +549,7 @@ func TestApplyInflightOnLeaderCrash(t *testing.T) {
 }
 
 func TestApplyWithFollowerCrash(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 300*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
@@ -551,12 +562,14 @@ func TestApplyWithFollowerCrash(t *testing.T) {
 	if err := future.Error(); err != nil {
 		t.Fatalf("Apply failed: %v", err)
 	}
-	sleepMs(50)
+	// replace: commit-паттерн (sleep перед CheckCommittedN). После
+	// CrashPeer подключены 2 узла; сценарий со сбоем — after-failover.
+	h.WaitForCommit(42, 2)
 	h.CheckCommittedN(42, 2)
 }
 
 func TestApplyNoQuorumThenNewLeader(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 100*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
@@ -564,10 +577,14 @@ func TestApplyNoQuorumThenNewLeader(t *testing.T) {
 
 	h.DisconnectPeer((lid + 1) % 3)
 	h.DisconnectPeer((lid + 2) % 3)
-	sleepMs(50)
+	// keep-класс (не commit-ожидание): состояние наблюдаемо — ждём
+	// фактической изоляции лидера.
+	h.waitForIsolated(lid, commitBudgetSteady)
 
+	inflightBefore := h.applyInflightCount(lid)
 	future := h.cluster[lid].Apply(42, 0)
-	sleepMs(50)
+	// Ждём, пока Apply попадёт в inflight лидера.
+	h.waitForApplyInflight(lid, inflightBefore+1, commitBudgetSteady)
 
 	// Force the leader to step down by sending AppendEntries with a higher term.
 	// This simulates a new leader being elected (in a higher term) without needing
@@ -587,6 +604,9 @@ func TestApplyNoQuorumThenNewLeader(t *testing.T) {
 	if err := h.cluster[lid].AppendEntries(args, &AppendEntriesReply{}); err != nil {
 		t.Fatal(err)
 	}
+	// keep: не commit-ожидание. Окно даёт runLeaderLoop завершиться
+	// после step-down; сам assert ниже — блокирующий future.Error(),
+	// он и является ожиданием результата.
 	sleepMs(100)
 
 	if err := future.Error(); err != ErrLeadershipLost {
@@ -611,6 +631,7 @@ func waitForLeaderB(t testing.TB, cm *ConsensusModule) {
 			t.Fatalf("timeout waiting for leader election")
 		default:
 		}
+		// poll-интервал condition-wait (не фиксированная пауза).
 		time.Sleep(10 * time.Millisecond)
 	}
 }

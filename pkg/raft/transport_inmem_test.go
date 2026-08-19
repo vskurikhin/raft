@@ -65,7 +65,7 @@ func startInmemHandler(t *testing.T, trans *InmemTransport, consume bool) func()
 
 // TestInmemNewTransport проверяет создание InmemTransport.
 func TestInmemNewTransport(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	trans := NewInmemTransport("raft-42")
 	if trans.Consumer() == nil {
 		t.Fatal("Consumer() returned nil")
@@ -81,7 +81,7 @@ func TestInmemNewTransport(t *testing.T) {
 
 // TestInmemDefaultTimeout проверяет таймаут по умолчанию.
 func TestInmemDefaultTimeout(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	trans := NewInmemTransport("test")
 	if trans.timeout != 500*time.Millisecond {
 		t.Fatalf("default timeout = %v, want 500ms", trans.timeout)
@@ -91,7 +91,7 @@ func TestInmemDefaultTimeout(t *testing.T) {
 
 // TestInmemAppendEntriesSuccess проверяет успешную отправку и получение ответа.
 func TestInmemAppendEntriesSuccess(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	t1, t2, cleanup := newInmemPair(t)
 	defer cleanup()
 	defer startInmemHandler(t, t2, true)()
@@ -118,7 +118,7 @@ func TestInmemAppendEntriesSuccess(t *testing.T) {
 
 // TestInmemAppendEntriesDisconnectedPeer проверяет отправку отключённому peer.
 func TestInmemAppendEntriesDisconnectedPeer(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	t1 := NewInmemTransport("test-0")
 	t2 := NewInmemTransport("test-1")
 	defer t1.Close()
@@ -134,7 +134,7 @@ func TestInmemAppendEntriesDisconnectedPeer(t *testing.T) {
 
 // TestInmemAppendEntriesAfterClose проверяет отправку после закрытия.
 func TestInmemAppendEntriesAfterClose(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	t1, t2 := NewInmemTransport("test-0"), NewInmemTransport("test-1")
 	t1.Connect(1, t2)
 	t2.Connect(0, t1)
@@ -152,7 +152,7 @@ func TestInmemAppendEntriesAfterClose(t *testing.T) {
 
 // TestInmemAppendEntriesPeerClosed проверяет отправку, когда peer закрыт.
 func TestInmemAppendEntriesPeerClosed(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	t1, t2, cleanup := newInmemPair(t)
 	defer cleanup()
 
@@ -167,7 +167,7 @@ func TestInmemAppendEntriesPeerClosed(t *testing.T) {
 
 // TestInmemAppendEntriesTimeout проверяет таймаут ожидания ответа.
 func TestInmemAppendEntriesTimeout(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	t1, t2, cleanup := newInmemPair(t)
 	defer cleanup()
 	// Не запускаем обработчик — consumerCh будет заблокирован
@@ -194,7 +194,7 @@ func TestInmemAppendEntriesTimeout(t *testing.T) {
 
 // TestInmemRequestVoteSuccess проверяет успешную отправку RequestVote.
 func TestInmemRequestVoteSuccess(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	t1, t2, cleanup := newInmemPair(t)
 	defer cleanup()
 	defer startInmemHandler(t, t2, true)()
@@ -219,7 +219,7 @@ func TestInmemRequestVoteSuccess(t *testing.T) {
 
 // TestInmemRequestVoteDisconnectedPeer проверяет отправку RequestVote отключённому peer.
 func TestInmemRequestVoteDisconnectedPeer(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	t1 := NewInmemTransport("test-0")
 	t2 := NewInmemTransport("test-1")
 	defer t1.Close()
@@ -234,7 +234,7 @@ func TestInmemRequestVoteDisconnectedPeer(t *testing.T) {
 
 // TestInmemRequestVoteAfterClose проверяет отправку RequestVote после закрытия.
 func TestInmemRequestVoteAfterClose(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	t1, t2 := NewInmemTransport("test-0"), NewInmemTransport("test-1")
 	t1.Connect(1, t2)
 	t2.Connect(0, t1)
@@ -252,7 +252,7 @@ func TestInmemRequestVoteAfterClose(t *testing.T) {
 
 // TestInmemRequestVotePeerClosed проверяет отправку RequestVote, когда peer закрыт.
 func TestInmemRequestVotePeerClosed(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	t1, t2, cleanup := newInmemPair(t)
 	defer cleanup()
 
@@ -267,7 +267,7 @@ func TestInmemRequestVotePeerClosed(t *testing.T) {
 
 // TestInmemConnect проверяет Connect.
 func TestInmemConnect(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	t1 := NewInmemTransport("test-0")
 	t2 := NewInmemTransport("test-1")
 	defer t1.Close()
@@ -285,7 +285,7 @@ func TestInmemConnect(t *testing.T) {
 
 // TestInmemDisconnect проверяет Disconnect.
 func TestInmemDisconnect(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	t1, t2, cleanup := newInmemPair(t)
 	defer cleanup()
 	_ = t2
@@ -305,7 +305,7 @@ func TestInmemDisconnect(t *testing.T) {
 
 // TestInmemDisconnectAll проверяет DisconnectAll.
 func TestInmemDisconnectAll(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	t1 := NewInmemTransport("test-0")
 	t2 := NewInmemTransport("test-1")
 	t3 := NewInmemTransport("test-2")
@@ -331,7 +331,7 @@ func TestInmemDisconnectAll(t *testing.T) {
 
 // TestInmemDoubleDisconnect проверяет, что Disconnect несуществующего peer не паникует.
 func TestInmemDoubleDisconnect(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	t1 := NewInmemTransport("test-0")
 	defer t1.Close()
 
@@ -347,7 +347,7 @@ func TestInmemDoubleDisconnect(t *testing.T) {
 // TestInmemConnectThenSend проверяет, что после Connect отправка работает,
 // а после Disconnect — нет.
 func TestInmemConnectThenSend(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	t1, t2, cleanup := newInmemPair(t)
 	defer cleanup()
 	defer startInmemHandler(t, t2, true)()
@@ -374,7 +374,7 @@ func TestInmemConnectThenSend(t *testing.T) {
 
 // TestInmemClose проверяет, что после Close все методы возвращают ошибку.
 func TestInmemClose(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	t1, t2 := NewInmemTransport("test-0"), NewInmemTransport("test-1")
 	t1.Connect(1, t2)
 	t2.Connect(0, t1)
@@ -392,7 +392,7 @@ func TestInmemClose(t *testing.T) {
 
 // TestInmemDoubleClose проверяет, что вызов Close дважды не вызывает panic.
 func TestInmemDoubleClose(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	t1 := NewInmemTransport("test-0")
 	t1.Close()
 	t1.Close() // не должно panic
@@ -400,7 +400,7 @@ func TestInmemDoubleClose(t *testing.T) {
 
 // TestInmemCloseConsumerDrain проверяет, что после Close consumerCh пуст.
 func TestInmemCloseConsumerDrain(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	t1, t2, cleanup := newInmemPair(t)
 	defer cleanup()
 
@@ -414,6 +414,8 @@ func TestInmemCloseConsumerDrain(t *testing.T) {
 	}()
 
 	// Ждём небольшой интервал, чтобы AppendEntries успел отправить RPC в consumerCh
+	// keep: timing — окно является предметом проверки в этом месте;
+	// наблюдаемого признака состояния здесь нет.
 	time.Sleep(10 * time.Millisecond)
 
 	// Закрываем t2 — это должно разблокировать AppendEntries (через peer.shutdownCh)
@@ -435,7 +437,7 @@ func TestInmemCloseConsumerDrain(t *testing.T) {
 // возвращают ErrNotImplemented. RequestPreVote не проверяется —
 // он реализован для InmemTransport.
 func TestInmemStubsReturnNotImplemented(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	trans := NewInmemTransport("test")
 	defer trans.Close()
 	t.Run("TimeoutNow", func(t *testing.T) {
@@ -456,7 +458,7 @@ func TestInmemStubsReturnNotImplemented(t *testing.T) {
 // TestInmemAppendPipelineReturnsNotImplemented проверяет, что
 // AppendEntriesPipeline возвращает ErrNotImplemented.
 func TestInmemAppendPipelineReturnsNotImplemented(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	trans := NewInmemTransport("test")
 	defer trans.Close()
 
@@ -469,7 +471,7 @@ func TestInmemAppendPipelineReturnsNotImplemented(t *testing.T) {
 // TestInmemConcurrentSend проверяет, что 10 горутин одновременно
 // могут отправлять AppendEntries разным peers.
 func TestInmemConcurrentSend(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	// Создаём 3 транспорта, соединённых в полную mesh-сеть
 	t0 := NewInmemTransport("test-0")
 	t1 := NewInmemTransport("test-1")
@@ -519,7 +521,7 @@ func TestInmemConcurrentSend(t *testing.T) {
 // TestInmemConcurrentConnectDisconnect проверяет Connect/Disconnect
 // из нескольких горутин. Запускать с -race.
 func TestInmemConcurrentConnectDisconnect(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	t0 := NewInmemTransport("test-0")
 	t1 := NewInmemTransport("test-1")
 	defer t0.Close()
@@ -539,7 +541,7 @@ func TestInmemConcurrentConnectDisconnect(t *testing.T) {
 
 // TestInmemManyRoundTrips проверяет 100 последовательных AppendEntries.
 func TestInmemManyRoundTrips(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	t1, t2, cleanup := newInmemPair(t)
 	defer cleanup()
 	defer startInmemHandler(t, t2, true)()
@@ -562,7 +564,7 @@ func TestInmemManyRoundTrips(t *testing.T) {
 // TestInmemTransportNoGoroutineLeak проверяет, что после Close
 // не остаётся goroutine.
 func TestInmemTransportNoGoroutineLeak(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 5*time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	t1 := NewInmemTransport("test-0")
 	// Просто создаём и закрываем — проверяем только утечку
 	t1.Close()
@@ -570,7 +572,7 @@ func TestInmemTransportNoGoroutineLeak(t *testing.T) {
 
 // TestInmemLocalAddr проверяет LocalAddr().
 func TestInmemLocalAddr(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	trans := NewInmemTransport("my-addr")
 	defer trans.Close()
 	if addr := trans.LocalAddr(); addr != "my-addr" {
@@ -580,7 +582,7 @@ func TestInmemLocalAddr(t *testing.T) {
 
 // TestInmemSetHeartbeatHandler проверяет, что SetHeartbeatHandler сохраняет функцию.
 func TestInmemSetHeartbeatHandler(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	trans := NewInmemTransport("test")
 	defer trans.Close()
 
@@ -601,7 +603,7 @@ func TestInmemSetHeartbeatHandler(t *testing.T) {
 // TestInmemConsumerIsUnbuffered проверяет, что Consumer() возвращает
 // небуферизированный канал.
 func TestInmemConsumerIsUnbuffered(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	trans := NewInmemTransport("test")
 	defer trans.Close()
 	if cap(trans.Consumer()) != 0 {
@@ -612,7 +614,7 @@ func TestInmemConsumerIsUnbuffered(t *testing.T) {
 // TestInmemDisconnectPeerCallsSideEffect проверяет, что Disconnect на
 // одном транспорте не влияет на другой транспорт (симметричность не требуется).
 func TestInmemDisconnectPeerCallsSideEffect(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	t1, t2, cleanup := newInmemPair(t)
 	defer cleanup()
 
@@ -636,7 +638,7 @@ func TestInmemDisconnectPeerCallsSideEffect(t *testing.T) {
 // TestInmemAppendEntriesRequestVoteError проверяет, что если обработчик
 // возвращает ошибку в RespChan, AppendEntries/RequestVote возвращают её.
 func TestInmemAppendEntriesError(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	t1, t2, cleanup := newInmemPair(t)
 	defer cleanup()
 
@@ -660,7 +662,7 @@ func TestInmemAppendEntriesError(t *testing.T) {
 // TestInmemRequestVoteError проверяет, что ошибка от обработчика
 // RequestVote пробрасывается вызывающей стороне.
 func TestInmemRequestVoteError(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	t1, t2, cleanup := newInmemPair(t)
 	defer cleanup()
 
@@ -683,7 +685,7 @@ func TestInmemRequestVoteError(t *testing.T) {
 // TestInmemCloseWithPendingRPC проверяет, что Close() не блокируется,
 // если есть RPC-запрос, ожидающий в consumerCh.
 func TestInmemCloseWithPendingRPC(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 5*time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	t1, t2, cleanup := newInmemPair(t)
 	defer cleanup()
 
@@ -695,6 +697,8 @@ func TestInmemCloseWithPendingRPC(t *testing.T) {
 	}()
 
 	// Даём время RPC дойти до consumerCh
+	// keep: timing — окно является предметом проверки в этом месте;
+	// наблюдаемого признака состояния здесь нет.
 	time.Sleep(10 * time.Millisecond)
 
 	// Закрываем t2 — это должно разблокировать AppendEntries
@@ -714,7 +718,7 @@ func TestInmemCloseWithPendingRPC(t *testing.T) {
 // TestInmemAppendEntriesWithEntries проверяет, что AppendEntries
 // с записями журнала работает корректно.
 func TestInmemAppendEntriesWithEntries(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	t1, t2, cleanup := newInmemPair(t)
 	defer cleanup()
 
@@ -759,7 +763,7 @@ func TestInmemAppendEntriesWithEntries(t *testing.T) {
 // TestInmemCloseIdempotent проверяет, что множественный Close
 // не вызывает проблем с каналами.
 func TestInmemCloseIdempotent(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	trans := NewInmemTransport("test")
 	trans.Close()
 	trans.Close()
@@ -770,7 +774,7 @@ func TestInmemCloseIdempotent(t *testing.T) {
 // TestInmemNewTransportMultiple проверяет, что несколько транспортов
 // создаются независимо.
 func TestInmemNewTransportMultiple(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	for i := 0; i < 10; i++ {
 		trans := NewInmemTransport(ServerAddress(fmt.Sprintf("node-%d", i)))
 		if trans.LocalAddr() != ServerAddress(fmt.Sprintf("node-%d", i)) {

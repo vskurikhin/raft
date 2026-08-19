@@ -74,6 +74,7 @@ func TestTraceReset(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatalf("trace buffer does not contain the CM.Stop entry: %q", buf.String())
 		}
+		// poll-интервал condition-wait (не фиксированная пауза).
 		time.Sleep(5 * time.Millisecond)
 	}
 }

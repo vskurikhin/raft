@@ -55,7 +55,9 @@ func TestTraceRedirect(t *testing.T) {
 
 	// Эмиттер трассировки — kvs.ServeHTTP (traceLogf("serving HTTP on %s"),
 	// печатается при TraceKV=1 > 0): после запуска файл не пуст.
-	kvs.ServeHTTP(":0")
+	if err := kvs.ServeHTTP(":0"); err != nil {
+		t.Fatalf("ServeHTTP: %v", err)
+	}
 
 	deadline := time.Now().Add(2 * time.Second)
 	for {
@@ -66,6 +68,7 @@ func TestTraceRedirect(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatalf("trace file %q does not contain the ServeHTTP entry: %v", path, err)
 		}
+		// poll-интервал condition-wait (не фиксированная пауза).
 		time.Sleep(5 * time.Millisecond)
 	}
 

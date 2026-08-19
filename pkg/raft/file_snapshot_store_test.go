@@ -41,7 +41,7 @@ func writeSnapshot(t *testing.T, store *FileSnapshotStore, index, term int, data
 // TestFileSnapshotStore_RoundTrip проверяет полный цикл
 // Create → Write → Close → List → Open.
 func TestFileSnapshotStore_RoundTrip(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	store, err := NewFileSnapshotStore(t.TempDir(), 2)
 	if err != nil {
@@ -95,7 +95,7 @@ func TestFileSnapshotStore_RoundTrip(t *testing.T) {
 // TestFileSnapshotStore_SurvivesRestart проверяет, что новый инстанс стора
 // на той же директории видит ранее записанные снапшоты.
 func TestFileSnapshotStore_SurvivesRestart(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	dir := t.TempDir()
 	store, err := NewFileSnapshotStore(dir, 2)
@@ -133,7 +133,7 @@ func TestFileSnapshotStore_SurvivesRestart(t *testing.T) {
 // TestFileSnapshotStore_Cancel проверяет, что Cancel удаляет временную
 // директорию и не затрагивает ранее созданные снапшоты.
 func TestFileSnapshotStore_Cancel(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	store, err := NewFileSnapshotStore(t.TempDir(), 2)
 	if err != nil {
@@ -171,7 +171,7 @@ func TestFileSnapshotStore_Cancel(t *testing.T) {
 // TestFileSnapshotStore_InvisibleBeforeClose проверяет, что незакрытый
 // снапшот не виден в List.
 func TestFileSnapshotStore_InvisibleBeforeClose(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	store, err := NewFileSnapshotStore(t.TempDir(), 2)
 	if err != nil {
@@ -198,7 +198,7 @@ func TestFileSnapshotStore_InvisibleBeforeClose(t *testing.T) {
 // TestFileSnapshotStore_DetectsCorruption проверяет, что порча state.bin
 // детектируется CRC32 при Open.
 func TestFileSnapshotStore_DetectsCorruption(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	store, err := NewFileSnapshotStore(t.TempDir(), 2)
 	if err != nil {
@@ -227,7 +227,7 @@ func TestFileSnapshotStore_DetectsCorruption(t *testing.T) {
 // TestFileSnapshotStore_Retain проверяет, что после создания снапшотов
 // сверх retain старейшие удаляются.
 func TestFileSnapshotStore_Retain(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	store, err := NewFileSnapshotStore(t.TempDir(), 2)
 	if err != nil {
@@ -266,7 +266,7 @@ func TestFileSnapshotStore_InvalidRetain(t *testing.T) {
 // TestFileSnapshotStore_ListSortedByMeta проверяет сортировку List
 // по (Term, Index) в порядке убывания, а не по имени директории.
 func TestFileSnapshotStore_ListSortedByMeta(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	store, err := NewFileSnapshotStore(t.TempDir(), 5)
 	if err != nil {
@@ -300,7 +300,7 @@ func TestFileSnapshotStore_ListSortedByMeta(t *testing.T) {
 // заставляет Create завершиться ошибкой os.IsExist вместо молчаливого
 // переиспользования каталога.
 func TestFileSnapshotStore_CreateNameCollision(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	store, err := NewFileSnapshotStore(t.TempDir(), 2)
 	if err != nil {

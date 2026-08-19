@@ -159,6 +159,7 @@ func TestTCPRaftElectionBasic(t *testing.T) {
 				close(done)
 				return
 			}
+			// poll-интервал condition-wait (не фиксированная пауза).
 			time.Sleep(100 * time.Millisecond)
 		}
 	}()
@@ -191,6 +192,7 @@ func TestTCPRaftReelectionAfterCrash(t *testing.T) {
 			leader = l
 			break
 		}
+		// poll-интервал condition-wait (не фиксированная пауза).
 		time.Sleep(100 * time.Millisecond)
 	}
 
@@ -208,6 +210,7 @@ func TestTCPRaftReelectionAfterCrash(t *testing.T) {
 		if l := h.getLeaderState(); l != -1 && l != leader {
 			return
 		}
+		// poll-интервал condition-wait (не фиксированная пауза).
 		time.Sleep(100 * time.Millisecond)
 	}
 }

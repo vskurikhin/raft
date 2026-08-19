@@ -1,7 +1,9 @@
 package raft
 
 import (
+	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -42,6 +44,17 @@ const (
 	// LeaktestBudget — единый бюджет leaktest:
 	// max(inmemRPCTimeout, TCPRPCTimeout) + 100ms = 600ms.
 	LeaktestBudget = 600 * time.Millisecond
+
+	// leaderElectionBudget — бюджет ожидания выборов лидера
+	// (§9 architecture.md): 2*maxElectionTimeout + preVoteRound ≈ 2.3s.
+	// Применяется CheckSingleLeader вместо прежнего необоснованного
+	// окна 8×150ms = 1.2s (TASK-004).
+	leaderElectionBudget = 2*maxElectionTimeout + preVoteRound
+
+	// pollInterval — интервал опроса condition-wait примитивов
+	// (Poll interval модели §9 architecture.md: 5–10ms). Не зависит
+	// от бюджета ожидания.
+	pollInterval = 10 * time.Millisecond
 )
 
 func init() {
@@ -50,6 +63,20 @@ func init() {
 
 // Harness — тестовый стенд для unit-тестирования Raft.
 // Использует InmemTransport вместо TCP, не открывает порты.
+//
+// Владение состоянием (ADR-011, TASK-004): поля commits, connected и
+// alive защищены h.mu — и читатели, и писатели работают короткими
+// критическими секциями. Инвариант границ (NEW-02): h.mu НИКОГДА не
+// удерживается через блокирующие lifecycle-операции — cm.Stop(),
+// transport.Close(), close(commitChans[i]), join коллекторов, а также
+// через вызовы cm.Report() (значения connected/alive снимаются под
+// h.mu, опрос CM выполняется вне её).
+//
+// Конвенция wait/assert (§8 architecture.md, NEW-08): предикаты wait
+// (committedOn, cond и diag в waitFor) исполняются с УЖЕ удерживаемой
+// h.mu; assert-функции CheckCommitted/CheckCommittedN/CheckNotCommitted
+// берут h.mu сами — их вызов под удерживаемой h.mu запрещён
+// (h.mu нереентерабельна).
 type Harness struct {
 	mu sync.Mutex
 
@@ -201,18 +228,32 @@ func NewHarnessWithOptions(t *testing.T, n int, opts ...HarnessOption) *Harness 
 func (h *Harness) Shutdown() {
 	h.shutdownOnce.Do(func() {
 		for i := 0; i < h.n; i++ {
-			if h.alive[i] {
-				h.alive[i] = false
+			// [h.mu: чтение и сброс alive[i]] release — короткая секция;
+			// Stop/Close/close выполняются вне h.mu (NEW-02).
+			h.mu.Lock()
+			wasAlive := h.alive[i]
+			h.alive[i] = false
+			h.mu.Unlock()
+
+			if wasAlive {
 				h.cluster[i].Stop()
 				h.transports[i].Close()
 			}
 			close(h.commitChans[i])
 		}
+		// Join коллекторов — завершающий шаг последовательности
+		// (ADR-003 п.9): после возврата Shutdown ни одна горутина
+		// не пишет в h.commits, поэтому чтение commits в assert'ах
+		// после Shutdown детерминировано.
+		h.wg.Wait()
 	})
 }
 
 // DisconnectPeer отключает сервер от всех остальных серверов кластера
 // через разрыв логического соединения в InmemTransport.
+//
+// Мутация connected — короткой секцией h.mu (NEW-02): операции над
+// транспортами выполняются вне блокировки.
 func (h *Harness) DisconnectPeer(id int) {
 	tlog("Disconnect %d", id)
 	h.transports[id].DisconnectAll()
@@ -221,19 +262,47 @@ func (h *Harness) DisconnectPeer(id int) {
 			h.transports[j].Disconnect(ServerID(id))
 		}
 	}
+	h.mu.Lock()
 	h.connected[id] = false
+	h.mu.Unlock()
 }
 
 // ReconnectPeer повторно подключает сервер ко всем остальным серверам кластера.
+//
+// Значения alive снимаются под h.mu до работы с транспортами; мутация
+// connected — отдельной короткой секцией (NEW-02).
 func (h *Harness) ReconnectPeer(id int) {
 	tlog("Reconnect %d", id)
+	alive := h.aliveSnapshot()
 	for j := 0; j < h.n; j++ {
-		if j != id && h.alive[j] {
+		if j != id && alive[j] {
 			h.transports[id].Connect(ServerID(j), h.transports[j])
 			h.transports[j].Connect(ServerID(id), h.transports[id])
 		}
 	}
+	h.mu.Lock()
 	h.connected[id] = true
+	h.mu.Unlock()
+}
+
+// aliveSnapshot возвращает копию среза alive, снятую под h.mu.
+// Контракт: вызывается БЕЗ удерживаемой h.mu.
+func (h *Harness) aliveSnapshot() []bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]bool, h.n)
+	copy(out, h.alive)
+	return out
+}
+
+// connectedSnapshot возвращает копию среза connected, снятую под h.mu.
+// Контракт: вызывается БЕЗ удерживаемой h.mu.
+func (h *Harness) connectedSnapshot() []bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]bool, h.n)
+	copy(out, h.connected)
+	return out
 }
 
 // CrashPeer «аварийно завершает работу» сервера, отключая его
@@ -273,8 +342,12 @@ func (h *Harness) CrashPeer(id int) {
 }
 
 // RestartPeer «перезапускает» сервер, создавая новый CM и InmemTransport.
+//
+// Значения alive снимаются под h.mu (NEW-02); создание CM, подключение
+// транспортов и ready-wait выполняются вне блокировки.
 func (h *Harness) RestartPeer(id int) {
-	if h.alive[id] {
+	alive := h.aliveSnapshot()
+	if alive[id] {
 		log.Fatalf("id=%d is alive in RestartPeer", id)
 	}
 	tlog("Restart %d", id)
@@ -292,7 +365,7 @@ func (h *Harness) RestartPeer(id int) {
 
 	// Подключаем новый транспорт к остальным.
 	for j := 0; j < h.n; j++ {
-		if j != id && h.alive[j] {
+		if j != id && alive[j] {
 			h.transports[id].Connect(ServerID(j), h.transports[j])
 			h.transports[j].Connect(ServerID(id), h.transports[id])
 		}
@@ -303,8 +376,10 @@ func (h *Harness) RestartPeer(id int) {
 		h.storage[id], NewCommitChannelFSM(h.commitChans[id]), ready,
 	)
 	close(ready)
+	h.mu.Lock()
 	h.alive[id] = true
 	h.connected[id] = true
+	h.mu.Unlock()
 	h.waitForPeerReady(id)
 }
 
@@ -316,11 +391,14 @@ func (h *Harness) waitForPeerReady(id int) {
 	h.t.Helper()
 	deadline := time.Now().Add(commitBudgetSteady)
 	for time.Now().Before(deadline) {
+		// Значения alive снимаются под h.mu, Report() вызывается вне её
+		// (инвариант границ NEW-02).
+		alive := h.aliveSnapshot()
 		reportID, _, _ := h.cluster[id].Report()
 		ready := reportID == id
 		if ready {
 			for j := 0; j < h.n; j++ {
-				if j != id && h.alive[j] && h.transports[id].IsDisconnected(ServerID(j)) {
+				if j != id && alive[j] && h.transports[id].IsDisconnected(ServerID(j)) {
 					ready = false
 					break
 				}
@@ -329,6 +407,7 @@ func (h *Harness) waitForPeerReady(id int) {
 		if ready {
 			return
 		}
+		// poll-интервал condition-wait (не фиксированная пауза).
 		time.Sleep(5 * time.Millisecond)
 	}
 	h.t.Fatalf("restarted peer %d did not become ready within %v", id, commitBudgetSteady)
@@ -346,31 +425,77 @@ func (h *Harness) PeerDontDropCalls(id int) {
 }
 
 // CheckSingleLeader проверяет, что только один сервер считает себя лидером.
+//
+// Бюджет — leaderElectionBudget (worst-case выборов: два election timeout
+// плюс раунд Pre-Vote, §9 architecture.md) вместо прежнего необоснованного
+// окна 8×150ms. Значения connected снимаются под h.mu, Report() опрашивается
+// вне блокировки (инвариант границ NEW-02). При исчерпании бюджета —
+// структурированная диагностика (§21 architecture.md).
 func (h *Harness) CheckSingleLeader() (int, int) {
-	for r := 0; r < 8; r++ {
+	h.t.Helper()
+	deadline := time.Now().Add(leaderElectionBudget)
+	for {
+		connected := h.connectedSnapshot()
 		leaderId := -1
 		leaderTerm := -1
 		for i := 0; i < h.n; i++ {
-			if h.connected[i] {
-				_, term, isLeader := h.cluster[i].Report()
-				if isLeader {
-					if leaderId < 0 {
-						leaderId = i
-						leaderTerm = term
-					} else {
-						h.t.Fatalf("both %d and %d think they're leaders", leaderId, i)
-					}
+			if !connected[i] {
+				continue
+			}
+			_, term, isLeader := h.cluster[i].Report()
+			if isLeader {
+				if leaderId < 0 {
+					leaderId = i
+					leaderTerm = term
+				} else {
+					h.t.Fatalf("both %d and %d think they're leaders", leaderId, i)
 				}
 			}
 		}
 		if leaderId >= 0 {
 			return leaderId, leaderTerm
 		}
-		time.Sleep(50 * Quantum * time.Millisecond)
+		if !time.Now().Before(deadline) {
+			break
+		}
+		time.Sleep(pollInterval)
 	}
 
-	h.t.Fatalf("leader not found")
+	h.t.Fatalf(
+		"CheckSingleLeader timeout (budget leaderElectionBudget=%v, polled %v):\n"+
+			"  expected: exactly one leader among connected peers\n"+
+			"  %s",
+		leaderElectionBudget, pollInterval, h.nodeStates(),
+	)
 	return -1, -1
+}
+
+// nodeStates возвращает строку состояния всех узлов (id, state, term,
+// connected/alive) для диагностики при исчерпании бюджета ожидания.
+// Контракт: вызывается БЕЗ удерживаемой h.mu (внутри снимает её на
+// время чтения connected/alive и опрашивает CM вне блокировки).
+func (h *Harness) nodeStates() string {
+	connected := h.connectedSnapshot()
+	alive := h.aliveSnapshot()
+
+	var sb strings.Builder
+	sb.WriteString("state:")
+	for i := 0; i < h.n; i++ {
+		if h.cluster[i] == nil {
+			fmt.Fprintf(&sb, " [%d: <no CM>]", i)
+			continue
+		}
+		_, term, isLeader := h.cluster[i].Report()
+		role := "follower/other"
+		if isLeader {
+			role = "leader"
+		}
+		fmt.Fprintf(
+			&sb, " [%d: %s term=%d connected=%t alive=%t]",
+			i, role, term, connected[i], alive[i],
+		)
+	}
+	return sb.String()
 }
 
 // WaitForSingleLeader ждёт, пока среди подключённых узлов останется
@@ -383,9 +508,10 @@ func (h *Harness) WaitForSingleLeader(timeout time.Duration) (int, int) {
 	h.t.Helper()
 	deadline := time.Now().Add(timeout)
 	for {
+		connected := h.connectedSnapshot()
 		leaderId, leaderTerm, multiple := -1, -1, false
 		for i := 0; i < h.n; i++ {
-			if !h.connected[i] {
+			if !connected[i] {
 				continue
 			}
 			_, term, isLeader := h.cluster[i].Report()
@@ -403,7 +529,7 @@ func (h *Harness) WaitForSingleLeader(timeout time.Duration) (int, int) {
 		if time.Now().After(deadline) {
 			break
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(pollInterval)
 	}
 	return h.CheckSingleLeader()
 }
@@ -419,16 +545,141 @@ func (h *Harness) GetTerm(serverID int) int {
 }
 
 // CheckNoLeader проверяет, что ни один из подключённых серверов
-// не считает себя лидером.
+// не считает себя лидером. Значения connected снимаются под h.mu,
+// Report() опрашивается вне блокировки (NEW-02).
 func (h *Harness) CheckNoLeader() {
+	h.t.Helper()
+	connected := h.connectedSnapshot()
 	for i := 0; i < h.n; i++ {
-		if h.connected[i] {
+		if connected[i] {
 			_, _, isLeader := h.cluster[i].Report()
 			if isLeader {
 				h.t.Fatalf("server %d leader; want none", i)
 			}
 		}
 	}
+}
+
+// waitFor опрашивает предикат cond с интервалом pollInterval, пока он
+// не станет истинным либо не истечёт budget.
+//
+// Контракт блокировки (§8 architecture.md, ADR-011, NEW-08): cond и diag
+// вызываются с УЖЕ удерживаемой h.mu — waitFor захватывает h.mu перед
+// каждым вычислением и освобождает сразу после. Поэтому cond/diag не
+// должны вызывать функции, самостоятельно берущие h.mu (CheckCommitted,
+// CheckCommittedN, CheckNotCommitted, *Snapshot) — h.mu нереентерабельна,
+// нарушение даёт немедленное зависание. Вызывать waitFor следует
+// БЕЗ удерживаемой h.mu.
+//
+// desc описывает ожидаемое состояние; diag (может быть nil) строит
+// расширенную диагностику и вызывается только при timeout — happy path
+// не несёт издержек. Возвращает nil при успехе, иначе ошибку с
+// диагностикой (§21 architecture.md); решение о t.Errorf/t.Fatalf
+// принимает вызывающий.
+func (h *Harness) waitFor(desc string, budget time.Duration, cond func() bool, diag func() string) error {
+	deadline := time.Now().Add(budget)
+	for {
+		h.mu.Lock()
+		ok := cond()
+		h.mu.Unlock()
+		if ok {
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			break
+		}
+		time.Sleep(pollInterval)
+	}
+
+	h.mu.Lock()
+	details := ""
+	if diag != nil {
+		details = diag()
+	}
+	h.mu.Unlock()
+
+	return fmt.Errorf(
+		"wait timeout (budget %v, polled %v):\n  expected: %s\n  %s\n  %s",
+		budget, pollInterval, desc, details, h.nodeStates(),
+	)
+}
+
+// committedOn возвращает (nc, converged):
+//   - nc — число подключённых узлов, у которых команда cmd присутствует
+//     в h.commits (в любой позиции);
+//   - converged == true, когда выполнены предусловия CheckCommitted:
+//     у всех подключённых узлов равные длины commits И запись cmd
+//     находится у них на одной и той же позиции с одинаковым Index.
+//
+// Предикат non-fatal (не вызывает t.Error*/t.Fatal*) и по построению
+// НЕ слабее assert'а CheckCommitted (SA-001/RC-1): узел, «ушедший
+// вперёд» по commits, удерживает converged == false, поэтому ожидание
+// не может завершиться раньше, чем assert станет выполнимым.
+//
+// Контракт: h.mu must be held.
+func (h *Harness) committedOn(cmd int) (nc int, converged bool) {
+	commitsLen := -1
+	lenEqual := true
+	for i := 0; i < h.n; i++ {
+		if !h.connected[i] {
+			continue
+		}
+		if commitsLen < 0 {
+			commitsLen = len(h.commits[i])
+		} else if len(h.commits[i]) != commitsLen {
+			lenEqual = false
+		}
+		for c := range h.commits[i] {
+			if v, ok := h.commits[i][c].Data.(int); ok && v == cmd {
+				nc++
+				break
+			}
+		}
+	}
+	if commitsLen < 0 || !lenEqual {
+		// Подключённых узлов нет либо журналы коммитов разошлись —
+		// предусловие CheckCommitted не выполнено.
+		return nc, false
+	}
+
+	for c := 0; c < commitsLen; c++ {
+		index := -1
+		same := true
+		for i := 0; i < h.n; i++ {
+			if !h.connected[i] {
+				continue
+			}
+			v, ok := h.commits[i][c].Data.(int)
+			if !ok || v != cmd {
+				same = false
+				break
+			}
+			if index < 0 {
+				index = h.commits[i][c].Index
+			} else if h.commits[i][c].Index != index {
+				same = false
+				break
+			}
+		}
+		if same {
+			return nc, true
+		}
+	}
+	return nc, false
+}
+
+// commitsDiag возвращает строку состояния h.commits для диагностики.
+// Контракт: h.mu must be held.
+func (h *Harness) commitsDiag() string {
+	var sb strings.Builder
+	sb.WriteString("commits:")
+	for i := 0; i < h.n; i++ {
+		fmt.Fprintf(&sb, " len[%d]=%d", i, len(h.commits[i]))
+		if n := len(h.commits[i]); n > 0 {
+			fmt.Fprintf(&sb, " last[%d]=%v", i, h.commits[i][n-1].Data)
+		}
+	}
+	return sb.String()
 }
 
 // CheckCommitted проверяет, что команда cmd зафиксирована на всех
@@ -495,74 +746,178 @@ func (h *Harness) CheckCommittedN(cmd int, n int) {
 	}
 }
 
-// WaitForCommit ждёт, пока команда cmd не будет зафиксирована
-// на n серверах, затем проверяет фиксацию. Дедлайн покрывает потолок
-// backoff репликации (ADR-P07-006: доставка переподключённому пиру
-// может задерживаться до 1000 мс) и замедление под -race.
+// WaitForCommit ждёт сходимости коммита команды cmd минимум на n
+// подключённых серверах и затем проверяет фиксацию assert'ом
+// CheckCommittedN.
+//
+// Бюджет по умолчанию — commitBudgetAfterFailover: сценарий вызова
+// может содержать перевыборы. Для сценариев с заведомо устоявшимся
+// лидером используйте WaitForCommitBudget(cmd, n, commitBudgetSteady).
 func (h *Harness) WaitForCommit(cmd int, n int) {
 	h.t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		h.mu.Lock()
-		nc := 0
-		for i := 0; i < h.n; i++ {
-			if h.connected[i] {
-				for c := 0; c < len(h.commits[i]); c++ {
-					if h.commits[i][c].Data.(int) == cmd {
-						nc++
-						break
-					}
-				}
-			}
-		}
-		h.mu.Unlock()
-		if nc >= n {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
+	h.WaitForCommitBudget(cmd, n, commitBudgetAfterFailover)
+}
+
+// WaitForCommitBudget — WaitForCommit с явным бюджетом ожидания
+// (commitBudgetSteady / commitBudgetAfterFailover — TASK-009).
+//
+// Схема (§8 architecture.md): wait по предикату сходимости committedOn
+// (под h.mu) → assert CheckCommittedN (без h.mu). Раннего return без
+// assert'а нет — assert выполняется и при успешном ожидании, и при
+// исчерпании бюджета (SA-001/RC-1: ожидание не слабее assert'а).
+func (h *Harness) WaitForCommitBudget(cmd int, n int, budget time.Duration) {
+	h.t.Helper()
+	desc := fmt.Sprintf("cmd=%d committed on >=%d connected peers (converged)", cmd, n)
+	err := h.waitFor(
+		desc, budget,
+		func() bool {
+			nc, converged := h.committedOn(cmd)
+			return nc >= n && converged
+		},
+		h.commitsDiag,
+	)
+	if err != nil {
+		h.t.Errorf("WaitForCommit %v", err)
 	}
+	// Assert выполняется ВНЕ h.mu (CheckCommittedN берёт её сам).
 	h.CheckCommittedN(cmd, n)
 }
 
-// WaitForCommitAll ждёт, пока команда cmd не будет зафиксирована на всех
-// подключённых серверах с одинаковым числом коммитов — достаточное
-// условие для CheckCommitted. Учитывает backoff репликации (ADR-P07-006):
-// доставка переподключённому пиру может задерживаться до 1000 мс,
-// фиксированный sleep недостаточен.
+// WaitForCommitAll ждёт сходимости коммита команды cmd на всех
+// подключённых серверах и проверяет фиксацию assert'ом CheckCommitted.
+// Предикат сходимости — тот же committedOn (равные длины commits,
+// одинаковая позиция и Index записи).
 func (h *Harness) WaitForCommitAll(cmd int, timeout time.Duration) {
 	h.t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		h.mu.Lock()
-		equal, found := true, true
-		wantLen := -1
-		for i := 0; i < h.n; i++ {
-			if !h.connected[i] {
-				continue
-			}
-			if wantLen < 0 {
-				wantLen = len(h.commits[i])
-			} else if len(h.commits[i]) != wantLen {
-				equal = false
-			}
-			has := false
-			for _, c := range h.commits[i] {
-				if c.Data.(int) == cmd {
-					has = true
-					break
+	desc := fmt.Sprintf("cmd=%d committed on all connected peers (converged)", cmd)
+	err := h.waitFor(
+		desc, timeout,
+		func() bool {
+			nc, converged := h.committedOn(cmd)
+			connected := 0
+			for i := 0; i < h.n; i++ {
+				if h.connected[i] {
+					connected++
 				}
 			}
-			if !has {
-				found = false
-			}
-		}
-		h.mu.Unlock()
-		if equal && found {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
+			return converged && nc == connected
+		},
+		h.commitsDiag,
+	)
+	if err != nil {
+		h.t.Errorf("WaitForCommitAll %v", err)
 	}
 	h.CheckCommitted(cmd)
+}
+
+// waitForSuffrage ждёт, пока узел observerID не увидит в своей последней
+// конфигурации сервер target с правом голоса suffrage — наблюдаемый признак
+// того, что изменение членства дошло до этого узла и применено.
+//
+// Примитив не-commit ожидания: ConfigurationFuture, возвращаемый
+// GetConfiguration, доступен на любом узле (снимок configurations.latest
+// под cm.mu), поэтому h.mu не участвует.
+func (h *Harness) waitForSuffrage(observerID int, target ServerID, suffrage ServerSuffrage, budget time.Duration) {
+	h.t.Helper()
+	deadline := time.Now().Add(budget)
+	for {
+		cfg := h.cluster[observerID].GetConfiguration().Configuration()
+		for _, srv := range cfg.ConfigServers {
+			if srv.ID == target && srv.Suffrage == suffrage {
+				return
+			}
+		}
+		if !time.Now().Before(deadline) {
+			break
+		}
+		time.Sleep(pollInterval)
+	}
+	h.t.Fatalf(
+		"waitForSuffrage timeout (budget %v, polled %v):\n"+
+			"  expected: server %d sees server %d with suffrage %v\n  %s",
+		budget, pollInterval, observerID, target, suffrage, h.nodeStates(),
+	)
+}
+
+// waitForIsolated ждёт, пока изоляция узла id фактически вступит в силу:
+// транспорт id не видит ни одного другого живого узла и ни один живой
+// узел не видит id.
+//
+// Примитив не-commit ожидания (§8 architecture.md, TASK-005 группа B):
+// заменяет фиксированный sleep после DisconnectPeer. Условие наблюдаемо
+// напрямую (состояние InmemTransport), поэтому ожидание, как правило,
+// завершается на первом опросе.
+func (h *Harness) waitForIsolated(id int, budget time.Duration) {
+	h.t.Helper()
+	deadline := time.Now().Add(budget)
+	for {
+		alive := h.aliveSnapshot()
+		isolated := true
+		for j := 0; j < h.n; j++ {
+			if j == id || !alive[j] {
+				continue
+			}
+			if !h.transports[id].IsDisconnected(ServerID(j)) ||
+				!h.transports[j].IsDisconnected(ServerID(id)) {
+				isolated = false
+				break
+			}
+		}
+		if isolated {
+			return
+		}
+		if !time.Now().Before(deadline) {
+			break
+		}
+		time.Sleep(pollInterval)
+	}
+	h.t.Fatalf(
+		"waitForIsolated timeout (budget %v, polled %v):\n"+
+			"  expected: server %d is disconnected from every live peer\n  %s",
+		budget, pollInterval, id, h.nodeStates(),
+	)
+}
+
+// applyInflightCount возвращает число future в leaderState.inflight
+// узла id — записей, отправленных в журнал лидера и ещё не
+// применённых к FSM. Читается под cm.mu; h.mu не участвует.
+//
+// Используется как база отсчёта для waitForApplyInflight: у только что
+// избранного лидера в inflight может оставаться собственная noop-запись,
+// поэтому «inflight непусто» само по себе не означает, что до лидерского
+// цикла дошла именно команда теста.
+func (h *Harness) applyInflightCount(id int) int {
+	cm := h.cluster[id]
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	return len(cm.leaderState.inflight)
+}
+
+// waitForApplyInflight ждёт, пока число future в leaderState.inflight
+// узла id не достигнет want — т.е. отправленный Apply дошёл до
+// лидерского цикла и ожидает фиксации.
+//
+// Примитив не-commit ожидания (§8 architecture.md, TASK-004): состояние
+// читается под cm.mu, h.mu не участвует — вложенных блокировок нет.
+// Порог want задаётся вызывающим как applyInflightCount(id) + N,
+// снятый ДО вызова Apply.
+func (h *Harness) waitForApplyInflight(id int, want int, budget time.Duration) {
+	h.t.Helper()
+	deadline := time.Now().Add(budget)
+	for {
+		if h.applyInflightCount(id) >= want {
+			return
+		}
+		if !time.Now().Before(deadline) {
+			break
+		}
+		time.Sleep(pollInterval)
+	}
+	h.t.Fatalf(
+		"waitForApplyInflight timeout (budget %v, polled %v):\n"+
+			"  expected: server %d has >=%d inflight Apply futures (got %d)\n  %s",
+		budget, pollInterval, id, want, h.applyInflightCount(id), h.nodeStates(),
+	)
 }
 
 // CheckNotCommitted проверяет, что команда cmd ещё не зафиксирована.

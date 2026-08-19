@@ -50,13 +50,16 @@ func TestTraceReset(t *testing.T) {
 	// стандартный логгер (путь конфигурации ""), файл трассировки
 	// не создаётся.
 	kvs := newTestService(t)
-	kvs.ServeHTTP(":0")
+	if err := kvs.ServeHTTP(":0"); err != nil {
+		t.Fatalf("ServeHTTP: %v", err)
+	}
 
 	deadline := time.Now().Add(2 * time.Second)
 	for !strings.Contains(buf.String(), "serving HTTP on") {
 		if time.Now().After(deadline) {
 			t.Fatalf("trace buffer does not contain the ServeHTTP entry: %q", buf.String())
 		}
+		// poll-интервал condition-wait (не фиксированная пауза).
 		time.Sleep(5 * time.Millisecond)
 	}
 }

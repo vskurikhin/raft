@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"io"
 	"testing"
-	"time"
 
 	"github.com/fortytw2/leaktest"
 )
@@ -12,7 +11,7 @@ import (
 // TestInmemSnapshotStore_CreateAndList проверяет создание снэпшота и получение
 // списка. Create должен перезаписывать предыдущий снэпшот.
 func TestInmemSnapshotStore_CreateAndList(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	store := NewInmemSnapshotStore()
 
@@ -74,7 +73,7 @@ func TestInmemSnapshotStore_CreateAndList(t *testing.T) {
 
 // TestInmemSnapshotStore_Open проверяет открытие снэпшота по ID.
 func TestInmemSnapshotStore_Open(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	store := NewInmemSnapshotStore()
 	sink, err := store.Create(10, 3, Configuration{}, 0)
@@ -114,7 +113,7 @@ func TestInmemSnapshotStore_Open(t *testing.T) {
 
 // TestInmemSnapshotStore_ListEmpty проверяет, что пустой store возвращает nil.
 func TestInmemSnapshotStore_ListEmpty(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	store := NewInmemSnapshotStore()
 	snapshots, err := store.List()
@@ -128,7 +127,7 @@ func TestInmemSnapshotStore_ListEmpty(t *testing.T) {
 
 // TestInmemSnapshotSink_WriteCloseCancel проверяет базовые операции SnapshotSink.
 func TestInmemSnapshotSink_WriteCloseCancel(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	store := NewInmemSnapshotStore()
 	sink, err := store.Create(5, 2, Configuration{}, 0)
@@ -164,7 +163,7 @@ func TestInmemSnapshotSink_WriteCloseCancel(t *testing.T) {
 // TestInmemSnapshotStore_ListDoesNotMutate проверяет, что List возвращает
 // копию метаданных, а не указатель на внутренние данные.
 func TestInmemSnapshotStore_ListDoesNotMutate(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	store := NewInmemSnapshotStore()
 	sink, err := store.Create(10, 3, Configuration{}, 5)
@@ -186,7 +185,7 @@ func TestInmemSnapshotStore_ListDoesNotMutate(t *testing.T) {
 // TestInmemSnapshotStore_OpenReturnsCopy проверяет, что Open возвращает
 // копию данных, а не ссылку на внутренний буфер.
 func TestInmemSnapshotStore_OpenReturnsCopy(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	store := NewInmemSnapshotStore()
 	sink, err := store.Create(10, 3, Configuration{}, 0)
@@ -214,7 +213,7 @@ func TestInmemSnapshotStore_OpenReturnsCopy(t *testing.T) {
 // TestInmemStore_VisibleOnlyAfterClose проверяет контракт: снапшот виден
 // в List/Open только после успешного Close.
 func TestInmemStore_VisibleOnlyAfterClose(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	store := NewInmemSnapshotStore()
 	sink, err := store.Create(10, 3, Configuration{}, 0)
@@ -256,7 +255,7 @@ func TestInmemStore_VisibleOnlyAfterClose(t *testing.T) {
 // TestInmemStore_CancelKeepsPrevious проверяет контракт: Cancel
 // незавершённого снапшота сохраняет предыдущий завершённый.
 func TestInmemStore_CancelKeepsPrevious(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	store := NewInmemSnapshotStore()
 	sinkA, err := store.Create(10, 1, Configuration{}, 10)
@@ -305,7 +304,7 @@ func TestInmemStore_CancelKeepsPrevious(t *testing.T) {
 // TestInmemStore_CloseIdempotent проверяет, что повторный Close не падает
 // и не создаёт дубликатов в List.
 func TestInmemStore_CloseIdempotent(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	store := NewInmemSnapshotStore()
 	sink, err := store.Create(10, 3, Configuration{}, 0)

@@ -15,7 +15,7 @@ import (
 // для индексов ниже первого индекса компактированного журнала в батч
 // раньше подставлялась запись log[0].
 func TestSendBatch_SkipsMissingPrefix(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	cm := &ConsensusModule{}
 	cm.cmState.log = []LogEntry{{Index: 5, Term: 1, Type: LogCommand, Data: "k=v"}}
@@ -56,7 +56,7 @@ func TestSendBatch_SkipsMissingPrefix(t *testing.T) {
 // «естественное» пересечение недостижимо, поэтому без искусственной подготовки
 // тест был бы зелёным на обеих версиях кода (FINDING-08).
 func TestSendBatch_CopyNotAliasedWithLog(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	const k = 3
 	fsm := newGateBatchFSM()
@@ -153,7 +153,7 @@ func TestSendBatch_CopyNotAliasedWithLog(t *testing.T) {
 // удержанный после возврата из Apply *LogEntry (и его payload) остаётся
 // неизменным после конфликтной перезаписи и компактирования журнала.
 func TestFSMRetainedEntryImmutable(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	const k = 3
 	cm := &ConsensusModule{}
@@ -195,7 +195,7 @@ func TestFSMRetainedEntryImmutable(t *testing.T) {
 // значения, которые применит FSM. Компактирование обязано заменять backing
 // array аллокацией нового среза, никогда — in-place обрезкой.
 func TestCompactLogs_PendingBatchUnchanged(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	const k = 3
 	fsm := newGateBatchFSM()
@@ -242,7 +242,7 @@ func TestCompactLogs_PendingBatchUnchanged(t *testing.T) {
 // принудительных перевыборах (RAFT_FORCE_MORE_REELECTION), после стабилизации
 // все узлы сходятся к одному состоянию — последняя команда закоммичена на всех.
 func TestClusterConvergence_ForcedReelections(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 10*time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	// Test-only хук: electionTimeout возвращает ReelectionTimeoutMs в трети
 	// случаев, вызывая частые смены лидера.
@@ -262,33 +262,32 @@ func TestClusterConvergence_ForcedReelections(t *testing.T) {
 
 	// Сходимость: последняя команда присутствует в логе коммитов всех узлов.
 	// Интеграционный тест с реальными таймерами — опрос с дедлайном.
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		h.mu.Lock()
-		converged := true
-		for i := 0; i < h.n; i++ {
-			if !h.connected[i] {
-				continue
-			}
-			found := false
-			for _, c := range h.commits[i] {
-				if c.Data.(int) == numCmds-1 {
-					found = true
-					break
+	err := h.waitFor(
+		fmt.Sprintf("cmd=%d committed on all connected peers", numCmds-1),
+		10*time.Second,
+		func() bool {
+			for i := 0; i < h.n; i++ {
+				if !h.connected[i] {
+					continue
+				}
+				found := false
+				for _, c := range h.commits[i] {
+					if c.Data.(int) == numCmds-1 {
+						found = true
+						break
+					}
+				}
+				if !found {
+					return false
 				}
 			}
-			if !found {
-				converged = false
-				break
-			}
-		}
-		h.mu.Unlock()
-		if converged {
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
+			return true
+		},
+		h.commitsDiag,
+	)
+	if err != nil {
+		t.Fatalf("кластер не сошёлся к команде %d: %v", numCmds-1, err)
 	}
-	t.Fatalf("кластер не сошёлся к команде %d", numCmds-1)
 }
 
 // newAliasTestCM создаёт минимальный ConsensusModule в состоянии follower с

@@ -14,7 +14,7 @@ import (
 // PreCandidate -> Follower -> PreCandidate (см.
 // .doc/loop-becomes-Follower-becomes-PreCandidate.md, §7.1).
 func TestFileStorage_RestartRestoresState(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 30*time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	dir := t.TempDir()
 	storage := NewFileStorage(dir)

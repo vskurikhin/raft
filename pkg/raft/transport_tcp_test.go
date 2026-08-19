@@ -83,7 +83,7 @@ func startTCPHandlerNoReply(t *testing.T, trans *TCPTransport) func() {
 
 // TestTCPNewTransport проверяет успешное создание TCPTransport.
 func TestTCPNewTransport(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	trans, err := NewTCPTransport("127.0.0.1:0", 500*time.Millisecond, 2)
 	if err != nil {
 		t.Fatalf("NewTCPTransport failed: %v", err)
@@ -99,7 +99,7 @@ func TestTCPNewTransport(t *testing.T) {
 
 // TestTCPNewTransportInvalidAddr проверяет ошибку при неверном адресе.
 func TestTCPNewTransportInvalidAddr(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	_, err := NewTCPTransport("invalid", 500*time.Millisecond, 2)
 	if err == nil {
 		t.Fatal("expected error for invalid address")
@@ -108,7 +108,7 @@ func TestTCPNewTransportInvalidAddr(t *testing.T) {
 
 // TestTCPNewTransportPortInUse проверяет ошибку при занятом порте.
 func TestTCPNewTransportPortInUse(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	first, err := NewTCPTransport("127.0.0.1:0", 500*time.Millisecond, 2)
 	if err != nil {
 		t.Fatalf("first transport: %v", err)
@@ -125,7 +125,7 @@ func TestTCPNewTransportPortInUse(t *testing.T) {
 
 // TestTCPAppendEntriesSuccess проверяет успешную отправку и получение ответа.
 func TestTCPAppendEntriesSuccess(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	client, server, cleanup := newTCPPair(t, 500*time.Millisecond)
 	defer cleanup()
 	defer startTCPHandler(t, server)()
@@ -151,7 +151,7 @@ func TestTCPAppendEntriesSuccess(t *testing.T) {
 
 // TestTCPAppendEntriesUnknownPeer проверяет отправку неизвестному peer.
 func TestTCPAppendEntriesUnknownPeer(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	client, err := NewTCPTransport("127.0.0.1:0", 100*time.Millisecond, 2)
 	if err != nil {
 		t.Fatalf("NewTCPTransport: %v", err)
@@ -168,7 +168,7 @@ func TestTCPAppendEntriesUnknownPeer(t *testing.T) {
 
 // TestTCPAppendEntriesAfterClose проверяет отправку после закрытия.
 func TestTCPAppendEntriesAfterClose(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	client, server, cleanup := newTCPPair(t, 500*time.Millisecond)
 	defer cleanup()
 	defer startTCPHandler(t, server)()
@@ -184,7 +184,7 @@ func TestTCPAppendEntriesAfterClose(t *testing.T) {
 
 // TestTCPAppendEntriesDisconnect проверяет отправку после Disconnect.
 func TestTCPAppendEntriesDisconnect(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	client, server, cleanup := newTCPPair(t, 500*time.Millisecond)
 	defer cleanup()
 	defer startTCPHandler(t, server)()
@@ -211,7 +211,7 @@ func TestTCPAppendEntriesDisconnect(t *testing.T) {
 
 // TestTCPAppendEntriesTimeout проверяет таймаут ответа.
 func TestTCPAppendEntriesTimeout(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	// Сервер с коротким таймаутом — 50ms
 	server, err := NewTCPTransport("127.0.0.1:0", 50*time.Millisecond, 2)
 	if err != nil {
@@ -237,7 +237,7 @@ func TestTCPAppendEntriesTimeout(t *testing.T) {
 
 // TestTCPRequestVoteSuccess проверяет успешную отправку RequestVote.
 func TestTCPRequestVoteSuccess(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	client, server, cleanup := newTCPPair(t, 500*time.Millisecond)
 	defer cleanup()
 	defer startTCPHandler(t, server)()
@@ -262,7 +262,7 @@ func TestTCPRequestVoteSuccess(t *testing.T) {
 
 // TestTCPRequestVoteUnknownPeer проверяет отправку RequestVote неизвестному peer.
 func TestTCPRequestVoteUnknownPeer(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	client, err := NewTCPTransport("127.0.0.1:0", 100*time.Millisecond, 2)
 	if err != nil {
 		t.Fatalf("NewTCPTransport: %v", err)
@@ -277,7 +277,7 @@ func TestTCPRequestVoteUnknownPeer(t *testing.T) {
 
 // TestTCPRequestVoteAfterClose проверяет отправку RequestVote после закрытия.
 func TestTCPRequestVoteAfterClose(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	client, server, cleanup := newTCPPair(t, 500*time.Millisecond)
 	defer cleanup()
 	defer startTCPHandler(t, server)()
@@ -293,7 +293,7 @@ func TestTCPRequestVoteAfterClose(t *testing.T) {
 // TestTCPConnectionReset проверяет, что после разрыва соединения
 // следующий вызов AppendEntries возвращает ошибку.
 func TestTCPConnectionReset(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	client, server, cleanup := newTCPPair(t, 500*time.Millisecond)
 	defer cleanup()
 	defer startTCPHandler(t, server)()
@@ -321,7 +321,7 @@ func TestTCPConnectionReset(t *testing.T) {
 // TestTCPReconnectAfterDrop проверяет, что Disconnect + Connect
 // позволяет установить новое соединение и успешно отправить RPC.
 func TestTCPReconnectAfterDrop(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	client, server, cleanup := newTCPPair(t, 500*time.Millisecond)
 	defer cleanup()
 	defer startTCPHandler(t, server)()
@@ -355,7 +355,7 @@ func TestTCPReconnectAfterDrop(t *testing.T) {
 
 // TestTCPConcurrentSends проверяет множественные параллельные отправки.
 func TestTCPConcurrentSends(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 5*time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	client, server, cleanup := newTCPPair(t, time.Second)
 	defer cleanup()
 	defer startTCPHandler(t, server)()
@@ -381,7 +381,7 @@ func TestTCPConcurrentSends(t *testing.T) {
 
 // TestTCPDoubleClose проверяет, что вызов Close дважды не вызывает panic.
 func TestTCPDoubleClose(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	trans, err := NewTCPTransport("127.0.0.1:0", 500*time.Millisecond, 2)
 	if err != nil {
 		t.Fatalf("NewTCPTransport: %v", err)
@@ -393,7 +393,7 @@ func TestTCPDoubleClose(t *testing.T) {
 // TestTCPCloseWaitsForGoroutines проверяет, что после Close
 // не остаётся работающих горутин.
 func TestTCPCloseWaitsForGoroutines(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 5*time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	trans, err := NewTCPTransport("127.0.0.1:0", 500*time.Millisecond, 2)
 	if err != nil {
 		t.Fatalf("NewTCPTransport: %v", err)
@@ -404,7 +404,7 @@ func TestTCPCloseWaitsForGoroutines(t *testing.T) {
 // TestTCPCloseStopsConsumer проверяет, что после Close
 // AppendEntries и RequestVote возвращают ошибку.
 func TestTCPCloseStopsConsumer(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	client, server, cleanup := newTCPPair(t, 500*time.Millisecond)
 	defer cleanup()
 	defer startTCPHandler(t, server)()
@@ -426,7 +426,7 @@ func TestTCPCloseStopsConsumer(t *testing.T) {
 
 // TestTCPGobRegistration проверяет, что RPC-типы зарегистрированы в gob.
 func TestTCPGobRegistration(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	// Проверяем, что init() зарегистрировал типы — создаём транспорт,
 	// отправляем RPC с разными типами, убеждаемся что gob не паникует.
@@ -474,7 +474,7 @@ func TestTCPGobRegistration(t *testing.T) {
 // TestTCPAppendEntriesError проверяет, что если сервер отвечает с ошибкой,
 // клиент получает и распознаёт её.
 func TestTCPAppendEntriesError(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	client, server, cleanup := newTCPPair(t, 500*time.Millisecond)
 	defer cleanup()
 
@@ -497,7 +497,7 @@ func TestTCPAppendEntriesError(t *testing.T) {
 
 // TestTCPAppendEntriesMultiple проверяет несколько последовательных вызовов.
 func TestTCPAppendEntriesMultiple(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	client, server, cleanup := newTCPPair(t, time.Second)
 	defer cleanup()
 	defer startTCPHandler(t, server)()
@@ -516,7 +516,7 @@ func TestTCPAppendEntriesMultiple(t *testing.T) {
 
 // TestTCPLocalAddr проверяет LocalAddr().
 func TestTCPLocalAddr(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	trans, err := NewTCPTransport("127.0.0.1:0", 500*time.Millisecond, 2)
 	if err != nil {
 		t.Fatalf("NewTCPTransport: %v", err)
@@ -531,7 +531,7 @@ func TestTCPLocalAddr(t *testing.T) {
 // TestTCPStubsReturnNotImplemented проверяет, что нереализованные методы возвращают
 // ErrNotImplemented, а реализованные (RequestPreVote, TimeoutNow) — транспортную ошибку.
 func TestTCPStubsReturnNotImplemented(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	trans, err := NewTCPTransport("127.0.0.1:0", 100*time.Millisecond, 2)
 	if err != nil {
 		t.Fatalf("NewTCPTransport: %v", err)
@@ -566,7 +566,7 @@ func TestTCPStubsReturnNotImplemented(t *testing.T) {
 
 // TestTCPDisconnectAll проверяет DisconnectAll.
 func TestTCPDisconnectAll(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	client, err := NewTCPTransport("127.0.0.1:0", 500*time.Millisecond, 2)
 	if err != nil {
 		t.Fatalf("NewTCPTransport: %v", err)
@@ -606,7 +606,7 @@ func TestTCPDisconnectAll(t *testing.T) {
 // TestTCPTransportNoGoroutineLeak проверяет, что после Close
 // не остаётся goroutine.
 func TestTCPTransportNoGoroutineLeak(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 5*time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	// Создаём транспорт с активным acceptLoop, используем
 	trans, err := NewTCPTransport("127.0.0.1:0", 500*time.Millisecond, 2)
 	if err != nil {

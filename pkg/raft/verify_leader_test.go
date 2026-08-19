@@ -16,7 +16,7 @@ import (
 // Старый код (порог len(peerIds)/2+1 = 1) подтверждал бы лидерство
 // в одиночку — тест дискриминирует.
 func TestVerifyLeader_TwoNodes_FollowerDownNoQuorum(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 200*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 2)
 	defer h.Shutdown()
 
@@ -49,7 +49,7 @@ func TestVerifyLeader_TwoNodes_FollowerDownNoQuorum(t *testing.T) {
 // Старый код (порог len(peerIds)/2+1 = 2) подтверждал бы при self + 1
 // follower — тест дискриминирует.
 func TestVerifyLeader_FourNodes_OneFollowerNotEnough(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 200*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 4)
 	defer h.Shutdown()
 
@@ -84,7 +84,7 @@ func TestVerifyLeader_FourNodes_OneFollowerNotEnough(t *testing.T) {
 // подтверждение может задержаться до следующего тика heartbeat из-за
 // занятого inflightAE).
 func TestVerifyLeader_FourNodes_OneDownStillVerifies(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 200*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 4)
 	defer h.Shutdown()
 
@@ -107,7 +107,7 @@ func TestVerifyLeader_FourNodes_OneDownStillVerifies(t *testing.T) {
 // Старый код голосовал на каждый success-ответ без фильтра Suffrage —
 // self + nonvoter давали бы 2 голоса и ложное подтверждение.
 func TestVerifyLeader_NonvoterAckDoesNotVote(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 300*Quantum*time.Millisecond)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 4)
 	defer h.Shutdown()
 
@@ -131,6 +131,7 @@ func TestVerifyLeader_NonvoterAckDoesNotVote(t *testing.T) {
 			}
 		}
 		if !demoted {
+			// poll-интервал condition-wait (не фиксированная пауза).
 			time.Sleep(10 * time.Millisecond)
 		}
 	}

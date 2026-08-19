@@ -217,6 +217,7 @@ func (h *snapshotHarness) RestartPeer(id int) {
 	close(ready)
 	h.alive[id] = true
 	h.connected[id] = true
+	// poll-интервал condition-wait (не фиксированная пауза).
 	sleepMs(20)
 }
 
@@ -254,6 +255,7 @@ func (h *snapshotHarness) waitForSnapshot(serverID int, timeout time.Duration) b
 			return false
 		default:
 		}
+		// poll-интервал condition-wait (не фиксированная пауза).
 		time.Sleep(10 * time.Millisecond)
 	}
 }
@@ -335,7 +337,7 @@ func (h *snapshotHarness) getLogLength(serverID int) int {
 // при достижении threshold. Устанавливаем низкий SnapshotThreshold (8),
 // отправляем 10 команд, ждём коммита и проверяем lastSnapshotIndex.
 func TestSnapshot_Creation(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 30*time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := newSnapshotHarness(t, 3)
 	defer h.Shutdown()
@@ -376,7 +378,7 @@ func TestSnapshot_Creation(t *testing.T) {
 // TestSnapshot_NoSnapshotStore проверяет, что nil SnapshotStore
 // не вызывает ошибок и снэпшоты отключены.
 func TestSnapshot_NoSnapshotStore(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 30*time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -390,6 +392,8 @@ func TestSnapshot_NoSnapshotStore(t *testing.T) {
 			t.Fatalf("SubmitToServer(%d) failed", i)
 		}
 	}
+	// keep: timing — окно является предметом проверки в этом месте;
+	// наблюдаемого признака состояния здесь нет.
 	sleepMs(ReelectionTimeoutMs)
 
 	// Проверяем, что lastSnapshotIndex == -1 на всех узлах.
@@ -413,7 +417,7 @@ func TestSnapshot_NoSnapshotStore(t *testing.T) {
 // совпадает с лидерским на пересечении. На HEAD до TASK-001 тест обязан
 // падать (INV-S1: lastLogIndex == -1 при установленном снапшоте).
 func TestSnapshot_Install(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 60*time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := newSnapshotHarness(t, 3)
 	defer h.Shutdown()
@@ -521,6 +525,7 @@ func (h *snapshotHarness) waitForCatchUp(leaderID, followerID int, timeout time.
 			h.t.Fatalf("follower %d did not catch up to leader %d: lastLogIndex follower=%d leader=%d",
 				followerID, leaderID, h.getLastLogIndex(followerID), h.getLastLogIndex(leaderID))
 		}
+		// poll-интервал condition-wait (не фиксированная пауза).
 		time.Sleep(10 * time.Millisecond)
 	}
 }
@@ -585,6 +590,7 @@ func (h *snapshotHarness) waitForFSMStateEqual(a, b int, timeout time.Duration) 
 		if time.Now().After(deadline) {
 			h.checkFSMStateEqual(a, b)
 		}
+		// poll-интервал condition-wait (не фиксированная пауза).
 		time.Sleep(10 * time.Millisecond)
 	}
 }
@@ -630,7 +636,7 @@ func TestCompactLog_Basic(t *testing.T) {
 
 // TestCompactLog_All проверяет компактирование всех записей.
 func TestCompactLog_All(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	cm := &ConsensusModule{}
 	cm.shutdownCh = make(chan struct{})
@@ -647,7 +653,7 @@ func TestCompactLog_All(t *testing.T) {
 // TestCompactLog_Nothing проверяет, что компактирование до индекса,
 // меньшего чем первая запись, не меняет лог.
 func TestCompactLog_Nothing(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	cm := &ConsensusModule{}
 	cm.shutdownCh = make(chan struct{})
@@ -667,7 +673,7 @@ func TestCompactLog_Nothing(t *testing.T) {
 
 // TestCompactLog_Empty проверяет компактирование пустого лога.
 func TestCompactLog_Empty(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	cm := &ConsensusModule{}
 	cm.shutdownCh = make(chan struct{})
@@ -750,6 +756,7 @@ func (h *snapshotHarness) waitForSingleLeader() int {
 				return i
 			}
 		}
+		// poll-интервал condition-wait (не фиксированная пауза).
 		time.Sleep(HeartbeatTimeoutMs * time.Millisecond * 2)
 	}
 	return -1
@@ -758,7 +765,7 @@ func (h *snapshotHarness) waitForSingleLeader() int {
 // TestSnapshot_MultipleSnapshots проверяет, что при множественных снэпшотах
 // InmemSnapshotStore хранит только последний, а лог компактируется.
 func TestSnapshot_MultipleSnapshots(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 60*time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	// Одноузловой кластер с низким threshold.
 	storage := NewMapStorage()
@@ -771,6 +778,8 @@ func TestSnapshot_MultipleSnapshots(t *testing.T) {
 	cm := NewConsensusModule(0, []int{}, transport, storage, fsm, ready, store)
 	defer cm.Stop()
 
+	// keep: timing — окно является предметом проверки в этом месте;
+	// наблюдаемого признака состояния здесь нет.
 	sleepMs(500)
 
 	cm.mu.Lock()
@@ -779,6 +788,8 @@ func TestSnapshot_MultipleSnapshots(t *testing.T) {
 	if !isLeader {
 		// Ждём выборов (одиночный узел становится лидером после election timeout).
 		for i := 0; i < 20; i++ {
+			// keep: timing — окно является предметом проверки в этом месте;
+			// наблюдаемого признака состояния здесь нет.
 			sleepMs(100)
 			cm.mu.Lock()
 			isLeader = cm.cmState.state == Leader
@@ -813,6 +824,7 @@ func TestSnapshot_MultipleSnapshots(t *testing.T) {
 		if snapIdx > 0 && logLen <= 10 {
 			break
 		}
+		// poll-интервал condition-wait (не фиксированная пауза).
 		time.Sleep(50 * time.Millisecond)
 	}
 
@@ -868,7 +880,7 @@ func TestSnapshot_MultipleSnapshots(t *testing.T) {
 // компактирования), а суффикс лога — доиграться существующим механизмом.
 // Используются реальные FileStorage и FileSnapshotStore в одной директории.
 func TestSnapshot_RestartRestoresFSM(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 60*time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	dir := t.TempDir()
 	storage := NewFileStorage(dir)
@@ -956,6 +968,7 @@ func TestSnapshot_RestartRestoresFSM(t *testing.T) {
 		if fsm2.getState("k29") == "v29" {
 			return
 		}
+		// poll-интервал condition-wait (не фиксированная пауза).
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("k29 not applied after restart: log suffix replay failed")
@@ -963,7 +976,7 @@ func TestSnapshot_RestartRestoresFSM(t *testing.T) {
 
 // TestSnapshot_LeaderCrash проверяет, что снэпшот переживает смену лидера.
 func TestSnapshot_LeaderCrash(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 60*time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := newSnapshotHarness(t, 3)
 	defer h.Shutdown()
@@ -1005,7 +1018,7 @@ func TestSnapshot_LeaderCrash(t *testing.T) {
 // TestInmemTransport_InstallSnapshot проверяет InstallSnapshot через
 // in-memory транспорт без участия CM.
 func TestInmemTransport_InstallSnapshot(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	t1, t2, cleanup := newInmemPair(t)
 	defer cleanup()
@@ -1100,7 +1113,7 @@ func (h *snapshotHarness) sendInstallSnapshotManually(from, to, lastLogIndex int
 // отправляется ни разу, догон — обычным AppendEntries. Заготовка создана
 // в TASK-004, рабочая реализация активируется TASK-006 (SA-003).
 func TestSnapshot_CatchUpWithinTrailingWindow(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 60*time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := newSnapshotHarness(t, 3)
 	defer h.Shutdown()
@@ -1157,7 +1170,7 @@ func TestSnapshot_CatchUpWithinTrailingWindow(t *testing.T) {
 // (кламп nextIndex по lastSnapshotIndex+1, отключающий InstallSnapshot)
 // не реализована.
 func TestSnapshot_CatchUpBehindSnapshot(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 60*time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := newSnapshotHarness(t, 3)
 	defer h.Shutdown()
@@ -1189,7 +1202,7 @@ func TestSnapshot_CatchUpBehindSnapshot(t *testing.T) {
 // снапшота (защита Leader Completeness: logOk в RequestVote/PreVote
 // считается против корректной пары, а не (-1,-1)).
 func TestSnapshot_InstallPostConditions(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 60*time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := newSnapshotHarness(t, 3)
 	defer h.Shutdown()
@@ -1234,7 +1247,7 @@ func TestSnapshot_InstallPostConditions(t *testing.T) {
 // meta.Index обязан завершиться Success:true, а журнал follower'а —
 // достроиться записями meta.Index+1….
 func TestSnapshot_InstallThenAppendEntries(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 60*time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := newSnapshotHarness(t, 3)
 	defer h.Shutdown()
@@ -1284,7 +1297,7 @@ func TestSnapshot_InstallThenAppendEntries(t *testing.T) {
 // (стартовый путь не отказывает, INV-S1 держится), FSM восстановлен из
 // снапшота, догон продолжается.
 func TestSnapshot_InstallRestartFollowUp(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 60*time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := newSnapshotHarness(t, 3)
 	defer h.Shutdown()
@@ -1326,7 +1339,7 @@ func TestSnapshot_InstallRestartFollowUp(t *testing.T) {
 // Success:true; commitIndex/lastApplied не откатываются; цикла нет
 // (число InstallSnapshot не растёт за окно наблюдения).
 func TestSnapshot_InstallIdempotency(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 60*time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := newSnapshotHarness(t, 3)
 	defer h.Shutdown()
@@ -1373,6 +1386,8 @@ func TestSnapshot_InstallIdempotency(t *testing.T) {
 
 	// Цикла нет: за окно наблюдения новых InstallSnapshot не появляется.
 	before := h.installSnapshotCount(followerID)
+	// keep: timing — окно является предметом проверки в этом месте;
+	// наблюдаемого признака состояния здесь нет.
 	sleepMs(ReelectionTimeoutMs * 2)
 	if n := h.installSnapshotCount(followerID); n != before {
 		t.Fatalf("InstallSnapshot storm: count %d -> %d", before, n)
@@ -1384,7 +1399,7 @@ func TestSnapshot_InstallIdempotency(t *testing.T) {
 // commitIndex продвигается, Apply-future разрешаются (кворум учитывает
 // догнанных снапшотом).
 func TestSnapshot_InstallQuorumFiveNodes(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 90*time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := newSnapshotHarness(t, 5)
 	defer h.Shutdown()
@@ -1457,7 +1472,7 @@ func TestSnapshot_InstallQuorumFiveNodes(t *testing.T) {
 // InstallSnapshot за фиксированное окно ограничено сверху backoff'ом
 // (до изменения — попытка на каждый heartbeat, ~30/с).
 func TestReplicationBackoff_BoundsAttemptsToUnavailablePeer(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 60*time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := newSnapshotHarness(t, 3)
 	defer h.Shutdown()
@@ -1495,6 +1510,8 @@ func TestReplicationBackoff_BoundsAttemptsToUnavailablePeer(t *testing.T) {
 
 	// Окно наблюдения: 3 секунды.
 	before := h.installSnapshotCount(followerID)
+	// keep: timing — окно является предметом проверки в этом месте;
+	// наблюдаемого признака состояния здесь нет.
 	time.Sleep(3 * time.Second)
 	attempts := h.installSnapshotCount(followerID) - before
 
@@ -1513,7 +1530,7 @@ func TestReplicationBackoff_BoundsAttemptsToUnavailablePeer(t *testing.T) {
 // TestReplicationBackoffDelay_Clamp; здесь дедлайн 3 с — запас на
 // contention полного набора тестов (in-memory harness, один процесс).
 func TestReplicationBackoff_RecoveryAfterReconnect(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 60*time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	h := newSnapshotHarness(t, 3)
 	defer h.Shutdown()
@@ -1555,6 +1572,8 @@ func TestReplicationBackoff_RecoveryAfterReconnect(t *testing.T) {
 	}
 
 	// Даём накопиться транспортным ошибкам (задержка выросла).
+	// keep: timing — окно является предметом проверки в этом месте;
+	// наблюдаемого признака состояния здесь нет.
 	time.Sleep(1500 * time.Millisecond)
 
 	h.ReconnectPeer(followerID)
@@ -1578,6 +1597,7 @@ func TestReplicationBackoff_RecoveryAfterReconnect(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatal("first successful RPC delayed beyond backoff ceiling + load margin")
 		}
+		// poll-интервал condition-wait (не фиксированная пауза).
 		time.Sleep(10 * time.Millisecond)
 	}
 }

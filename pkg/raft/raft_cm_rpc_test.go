@@ -2,7 +2,6 @@ package raft
 
 import (
 	"testing"
-	"time"
 
 	"github.com/fortytw2/leaktest"
 )
@@ -17,7 +16,7 @@ import (
 //
 // Согласованное состояние (после ADR-P07-001): lastLogIndex == N.
 func TestAppendEntries_ConflictIndexSnapshotBoundary(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	cm := &ConsensusModule{}
 	cm.cmState.state = Follower
@@ -53,7 +52,7 @@ func TestAppendEntries_ConflictIndexSnapshotBoundary(t *testing.T) {
 // (ADR-P07-002 п.4): даже при испорченном lastLogIndex (-1, состояние,
 // порождавшее инцидент) граница работает: ConflictIndex = max(-1, N)+1 = N+1.
 func TestAppendEntries_ConflictIndexSnapshotBoundaryCorrupted(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	cm := &ConsensusModule{}
 	cm.cmState.state = Follower

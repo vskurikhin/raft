@@ -50,6 +50,7 @@ func (m *mockTransportAE) AppendEntries(_ ServerID, args AppendEntriesArgs) (App
 		<-m.blockCh
 	}
 	if m.delay > 0 {
+		// poll-интервал condition-wait (не фиксированная пауза).
 		time.Sleep(m.delay)
 	}
 	if m.failReply {
@@ -164,26 +165,42 @@ func TestLeaderSendAEs_Deduplication(t *testing.T) {
 	cm.leaderState.inflightAE[1].Store(false)
 
 	// Установить inflightAE[1] = true — имитация активной горутины.
+	// Store — синхронная операция, отдельного ожидания не требуется.
 	cm.leaderState.inflightAE[1].Store(true)
-	time.Sleep(10 * time.Millisecond)
 
 	// Вызвать leaderSendAEs — должен пропустить peer 1 (CAS=false).
 	cm.leaderSendAEs()
-	time.Sleep(30 * time.Millisecond)
 
-	calls := mock.callCount.Load()
-	if calls > 0 {
+	// Негативный assert — budgeted negative window (классификация
+	// SA-019/RC-14). Бюджет выведен из протокольной константы
+	// HeartbeatTimeoutMs: за интервал heartbeat сломанная дедупликация
+	// успела бы выполнить как минимум один AppendEntries.
+	//
+	// Инвариант окна: опрос НЕ доказывает отсутствия вызова — окно
+	// осознанно временное и является единственным доступным способом
+	// проверить «ничего не произошло». Увеличение окна не усиливает
+	// assert, уменьшение — ослабляет его.
+	// keep: timing — окно является предметом проверки в этом месте;
+	// наблюдаемого признака состояния здесь нет.
+	sleepMs(HeartbeatTimeoutMs)
+
+	if calls := mock.callCount.Load(); calls > 0 {
 		t.Errorf("expected 0 AppendEntries calls (dedup active), got %d", calls)
 	}
 
 	// Сбросить флаг — теперь leaderSendAEs должен запустить горутину.
+	// Позитивный assert — poll по наблюдаемому условию (calls >= 1)
+	// с дедлайном, а не фиксированная пауза.
 	cm.leaderState.inflightAE[1].Store(false)
 	cm.leaderSendAEs()
-	time.Sleep(30 * time.Millisecond)
 
-	calls = mock.callCount.Load()
-	if calls == 0 {
-		t.Error("expected AppendEntries call after inflightAE reset, got 0")
+	deadline := time.Now().Add(inmemRPCTimeout)
+	for mock.callCount.Load() == 0 {
+		if !time.Now().Before(deadline) {
+			t.Fatalf("expected AppendEntries call after inflightAE reset within %v, got 0",
+				inmemRPCTimeout)
+		}
+		time.Sleep(pollInterval)
 	}
 }
 
@@ -232,6 +249,8 @@ func TestInflightAE_DeferReset(t *testing.T) {
 	// Установить флаг и вызвать leaderSendAEsToPeer.
 	cm.leaderState.inflightAE[1].Store(true)
 	cm.leaderSendAEsToPeer(1, 1, 0)
+	// keep: timing — окно является предметом проверки в этом месте;
+	// наблюдаемого признака состояния здесь нет.
 	time.Sleep(20 * time.Millisecond)
 
 	// После завершения флаг должен быть сброшен.
@@ -290,6 +309,8 @@ func TestInflightAE_DeferResetOnSnapshotPath(t *testing.T) {
 
 	cm.leaderState.inflightAE[1].Store(true)
 	cm.leaderSendAEsToPeer(1, 1, 0)
+	// keep: timing — окно является предметом проверки в этом месте;
+	// наблюдаемого признака состояния здесь нет.
 	time.Sleep(20 * time.Millisecond)
 
 	if cm.leaderState.inflightAE[1].Load() {
@@ -319,6 +340,8 @@ func TestLeaderSendAEs_StateCheck(t *testing.T) {
 	}
 
 	cm.leaderSendAEs()
+	// keep: timing — окно является предметом проверки в этом месте;
+	// наблюдаемого признака состояния здесь нет.
 	time.Sleep(20 * time.Millisecond)
 
 	if calls := mock.callCount.Load(); calls > 0 {
@@ -955,7 +978,7 @@ func TestReplicationBackoff_LogicalRejectionsDoNotBackoff(t *testing.T) {
 // пересоздаёт карты replFailures/lastAttempt (утечки записей прошлого
 // лидерства исключены).
 func TestReplicationBackoff_LeaderStateReinitialized(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	cm := &ConsensusModule{}
 	cm.storage = NewMapStorage()

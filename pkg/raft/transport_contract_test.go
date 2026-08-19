@@ -73,7 +73,7 @@ func runTransportHandler(t *testing.T, trans Transport, consume bool) func() {
 }
 
 func TestTransportConsumerIsUnbuffered(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	tests := []struct {
 		name string
@@ -99,7 +99,7 @@ func TestTransportConsumerIsUnbuffered(t *testing.T) {
 }
 
 func TestTransportAppendEntriesIdempotent(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	tests := []struct {
 		name string
@@ -130,7 +130,7 @@ func TestTransportAppendEntriesIdempotent(t *testing.T) {
 }
 
 func TestTransportRequestVoteIdempotent(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	tests := []struct {
 		name string
@@ -161,7 +161,7 @@ func TestTransportRequestVoteIdempotent(t *testing.T) {
 }
 
 func TestTransportDisconnectReturnsError(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	tests := []struct {
 		name string
@@ -199,7 +199,7 @@ func TestTransportDisconnectReturnsError(t *testing.T) {
 }
 
 func TestTransportCloseReturnsError(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	tests := []struct {
 		name string
@@ -233,7 +233,7 @@ func TestTransportCloseReturnsError(t *testing.T) {
 }
 
 func TestTransportStubsReturnNotImplemented(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	tests := []struct {
 		name string
@@ -281,7 +281,7 @@ func TestTransportStubsReturnNotImplemented(t *testing.T) {
 }
 
 func TestTransportAppendEntriesWithEntries(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	tests := []struct {
 		name string
@@ -319,7 +319,7 @@ func TestTransportAppendEntriesWithEntries(t *testing.T) {
 }
 
 func TestTransportLocalAddr(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	tests := []struct {
 		name string

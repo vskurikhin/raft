@@ -2,7 +2,6 @@ package raft
 
 import (
 	"testing"
-	"time"
 
 	"github.com/fortytw2/leaktest"
 )
@@ -40,7 +39,7 @@ func (m *mockTransportConflict) AppendEntries(_ ServerID, _ AppendEntriesArgs) (
 //
 // Ожидание: termIndexMap корректно отражает последний индекс каждого терма.
 func TestTermIndexMap_AppendEntries(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 5*time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	storage := NewMapStorage()
 	cm := &ConsensusModule{
@@ -109,7 +108,7 @@ func TestTermIndexMap_AppendEntries(t *testing.T) {
 //
 // Ожидание: после компактирования карта содержит только оставшиеся термы.
 func TestTermIndexMap_CompactLogs(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	cm := &ConsensusModule{}
 	cm.shutdownCh = make(chan struct{})
@@ -167,7 +166,7 @@ func TestTermIndexMap_CompactLogs(t *testing.T) {
 //
 // Ожидание: termIndexMap корректно отражает новый состав лога.
 func TestTermIndexMap_AppendEntriesConflict(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	cm := &ConsensusModule{
 		storage:    NewMapStorage(),
@@ -249,7 +248,7 @@ func TestTermIndexMap_AppendEntriesConflict(t *testing.T) {
 //
 // Ожидание: termIndexMap содержит все термы из восстановленного лога.
 func TestTermIndexMap_RestoreFromStorage(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	storage := NewMapStorage()
 	ready := make(chan any)
@@ -312,7 +311,7 @@ func TestTermIndexMap_RestoreFromStorage(t *testing.T) {
 //
 // Ожидание: O(1) lookup в termIndexMap даёт correct raft index.
 func TestTermIndexMap_LeaderSendAEsConflictLookup(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	mock := &mockTransportConflict{replyTerm: 2, success: false, conflictTerm: 2}
 	cm := &ConsensusModule{
@@ -388,7 +387,7 @@ func TestTermIndexMap_LeaderSendAEsConflictLookup(t *testing.T) {
 //
 // Ожидание: nextIndex = 301, подтверждающий исправление бага.
 func TestTermIndexMap_SlicePositionBug(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	mock := &mockTransportConflict{replyTerm: 2, success: false, conflictTerm: 2}
 	cm := &ConsensusModule{

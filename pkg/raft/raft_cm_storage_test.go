@@ -50,6 +50,7 @@ func waitForSnapshotAndCompaction(t *testing.T, cm *ConsensusModule, originalLog
 		if snapIdx > 0 && logLen < originalLogLen {
 			return snapIdx
 		}
+		// poll-интервал condition-wait (не фиксированная пауза).
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("timeout waiting for snapshot and log compaction")
@@ -78,6 +79,7 @@ func waitForSnapshotQuiescence(t *testing.T, cm *ConsensusModule, storage Storag
 		if !needMore && persistedIdx == snapIdx {
 			return
 		}
+		// poll-интервал condition-wait (не фиксированная пауза).
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("timeout waiting for snapshot quiescence")
@@ -88,7 +90,7 @@ func waitForSnapshotQuiescence(t *testing.T, cm *ConsensusModule, storage Storag
 // lastApplied/commitIndex соответствуют индексу снапшота, суффикс лога
 // реплицируется после выборов.
 func TestRestoreFromSnapshotStore_RestoresFSMAndIndex(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 30*time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	dir := t.TempDir()
 	storage1 := NewFileStorage(dir)
@@ -175,6 +177,7 @@ func TestRestoreFromSnapshotStore_RestoresFSMAndIndex(t *testing.T) {
 		if fsm2.getState("k9") == "v9" {
 			return
 		}
+		// poll-интервал condition-wait (не фиксированная пауза).
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("k9 not applied after restart: log suffix replay failed")
@@ -183,7 +186,7 @@ func TestRestoreFromSnapshotStore_RestoresFSMAndIndex(t *testing.T) {
 // TestRestoreFromSnapshotStore_EmptyStoreNoSnapshots — старт без снапшотов
 // не падает (свежий узел).
 func TestRestoreFromSnapshotStore_EmptyStoreNoSnapshots(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	cm := &ConsensusModule{
 		fsm:           newSnapshotTestFSM(),
@@ -209,7 +212,7 @@ func TestRestoreFromSnapshotStore_EmptyStoreNoSnapshots(t *testing.T) {
 // lastSnapshotIndex, дыра между снапшотом и логом, безусловный инвариант
 // при пустом журнале.
 func TestRestoreFromSnapshotStore_FailFastGap(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	// 1. Пустой store + lastSnapshotIndex >= 0 → ошибка.
 	cm := &ConsensusModule{
@@ -269,7 +272,7 @@ func TestRestoreFromSnapshotStore_FailFastGap(t *testing.T) {
 // lastSnapshotIndex на диске (окно крэша FINDING-007) — конструктор не
 // падает, метаданные берутся из стора и исправляются на диске.
 func TestRestoreFromSnapshotStore_SelfHealsStalePersistKey(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 30*time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	dir := t.TempDir()
 	storage1 := NewFileStorage(dir)
@@ -361,7 +364,7 @@ func TestRestoreFromSnapshotStore_SelfHealsStalePersistKey(t *testing.T) {
 // валидный снапшот (ревью HIGH-1): lastLogIndex/lastLogTerm синхронизируются
 // с meta, инвариант lastApplied <= lastLogIndex держится.
 func TestRestoreFromSnapshotStore_EmptyLogWithSnapshot(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 30*time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	dir := t.TempDir()
 
@@ -430,7 +433,7 @@ func (r *recordingStorage) keysSnapshot() []string {
 // (TASK-008): снапшот-ключи записываются ДО усечённого лога, чтобы крэш
 // между записями не оставлял «лог усечён, а lastSnapshotIndex старый».
 func TestPersistToStorage_LogWrittenLast(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	rec := &recordingStorage{Storage: NewMapStorage()}
 	cm := &ConsensusModule{storage: rec}
@@ -483,7 +486,7 @@ func TestCheckSnapshotKeysConsistency(t *testing.T) {
 // что конфигурация кластера восстанавливается из метаданных снапшота,
 // если она новее конфигурации из компактированного суффикса лога.
 func TestRestoreFromSnapshotStore_RestoresConfiguration(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	snapConfig := Configuration{ConfigServers: []ConfigServer{
 		{ID: 0, Address: "0", Suffrage: Voter},

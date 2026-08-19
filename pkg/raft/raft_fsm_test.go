@@ -7,7 +7,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/fortytw2/leaktest"
 )
@@ -84,7 +83,7 @@ func (s *testSnapshot) Release() {}
 // Создаёт FSM, применяет команды, делает снэпшот, восстанавливает
 // в новую FSM и проверяет состояние.
 func TestSnapshotTestFSM_Basic(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	fsm := newSnapshotTestFSM()
 	fsm.Apply(&LogEntry{Data: "a=1"})
@@ -132,7 +131,7 @@ func TestSnapshotTestFSM_Basic(t *testing.T) {
 
 // TestSnapshotTestFSM_Empty проверяет снэпшот пустой FSM.
 func TestSnapshotTestFSM_Empty(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	fsm := newSnapshotTestFSM()
 	snap, err := fsm.Snapshot()
@@ -164,7 +163,7 @@ func TestSnapshotTestFSM_Empty(t *testing.T) {
 // TestCommitChannelFSM_SnapshotStub проверяет, что заглушки
 // CommitChannelFSM.Snapshot/Restore возвращают ErrNotImplemented.
 func TestCommitChannelFSM_SnapshotStub(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	ch := make(chan CommitEntry, 1)
 	fsm := NewCommitChannelFSM(ch)

@@ -47,7 +47,7 @@ func (f *failingSnapshotStore) createCount() int {
 // логируется через traceLogf(0, ...) — проверка через перехват лога
 // не выполняется, чтобы не мутировать глобальный логгер из теста.
 func TestRunSnapshots_TakeSnapshotErrorDoesNotCrash(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	fsm := newSnapshotTestFSM()
 	ready := make(chan any)
@@ -75,6 +75,7 @@ func TestRunSnapshots_TakeSnapshotErrorDoesNotCrash(t *testing.T) {
 		if store.createCount() >= 1 {
 			return
 		}
+		// poll-интервал condition-wait (не фиксированная пауза).
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("takeSnapshot was never attempted: failing store Create not called")
@@ -84,7 +85,7 @@ func TestRunSnapshots_TakeSnapshotErrorDoesNotCrash(t *testing.T) {
 // что при пустом List() у лидера с lastSnapshotIndex >= 0 вызов не
 // паникует, не меняет nextIndex и отправляет сигнал в snapshotCh.
 func TestLeaderSendSnapshot_EmptyListSignalsSnapshot(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	cm := &ConsensusModule{
 		snapshotStore: NewInmemSnapshotStore(),
@@ -188,7 +189,7 @@ func driveInstallSnapshotRPC(t *testing.T, cm *ConsensusModule, req *InstallSnap
 // состояние не изменяется. На HEAD до ADR-P07-003 второй вызов создавал
 // бы новый снапшот (Create) — тест падает.
 func TestInstallSnapshot_RepeatedIsNoOp(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	cm, store := newInstallSnapshotCM()
 	data := installSnapshotRequestData(t, map[string]string{"k0": "v0"})
@@ -224,7 +225,7 @@ func TestInstallSnapshot_RepeatedIsNoOp(t *testing.T) {
 // с LastLogIndex меньше текущего lastSnapshotIndex — no-op, commitIndex и
 // lastApplied не уменьшаются (монотонность по построению, ADR-P07-003).
 func TestInstallSnapshot_StaleDoesNotRollBack(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	cm, store := newInstallSnapshotCM() // lastSnapshotIndex = commitIndex = 10
 	data := installSnapshotRequestData(t, map[string]string{"k0": "v0"})
@@ -266,7 +267,7 @@ func (c *countingReader) Read(p []byte) (int, error) {
 // тело запроса обязано быть вычитано существующим drain-механизмом в defer
 // (ADR-P07-003 п.4) — иначе на TCP-транспорте соединение рассинхронизируется.
 func TestInstallSnapshot_NoOpDrainsBody(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	cm, _ := newInstallSnapshotCM()
 	data := installSnapshotRequestData(t, map[string]string{"k0": "v0"})
@@ -291,7 +292,7 @@ func TestInstallSnapshot_NoOpDrainsBody(t *testing.T) {
 // обязано обслужить следующий RPC (AppendEntries) — интегральная проверка
 // drain'а на реальном TCP-транспорте.
 func TestInstallSnapshot_NoOpKeepsTCPConnectionUsable(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 10*time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	client, server, cleanup := newTCPTransportPair(t)
 	defer cleanup()
@@ -312,6 +313,8 @@ func TestInstallSnapshot_NoOpKeepsTCPConnectionUsable(t *testing.T) {
 	cm.mu.Unlock()
 
 	// Ждём, пока runRPCReader начнёт обслуживать входящие RPC.
+	// keep: timing — окно является предметом проверки в этом месте;
+	// наблюдаемого признака состояния здесь нет.
 	sleepMs(50)
 
 	data := []byte("snapshot-body-bytes")

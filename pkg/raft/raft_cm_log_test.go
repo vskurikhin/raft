@@ -2,7 +2,6 @@ package raft
 
 import (
 	"testing"
-	"time"
 
 	"github.com/fortytw2/leaktest"
 )
@@ -18,7 +17,7 @@ import (
 // свежего узла не изменилось: пустой журнал и lastSnapshotIndex == -1
 // дают (-1, -1).
 func TestRebuildLastLog_EmptyLogWithoutSnapshot(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	cm := &ConsensusModule{}
 	cm.cmState.log = nil
@@ -38,7 +37,7 @@ func TestRebuildLastLog_EmptyLogWithoutSnapshot(t *testing.T) {
 // Именно эта ветка ломала догон в инциденте: rebuildLastLog затирал
 // корректные lastLogIndex/lastLogTerm в -1/-1.
 func TestRebuildLastLog_EmptyLogWithSnapshot(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	cm := &ConsensusModule{}
 	cm.cmState.log = nil
@@ -57,7 +56,7 @@ func TestRebuildLastLog_EmptyLogWithSnapshot(t *testing.T) {
 // поведение не меняется: берётся последняя запись среза, граница
 // снапшота не участвует.
 func TestRebuildLastLog_NonEmptyLog(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	cm := &ConsensusModule{}
 	cm.cmState.log = []LogEntry{
@@ -80,7 +79,7 @@ func TestRebuildLastLog_NonEmptyLog(t *testing.T) {
 // недостижима, результат — последняя вставленная запись (ADR-P07-001,
 // анализ побочных эффектов п.1).
 func TestRebuildLastLog_AppendEntriesCallSite(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	cm := &ConsensusModule{}
 	cm.storage = NewMapStorage()
@@ -123,7 +122,7 @@ func TestRebuildLastLog_AppendEntriesCallSite(t *testing.T) {
 // (поле ещё -1, как в конструкторе), поэтому пустой журнал даёт (-1, -1)
 // (ADR-P07-001, анализ побочных эффектов п.2).
 func TestRebuildLastLog_RestoreFromStorageCallSite(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	storage := NewMapStorage()
 	storage.Set("currentTerm", gobEncode(t, 1))
@@ -146,7 +145,7 @@ func TestRebuildLastLog_RestoreFromStorageCallSite(t *testing.T) {
 // TestRebuildLastLog_RestoreFromStorageNonEmptyLog — тот же call site
 // с непустым журналом в storage: последняя запись (поведение прежнее).
 func TestRebuildLastLog_RestoreFromStorageNonEmptyLog(t *testing.T) {
-	defer leaktest.CheckTimeout(t, time.Second)()
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	storage := NewMapStorage()
 	storage.Set("currentTerm", gobEncode(t, 1))
