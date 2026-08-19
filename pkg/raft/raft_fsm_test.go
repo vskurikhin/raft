@@ -50,7 +50,7 @@ func (f *snapshotTestFSM) Snapshot() (FSMSnapshot, error) {
 }
 
 func (f *snapshotTestFSM) Restore(r io.ReadCloser) error {
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 	data, err := io.ReadAll(r)
 	if err != nil {
 		return err

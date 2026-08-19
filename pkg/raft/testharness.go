@@ -482,7 +482,7 @@ func (h *Harness) nodeStates() string {
 	sb.WriteString("state:")
 	for i := 0; i < h.n; i++ {
 		if h.cluster[i] == nil {
-			fmt.Fprintf(&sb, " [%d: <no CM>]", i)
+			_, _ = fmt.Fprintf(&sb, " [%d: <no CM>]", i)
 			continue
 		}
 		_, term, isLeader := h.cluster[i].Report()
@@ -490,7 +490,7 @@ func (h *Harness) nodeStates() string {
 		if isLeader {
 			role = "leader"
 		}
-		fmt.Fprintf(
+		_, _ = fmt.Fprintf(
 			&sb, " [%d: %s term=%d connected=%t alive=%t]",
 			i, role, term, connected[i], alive[i],
 		)
@@ -674,9 +674,9 @@ func (h *Harness) commitsDiag() string {
 	var sb strings.Builder
 	sb.WriteString("commits:")
 	for i := 0; i < h.n; i++ {
-		fmt.Fprintf(&sb, " len[%d]=%d", i, len(h.commits[i]))
+		_, _ = fmt.Fprintf(&sb, " len[%d]=%d", i, len(h.commits[i]))
 		if n := len(h.commits[i]); n > 0 {
-			fmt.Fprintf(&sb, " last[%d]=%v", i, h.commits[i][n-1].Data)
+			_, _ = fmt.Fprintf(&sb, " last[%d]=%v", i, h.commits[i][n-1].Data)
 		}
 	}
 	return sb.String()

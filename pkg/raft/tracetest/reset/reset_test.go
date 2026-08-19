@@ -30,7 +30,7 @@ var buf syncBuffer
 func TestMain(m *testing.M) {
 	log.SetOutput(&buf)
 	if err := raft.SetTraceLogFile(""); err != nil {
-		os.Stderr.WriteString("raft: trace configuration failed: " + err.Error() + "\n")
+		_, _ = os.Stderr.WriteString("raft: trace configuration failed: " + err.Error() + "\n")
 		os.Exit(1)
 	}
 	os.Exit(m.Run())

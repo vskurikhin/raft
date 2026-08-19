@@ -20,7 +20,7 @@ type failingSnapshotStore struct {
 	creates int
 }
 
-func (f *failingSnapshotStore) Create(index, term int, configuration Configuration, configIndex int) (SnapshotSink, error) {
+func (f *failingSnapshotStore) Create(_, _ int, _ Configuration, _ int) (SnapshotSink, error) {
 	f.mu.Lock()
 	f.creates++
 	f.mu.Unlock()
@@ -31,7 +31,7 @@ func (f *failingSnapshotStore) List() ([]*SnapshotMeta, error) {
 	return nil, nil
 }
 
-func (f *failingSnapshotStore) Open(id string) (*SnapshotMeta, io.ReadCloser, error) {
+func (f *failingSnapshotStore) Open(_ string) (*SnapshotMeta, io.ReadCloser, error) {
 	return nil, nil, fmt.Errorf("open failed")
 }
 

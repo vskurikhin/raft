@@ -31,7 +31,7 @@ var buf syncBuffer
 func TestMain(m *testing.M) {
 	log.SetOutput(&buf)
 	if err := kvservice.SetTraceLogFile(""); err != nil {
-		os.Stderr.WriteString("kvservice: trace configuration failed: " + err.Error() + "\n")
+		_, _ = os.Stderr.WriteString("kvservice: trace configuration failed: " + err.Error() + "\n")
 		os.Exit(1)
 	}
 	os.Exit(m.Run())

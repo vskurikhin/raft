@@ -462,7 +462,7 @@ func (m *mockSnapshotStore) List() ([]*SnapshotMeta, error) {
 	}, nil
 }
 
-func (m *mockSnapshotStore) Open(id string) (*SnapshotMeta, io.ReadCloser, error) {
+func (m *mockSnapshotStore) Open(_ string) (*SnapshotMeta, io.ReadCloser, error) {
 	return &SnapshotMeta{Index: 0, Term: 1, Size: 0}, io.NopCloser(bytes.NewReader(nil)), nil
 }
 
@@ -483,7 +483,7 @@ func (m *mockSnapshotStoreCfg) List() ([]*SnapshotMeta, error) {
 
 // Open возвращает предзаданные метаданные и пустой ридер — для проверки
 // корректности вызова важны лишь метаданные, содержимое не читается.
-func (m *mockSnapshotStoreCfg) Open(id string) (*SnapshotMeta, io.ReadCloser, error) {
+func (m *mockSnapshotStoreCfg) Open(_ string) (*SnapshotMeta, io.ReadCloser, error) {
 	return m.openMeta, io.NopCloser(bytes.NewReader(nil)), nil
 }
 
