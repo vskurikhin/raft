@@ -5,47 +5,43 @@ PROJECTNAME=$(shell basename "$(PWD)")
 # Go related variables.
 GOBASE=$(shell pwd)
 GOPATH="$(GOBASE)/vendor:$(GOBASE)"
-CMD_SERVER=cmd
-GOBIN=$(GOBASE)/$(CMD_SERVER)
-GOFILES=$(wildcard *.go)
+GOBIN=$(GOBASE)/bin
+GOCMD=$(GOBASE)/cmd
+TRACE=trace
+TRACE_LOG_LEVEL=0
 
 # Redirect error output to a file, so we can show it in development mode.
 STDERR=/tmp/.$(PROJECTNAME)kv-stderr.txt
 
+NODES := 1 2 3
+
 # PID file will keep the process id of the raft
-PID_RAFT1=/tmp/.$(PROJECTNAME)kv-1.pid
-PID_RAFT2=/tmp/.$(PROJECTNAME)kv-2.pid
-PID_RAFT3=/tmp/.$(PROJECTNAME)kv-3.pid
-PID_LOADKV=/tmp/.loadkv.pid
+pid_file   = /tmp/.$(PROJECTNAME)kv-$(1).pid
+PID_LOADKV = /tmp/.loadkv.pid
 
-TRACE_LOG_RAFT1=$(GOBASE)/$(PROJECTNAME)kv-1.trace
-TRACE_LOG_RAFT2=$(GOBASE)/$(PROJECTNAME)kv-2.trace
-TRACE_LOG_RAFT3=$(GOBASE)/$(PROJECTNAME)kv-3.trace
+trace_cm   = $(GOBASE)/$(TRACE)/$(PROJECTNAME)cm-$(1).trace
+trace_kv   = $(GOBASE)/$(TRACE)/$(PROJECTNAME)kv-$(1).trace
+stderr     = $(GOBASE)/$(TRACE)/$(PROJECTNAME)kv-$(1).stderr
+stdout     = $(GOBASE)/$(TRACE)/$(PROJECTNAME)kv-$(1).stdout
 
-TRACE_LOG_KVBD1=$(GOBASE)/$(PROJECTNAME)kvdb-1.trace
-TRACE_LOG_KVBD2=$(GOBASE)/$(PROJECTNAME)kvdb-2.trace
-TRACE_LOG_KVBD3=$(GOBASE)/$(PROJECTNAME)kvdb-3.trace
+# Списки всех pid/trace/stderr файлов, собираются из NODES:
+PID_FILES     = $(LOADKV_PID) $(foreach n,$(NODES),$(call pid_file,$(n)))
+TRACE_FILES   = $(foreach n,$(NODES),$(call trace_cm,$(n)) $(call trace_kv,$(n)))
+STDERR_FILES  = $(foreach n,$(NODES),$(call stderr,$(n)))
 
-STD_ERR_RAFT1=$(GOBASE)/$(PROJECTNAME)kv-1.stderr
-STD_ERR_RAFT2=$(GOBASE)/$(PROJECTNAME)kv-2.stderr
-STD_ERR_RAFT3=$(GOBASE)/$(PROJECTNAME)kv-3.stderr
+OUT_LOAD_KV_FILE = $(GOBASE)/$(TRACE)/loadkv.out
 
-HTTP1_PORT=8881
-HTTP2_PORT=8882
-HTTP3_PORT=8883
-
-RAFT1_PORT=9991
-RAFT2_PORT=9992
-RAFT3_PORT=9993
+HTTP_PORTS = 8881 8882 8883
+RAFT_PORTS = 9991 9992 9993
+http_port = $(word $(1),$(HTTP_PORTS))
+raft_port = $(word $(1),$(RAFT_PORTS))
 
 TEMP_FILE=$(shell mktemp)
-MAIN_GO=./$(CMD_SERVER)/main.go
+MAIN_GO=./$(GOCMD)/main.go
 
-# Test related variables.
-# PKG ограничивает набор пакетов, TESTFLAGS — дополнительные флаги go test.
-# Пример: make test PKG=./pkg/raft TESTFLAGS="-run TestElection -count=1"
 PKG?=./...
 TESTFLAGS?=
+RACE_PKGS := . ./pkg/...
 LINTFLAGS?=
 
 # Make is verbose in Linux. Make it silent.
@@ -70,31 +66,35 @@ start: start-raft
 stop: stop-raft
 
 start-raft: stop-raft
-	@echo "  >  $(PROJECTNAME) is available at $(HTTP1_PORT)"
-	@-$(GOBIN)/$(PROJECTNAME)kv -number 1 -http-addr=":$(HTTP1_PORT)" -rpc-addr=":$(RAFT1_PORT)" -peers="2=:$(RAFT2_PORT),3=:$(RAFT3_PORT)" -trace-log-level 10 --trace-cm-log-file "$(TRACE_LOG_RAFT1)" --trace-kv-log-file "$(TRACE_LOG_KVBD1)" 2>"$(STD_ERR_RAFT1)" & echo $$! > $(PID_RAFT1)
-	@cat $(PID_RAFT1) | sed "/^/s/^/  \>  PID1: /"
-	@echo "  >  $(PROJECTNAME) is available at $(HTTP2_PORT)"
-	@-$(GOBIN)/$(PROJECTNAME)kv -number 2 -http-addr=":$(HTTP2_PORT)" -rpc-addr=":$(RAFT2_PORT)" -peers="1=:$(RAFT1_PORT),3=:$(RAFT3_PORT)" -trace-log-level 10 --trace-cm-log-file "$(TRACE_LOG_RAFT2)" --trace-kv-log-file "$(TRACE_LOG_KVBD2)" 2>"$(STD_ERR_RAFT2)" & echo $$! > $(PID_RAFT2)
-	@cat $(PID_RAFT2) | sed "/^/s/^/  \>  PID2: /"
-	@echo "  >  $(PROJECTNAME) is available at $(HTTP3_PORT)"
-	@-$(GOBIN)/$(PROJECTNAME)kv -number 3 -http-addr=":$(HTTP3_PORT)" -rpc-addr=":$(RAFT3_PORT)" -peers="1=:$(RAFT1_PORT),2=:$(RAFT2_PORT)" -trace-log-level 10 --trace-cm-log-file "$(TRACE_LOG_KVBD3)" --trace-kv-log-file "$(TRACE_LOG_RAFT3)" 2>"$(STD_ERR_RAFT3)" & echo $$! > $(PID_RAFT3)
-	@cat $(PID_RAFT3) | sed "/^/s/^/  \>  PID3: /"
-	@-$(GOBIN)/loadkv -get-percent 75 -peers ":$(HTTP1_PORT),:$(HTTP2_PORT),:$(HTTP3_PORT)" -request-rate 1000 > ./loadkv-1.out 2>&1  & echo $$! > $(PID_LOADKV)
-	@cat $(PID_RAFT3) | sed "/^/s/^/  \>  PID3: /"
+	@for n in $(NODES); do \
+		http=$$(printf '888%s' $$n); \
+		rpc=$$(printf '999%s' $$n); \
+		peers=$$(for p in $(NODES); do \
+			[ $$p = $$n ] || printf '%s=:999%s,' $$p $$p; done | sed 's/,$$//'); \
+		echo "  >  $(PROJECTNAME) is available at $$http"; \
+		$(GOBIN)/$(PROJECTNAME)kv -number $$n \
+			-http-addr=":$$http" -rpc-addr=":$$rpc" -peers="$$peers" \
+			-trace-log-level $(TRACE_LOG_LEVEL) \
+			--trace-cm-log-file "$(call trace_cm,$$n)" \
+			--trace-kv-log-file "$(call trace_kv,$$n)" \
+			1>"$(call stdout,$$n)" 2>"$(call stderr,$$n)" & \
+		echo $$! > $(call pid_file,$$n); \
+		sed "/^/s/^/  \>  PID$$n: /" $(call pid_file,$$n); \
+	done
+	@sleep 2
+	@$(GOBIN)/loadkv -get-percent 75 \
+		-peers ":8881,:8882,:8883" -request-rate 1000 \
+		> $(OUT_LOAD_KV_FILE) 2>&1 & echo $$! > $(PID_LOADKV)
+	@sed "/^/s/^/  \>  PID4: /" $(PID_LOADKV)
 
 stop-raft:
 	@-touch $(PID_LOADKV)
 	@-kill `cat $(PID_LOADKV)` 2> /dev/null || true
 	@-rm $(PID_LOADKV)
-	@-touch $(PID_RAFT3)
-	@-kill `cat $(PID_RAFT3)` 2> /dev/null || true
-	@-rm $(PID_RAFT3)
-	@-touch $(PID_RAFT2)
-	@-kill `cat $(PID_RAFT2)` 2> /dev/null || true
-	@-rm $(PID_RAFT2)
-	@-touch $(PID_RAFT1)
-	@-kill `cat $(PID_RAFT1)` 2> /dev/null || true
-	@-rm $(PID_RAFT1)
+	@sleep 3
+	@for f in $(PID_FILES); do \
+		touch $$f; kill `cat $$f` 2> /dev/null || true; rm $$f; \
+	done
 
 restart-raft: stop-raft start-raft
 
@@ -103,51 +103,52 @@ build: go-build-raft
 
 ## clean: Clean build files. Runs `go clean` internally.
 clean: go-clean
-	@-rm -rf ./loadkv-1.out 2> /dev/null || true
-	@-rm -rf ./data
-	@-touch "$(STD_ERR_RAFT3)"
-	@-rm "$(STD_ERR_RAFT3)"
-	@-touch "$(STD_ERR_RAFT2)"
-	@-rm "$(STD_ERR_RAFT2)"
-	@-touch "$(STD_ERR_RAFT1)"
-	@-rm "$(STD_ERR_RAFT1)"
-	@-touch "$(TRACE_LOG_KVBD3)"
-	@-rm "$(TRACE_LOG_KVBD3)"
-	@-touch "$(TRACE_LOG_KVBD2)"
-	@-rm "$(TRACE_LOG_KVBD2)"
-	@-touch "$(TRACE_LOG_KVBD1)"
-	@-rm "$(TRACE_LOG_KVBD1)"
-	@-touch "$(TRACE_LOG_RAFT3)"
-	@-rm "$(TRACE_LOG_RAFT3)"
-	@-touch "$(TRACE_LOG_RAFT2)"
-	@-rm "$(TRACE_LOG_RAFT2)"
-	@-touch "$(TRACE_LOG_RAFT1)"
-	@-rm "$(TRACE_LOG_RAFT1)"
-	@-rm $(GOBIN)/loadkv 2> /dev/null || true
-	@-rm $(GOBIN)/$(PROJECTNAME)kv 2> /dev/null || true
-	@-go clean -testcache
+	@echo "  >  Clean trace files..."
+	@rm -f $(OUT_LOAD_KV_FILE) \
+		$(wildcard $(GOBASE)/$(TRACE)/$(PROJECTNAME)cm-*.trace) \
+		$(wildcard $(GOBASE)/$(TRACE)/$(PROJECTNAME)kv-*.trace) \
+		$(wildcard $(GOBASE)/$(TRACE)/$(PROJECTNAME)kv-*.stderr) \
+		$(wildcard $(GOBASE)/$(TRACE)/$(PROJECTNAME)kv-*.stdout) \
+		$(STDERR)
+	@rm -f $(PID_FILES)
+	@echo "  >  Clean data files..."
+	@rm -rf ./data
+	@echo "  >  Clean build files..."
+	@rm -f $(GOBIN)/loadkv $(GOBIN)/$(PROJECTNAME)kv
+	@go clean -testcache
 
 go-compile: go-build-raft
 
 go-build-raft:
 	@echo "  >  Building $(PROJECTNAME)kv binary..."
-	@cd $(CMD_SERVER) && go build -o $(GOBIN)/$(PROJECTNAME)kv $(GOFILES)
+	@cd $(GOCMD) && go build -o $(GOBIN)/$(PROJECTNAME)kv .
 	@echo "  >  Building loadkv binary..."
-	@cd $(CMD_SERVER)/load && go build -o $(GOBIN)/loadkv $(GOFILES)
+	@cd $(GOCMD)/load && go build -o $(GOBIN)/loadkv .
 
-# 1. Generate the list of packages to include, excluding 'mocks'
-# go list ./... lists all packages; grep -v excludes lines containing 'mocks'
 go-coverage:
-	CVPKG=$(go list ./... | grep -v '/mocks' | tr '\n' ',')
+	@echo "  >  Generate the list of packages to include..."
+	# 1. Generate the list of packages to include, excluding 'mocks'
+	# go list ./... lists all packages; grep -v excludes lines containing 'mocks'
+	CVPKG=$(go list ./... | grep -v -e '/part\|/cmd' | tr '\n' ',')
 	# 2. Run tests with coverage analysis applied only to the specified packages
-	# @GOPATH=$(GOPATH) GOBIN=$(GOBIN) go test -coverpkg=$(CVPKG) -coverprofile=coverage.out ./...
-	@go test -coverprofile=coverage.out ./...
-	# 3. (Optional) Generate the HTML report
+	@echo "  >  Run tests with coverage analysis..."
+	@go test -coverprofile=coverage.out . ./pkg
+	# 3. Generate the HTML report
+	@echo "  >  Generate the HTML report."
 	@go tool cover -html=coverage.out -o docs/coverage.html
 
-go-test:
-	@echo "  >  Running tests: pkg/raft $(TESTFLAGS)"
-	@go test $(TESTFLAGS) ./pkg/raft
+verify-imports:
+	@if grep -rn --include='*.go' -e 'vskurikhin/raft/pkg/raft"' \
+		--exclude-dir=part1 --exclude-dir=part2 --exclude-dir=part3 \
+		--exclude-dir=part4kv --exclude-dir=part5kv --exclude-dir=vendor \
+		--exclude-dir=.doc --exclude-dir=.ai . ; then \
+		echo "found imports of removed path vskurikhin/raft/pkg/raft" >&2; \
+		exit 1; \
+	fi
+
+go-test: verify-imports
+	@echo "  >  Running tests: . $(TESTFLAGS)"
+	@go test $(TESTFLAGS) .
 	@echo "  >  Running tests: pkg/raft/tracetest/... $(TESTFLAGS)"
 	@go test $(TESTFLAGS) ./pkg/raft/tracetest/...
 	@echo "  >  Running tests: pkg/kvservice/... $(TESTFLAGS)"
@@ -155,9 +156,16 @@ go-test:
 	@echo "  >  Running tests: pkg $(TESTFLAGS)"
 	@go test $(TESTFLAGS) ./pkg
 
-go-test-race:
-	@echo "  >  Running tests with -race: ./pkg/... $(TESTFLAGS)"
-	@go test -race $(TESTFLAGS) ./pkg/...
+verify-race-scope:
+	@ROOT_PKG=$$(go list -m); \
+	go list $(RACE_PKGS) | grep -qx "$$ROOT_PKG" || { \
+		echo "race scope lost root raft package: $$ROOT_PKG not in $(RACE_PKGS)" >&2; \
+		exit 1; \
+	}
+
+go-test-race: verify-race-scope
+	@echo "  >  Running tests with -race: $(RACE_PKGS) $(TESTFLAGS)"
+	@go test -race $(TESTFLAGS) $(RACE_PKGS)
 
 go-lint:
 	@echo "  >  Running golangci-lint: $(PKG) $(LINTFLAGS)"
@@ -179,13 +187,13 @@ ifneq (,$(wildcard vendor))
 endif
 
 go-install:
-	go install $(GOFILES)
+	go install ./cmd/...
 
 go-clean:
 	@echo "  >  Cleaning build cache"
 	@go clean
 
-.PHONY: test test-race lint go-test go-test-race go-lint
+.PHONY: test test-race lint go-test go-test-race go-lint verify-imports verify-race-scope
 
 .PHONY: help
 all: help

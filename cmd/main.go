@@ -9,10 +9,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/vskurikhin/raft"
 	"github.com/vskurikhin/raft/internal/_init"
 	"github.com/vskurikhin/raft/internal/config"
 	"github.com/vskurikhin/raft/pkg/kvservice"
-	"github.com/vskurikhin/raft/pkg/raft"
 )
 
 const (
@@ -43,7 +43,7 @@ var wg sync.WaitGroup
 // runWith создаёт и запускает узел с заданными параметрами values и
 // возвращает stop-функцию для корректного завершения узла
 // (CM.Stop → HTTP shutdown). Позволяет тестам управлять полным
-// lifecycle узла без глобальных run-инстансов.
+// жизненный цикл узла без глобальных экземпляров запуска.
 func runWith(values *config.Values) (func(), error) {
 	nums := slices.Collect(maps.Keys(values.Peers))
 	ready := make(chan any)
@@ -53,9 +53,9 @@ func runWith(values *config.Values) (func(), error) {
 		dataDir = filepath.Join("data", fmt.Sprintf("node-%d", values.Number))
 	}
 
-	// Durable-хранилище снапшотов: log compaction усекает durable-лог,
-	// поэтому снапшот обязан переживать рестарт процесса. retain=2 —
-	// запас на случай повреждения последнего снапшота.
+	// Постоянное хранилище снимков: сжатие усекает журнал на диске,
+	// поэтому снимок обязан переживать рестарт процесса. retain=2 —
+	// запас на случай повреждения последнего снимка.
 	snapshotStore, err := raft.NewFileSnapshotStore(dataDir, 2)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create file snapshot store in %s: %w", dataDir, err)

@@ -10,13 +10,13 @@ import (
 func checkDataStoreSnapshotRestore(t *testing.T, ds *DataStore) {
 	t.Helper()
 
-	// Создаём снэпшот (сериализованные байты).
+	// Создаём снимок (сериализованные байты).
 	data, err := ds.Snapshot()
 	if err != nil {
 		t.Fatalf("Snapshot failed: %v", err)
 	}
 
-	// Восстанавливаем новый DataStore из снэпшота.
+	// Восстанавливаем новый DataStore из снимка.
 	ds2 := NewDataStore()
 	if err := ds2.Restore(data); err != nil {
 		t.Fatalf("Restore failed: %v", err)

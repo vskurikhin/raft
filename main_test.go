@@ -1,4 +1,4 @@
-package kvservice
+package raft
 
 import (
 	"os"
@@ -8,7 +8,7 @@ import (
 // TestMain выполняет единственную статическую конфигурацию.
 func TestMain(m *testing.M) {
 	if err := SetTrace(TraceConfig{Level: 1}); err != nil {
-		_, _ = os.Stderr.WriteString("kvservice: trace configuration failed: " + err.Error() + "\n")
+		_, _ = os.Stderr.WriteString("raft: trace configuration failed: " + err.Error() + "\n")
 		os.Exit(1)
 	}
 	os.Exit(m.Run())

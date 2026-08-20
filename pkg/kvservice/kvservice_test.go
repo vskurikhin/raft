@@ -4,7 +4,7 @@ import (
 	"net"
 	"testing"
 
-	"github.com/vskurikhin/raft/pkg/raft"
+	"github.com/vskurikhin/raft"
 )
 
 func TestConfig(t *testing.T) {

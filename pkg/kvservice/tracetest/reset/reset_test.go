@@ -1,6 +1,6 @@
 // Package reset_test — test-бинарник контракта трассировки
 // pkg/kvservice: сценарий вывода по умолчанию (stderr-путь). Один
-// бинарник на один сценарий конфигурации (ADR-004, NEW-14);
+// бинарник на один сценарий конфигурации;
 // симметрично pkg/raft/tracetest/reset. Бинарник конфигурируется
 // пустым LogFile однократно с самого начала — единственная успешная
 // конфигурация процесса; reset-through-re-set запрещён строгим
@@ -17,8 +17,8 @@ import (
 	"time"
 
 	"github.com/fortytw2/leaktest"
+	"github.com/vskurikhin/raft"
 	"github.com/vskurikhin/raft/pkg/kvservice"
-	"github.com/vskurikhin/raft/pkg/raft"
 )
 
 // buf — синхронизированный приёмник стандартного логгера: запись

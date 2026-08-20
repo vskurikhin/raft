@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/fortytw2/leaktest"
-	"github.com/vskurikhin/raft/pkg/raft"
+	"github.com/vskurikhin/raft"
 )
 
 func TestSetupHarness(t *testing.T) {
@@ -184,7 +184,7 @@ func Test5ServerConcurrentClientsPutsAndGets(t *testing.T) {
 }
 
 // runConcurrentPutsAndGets выполняет две фазы параллельных запросов
-// (PUT, затем GET) по паттерну ADR-008/TASK-007:
+// (PUT, затем GET) по паттерну:
 // start → work → error propagation (errCh) → Wait → assertions.
 //
 // Worker-горутины используют Try*-хелперы и НЕ обращаются к *testing.T;
@@ -282,7 +282,7 @@ func TestDisconnectLeaderAfterPuts(t *testing.T) {
 	// к единственному лидеру. Прежняя схема (реконнект + sleepMs(200)
 	// с комментарием «утечка одной горутины не критична») допускала
 	// утечку; теперь h.Shutdown() в defer полностью останавливает все
-	// сервисы, поэтому непогашенных горутин не остаётся (FINDING-20).
+	// сервисы, поэтому непогашенных горутин не остаётся.
 	h.ReconnectServiceToPeers(lid)
 	h.WaitForSingleLeader(3 * time.Second)
 }
@@ -431,8 +431,8 @@ func TestCrashThenRestartLeader(t *testing.T) {
 	}
 }
 
-// TestRestartServiceGetsNewPort — регрессионный тест ADR-012/TASK-008
-// (SA-010): сервис слушает на ":0", поэтому после рестарта он получает
+// TestRestartServiceGetsNewPort — регрессионный тест
+// сервис слушает на ":0", поэтому после рестарта он получает
 // НОВЫЙ порт. Харнесс обязан обновить kvServiceAddrs; перезапущенный
 // сервис обязан отвечать по новому адресу, а клиенты, пересозданные
 // после рестарта, — успешно выполнять put/get.

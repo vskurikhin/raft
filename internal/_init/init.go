@@ -3,9 +3,9 @@ package _init
 import (
 	"log"
 
+	"github.com/vskurikhin/raft"
 	"github.com/vskurikhin/raft/internal/config"
 	"github.com/vskurikhin/raft/pkg/kvservice"
-	"github.com/vskurikhin/raft/pkg/raft"
 )
 
 var Values config.Values

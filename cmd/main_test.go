@@ -5,8 +5,8 @@ import (
 	"testing"
 
 	"github.com/fortytw2/leaktest"
+	"github.com/vskurikhin/raft"
 	"github.com/vskurikhin/raft/internal/config"
-	"github.com/vskurikhin/raft/pkg/raft"
 )
 
 // TestRunWithEmptyPeers запускает узел без соседей через runWith и
@@ -27,7 +27,7 @@ func TestRunWithEmptyPeers(t *testing.T) {
 }
 
 // TestRunWithPeerConnect запускает узел, подключённый к peer-серверу.
-// CommitChannelFSM peer'а имеет reader-горутину (контракт raft.FSM:
+// CommitChannelFSM соседа имеет reader-горутину (контракт raft.FSM:
 // канал всегда имеет читателя при живом узле); порядок cleanup:
 // peer.Shutdown (producers завершены) → close(commitChannel) →
 // join reader.

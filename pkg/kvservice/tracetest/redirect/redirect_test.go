@@ -1,6 +1,6 @@
 // Package redirect_test — test-бинарник контракта трассировки
 // pkg/kvservice: сценарий перенаправления в файл. Один бинарник на один
-// сценарий конфигурации (ADR-004, NEW-14); симметрично
+// сценарий конфигурации; симметрично
 // pkg/raft/tracetest/redirect. Строгий set-once: ровно один успешный
 // вызов SetTrace на процесс; любой повторный вызов — ошибка
 // контракта. Эмиттер трассировки — kvs.ServeHTTP.
@@ -14,8 +14,8 @@ import (
 	"time"
 
 	"github.com/fortytw2/leaktest"
+	"github.com/vskurikhin/raft"
 	"github.com/vskurikhin/raft/pkg/kvservice"
-	"github.com/vskurikhin/raft/pkg/raft"
 )
 
 // traceLevel — порог трассировки бинарника. Задаётся явно: эмиттер

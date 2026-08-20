@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	Workers        = 5
+	Workers        = 4
 	RequestTimeout = 10 * time.Second
 )
 
@@ -63,7 +63,7 @@ func main() {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	var wg sync.WaitGroup
-	for i := 0; i < Workers; i++ {
+	for i := range Workers {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()

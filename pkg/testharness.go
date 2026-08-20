@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/vskurikhin/raft"
 	"github.com/vskurikhin/raft/pkg/kvclient"
 	"github.com/vskurikhin/raft/pkg/kvservice"
-	"github.com/vskurikhin/raft/pkg/raft"
 )
 
 func init() {
@@ -23,11 +23,11 @@ func init() {
 
 // Harness Тестовый стенд для системного тестирования kvservice и клиента.
 //
-// Владение состоянием (ADR-012, TASK-008): kvServiceAddrs, connected и
+// Владение состоянием: kvServiceAddrs, connected и
 // alive защищены h.mu — адреса сервисов меняются при рестарте на :0
 // (новый порт), поэтому читатели обязаны брать их под блокировкой.
 // Инвариант границ: h.mu не удерживается через блокирующие
-// lifecycle-операции (Shutdown сервисов, ConnectToRaftPeer).
+// операции жизненного цикла (Shutdown сервисов, ConnectToRaftPeer).
 type Harness struct {
 	mu sync.Mutex
 
@@ -98,7 +98,7 @@ func NewHarness(t *testing.T, n int) *Harness {
 
 	// Каждый экземпляр KVService обслуживает REST API на своём TCP-порту.
 	// Порт назначает ядро (":0"): фиксированные порты приводили к конфликтам
-	// при параллельном запуске тестовых процессов (ADR-012).
+	// при параллельном запуске тестовых процессов.
 	kvServiceAddrs := make([]string, n)
 	for i := range n {
 		if err := kvss[i].ServeHTTP(":0"); err != nil {
@@ -154,7 +154,7 @@ func (h *Harness) ReconnectServiceToPeers(id int) {
 	h.mu.Unlock()
 }
 
-// clientAddr переводит фактический адрес listener'а сервиса
+// clientAddr переводит фактический адрес слушателя сервиса
 // (":0" даёт вид "[::]:PORT" — wildcard, непригодный для набора)
 // в адрес "localhost:PORT", по которому обращаются тестовые клиенты.
 func clientAddr(t *testing.T, kvs *kvservice.KVService) string {
@@ -192,7 +192,7 @@ func (h *Harness) connectedSnapshot() []bool {
 
 // aliveAddrs возвращает копию адресов работающих сервисов, снятую под
 // h.mu. Копия обязательна: срез h.kvServiceAddrs обновляется при
-// рестарте сервиса на новом порту (ADR-012).
+// рестарте сервиса на новом порту.
 func (h *Harness) aliveAddrs() []string {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -237,7 +237,7 @@ func (h *Harness) RestartService(id int) {
 	h.kvCluster[id] = kvservice.NewKVService(":0", id, peerIds, h.storage[id], ready)
 	// Рестарт на ":0" даёт НОВЫЙ порт: адрес сервиса обязан быть обновлён,
 	// иначе клиенты, собранные из kvServiceAddrs, обращались бы к порту
-	// прежней инкарнации (ADR-012).
+	// прежней инкарнации.
 	if err := h.kvCluster[id].ServeHTTP(":0"); err != nil {
 		h.t.Fatalf("ServeHTTP for restarted service %d: %v", id, err)
 	}
@@ -304,7 +304,7 @@ func (h *Harness) NewClientWithRandomAddrsOrder() *kvclient.KVClient {
 	addrs := h.aliveAddrs()
 	// keep: легитимная рандомизация порядка адресов — предмет теста
 	// (клиент обязан находить лидера при любом порядке). Инъекция
-	// детерминированного RNG отклонена ADR-006.
+	// детерминированного RNG отклонена.
 	rand.Shuffle(len(addrs), func(i, j int) {
 		addrs[i], addrs[j] = addrs[j], addrs[i]
 	})
@@ -317,7 +317,7 @@ func (h *Harness) NewClientWithRandomAddrsOrder() *kvclient.KVClient {
 // повторные попытки.
 func (h *Harness) NewClientSingleService(id int) *kvclient.KVClient {
 	// Копия, а не срез поверх общего массива: aliasing позволял клиенту
-	// увидеть адрес другой инкарнации после RestartService (ADR-012).
+	// увидеть адрес другой инкарнации после RestartService.
 	h.mu.Lock()
 	addrs := []string{h.kvServiceAddrs[id]}
 	h.mu.Unlock()
@@ -361,7 +361,7 @@ func (h *Harness) CheckSingleLeader() int {
 	return -1
 }
 
-// Try*/Check* — две формы одних и тех же проверок (ADR-008, TASK-007).
+// Try*/Check* — две формы одних и тех же проверок.
 //
 // Try*-варианты возвращают ошибку и НЕ обращаются к *testing.T: только
 // они допустимы внутри worker-горутин (t.Error*/t.Fatal* из горутины
@@ -425,7 +425,7 @@ func (h *Harness) TryGetNotFound(c *kvclient.KVClient, key string) error {
 // Отличие от CheckSingleLeader: окно «два лидера» после переподключения
 // изолированного сервиса не является ошибкой — прежний лидер узнаёт о
 // более высоком term'е только с первым дошедшим AppendEntries, доставка
-// которого откладывается backoff'ом репликации (ADR-P07-006).
+// которого откладывается задержкой повторов репликации.
 // CheckSingleLeader трактует такое состояние как фатальное, поэтому для
 // ожидания схождения используется этот метод.
 func (h *Harness) WaitForSingleLeader(timeout time.Duration) int {
@@ -513,7 +513,7 @@ func (h *Harness) CheckGetTimesOut(c *kvclient.KVClient, key string) {
 		return
 	}
 	// Проверка по фактической цепочке ошибок, а не по подстроке
-	// (TASK-012): kvclient.Get → send → sendJSONRequest →
+	// kvclient.Get → send → sendJSONRequest →
 	// http.Client.Do возвращает *url.Error, оборачивающий
 	// context.DeadlineExceeded, и send возвращает его как есть при
 	// ctx.Err() != nil. Ветка «commit failed; please retry»
