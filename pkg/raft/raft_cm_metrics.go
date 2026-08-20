@@ -177,7 +177,7 @@ func peerSum(m map[int]int64) int64 {
 // ni/mi. Вызывается только из stats под cm.mu.
 func (c *raftCounters) report(ls *leaderState) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "ISsent=%d ISrecv=%d ISstale=%d AErej=%d NIrejIgn=%d BndViol=%d",
+	_, _ = fmt.Fprintf(&b, "ISsent=%d ISrecv=%d ISstale=%d AErej=%d NIrejIgn=%d BndViol=%d",
 		peerSum(c.installSnapshotSent), c.installSnapshotReceived.Load(),
 		peerSum(c.installSnapshotSkippedStale), peerSum(c.appendEntriesRejected),
 		peerSum(c.nextIndexRejectionIgnored), c.snapshotLogBoundaryViolation.Load())
@@ -187,21 +187,7 @@ func (c *raftCounters) report(ls *leaderState) string {
 	}
 	sort.Ints(peers)
 	for _, p := range peers {
-		fmt.Fprintf(&b, " p%d:ni=%d/mi=%d", p, ls.nextIndex[p], ls.matchIndex[p])
+		_, _ = fmt.Fprintf(&b, " p%d:ni=%d/mi=%d", p, ls.nextIndex[p], ls.matchIndex[p])
 	}
 	return b.String()
-}
-
-func Mean(latencies []float64) (result float64) {
-	if n := len(latencies); n > 0 {
-		result = SumFloat(latencies) / float64(n)
-	}
-	return result
-}
-
-func SumFloat(slice []float64) (sum float64) {
-	for _, v := range slice {
-		sum += v
-	}
-	return sum
 }
