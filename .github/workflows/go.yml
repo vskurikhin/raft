@@ -33,6 +33,13 @@ jobs:
       - name: Create empty .env required by Makefile
         run: touch .env
 
+      - name:
+          Debug: where is go.mod
+        run: |
+          pwd
+          ls -la
+          find . -name go.mod
+
       - name: Download dependencies
         run: go mod download
 
