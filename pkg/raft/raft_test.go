@@ -802,8 +802,12 @@ func waitForNewLeaderExcept(t *testing.T, h *Harness, excludedID int, timeout ti
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
+		// Дисциплина владения состоянием Harness (ADR-011): connected
+		// читается снимком под h.mu — одна выборка на итерацию опроса;
+		// Report() опрашивается вне блокировки (граница NEW-02).
+		connected := h.connectedSnapshot()
 		for i := 0; i < h.n; i++ {
-			if i == excludedID || !h.connected[i] {
+			if i == excludedID || !connected[i] {
 				continue
 			}
 			_, term, isLeader := h.cluster[i].Report()

@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -239,55 +240,145 @@ func TestCompactLogs_PendingBatchUnchanged(t *testing.T) {
 
 // TestClusterConvergence_ForcedReelections — интеграционный convergence-тест
 // (INV-1..INV-4 end-to-end): кластер 3 узлов, непрерывная запись при
-// принудительных перевыборах (RAFT_FORCE_MORE_REELECTION), после стабилизации
-// все узлы сходятся к одному состоянию — последняя команда закоммичена на всех.
+// ПОВТОРНЫХ ВЫЗВАННЫХ сменах лидера; после стабилизации все узлы сходятся
+// к одному состоянию.
+//
+// Предмет проверки (ADR-015) — сходимость и безопасность при повторных
+// реальных сменах лидера. Смены вызывает сам тест инъекцией сбоя
+// (DisconnectPeer текущего лидера → выборы → ReconnectPeer), а НЕ хук
+// RAFT_FORCE_MORE_REELECTION. Хук сохранён как стресс-смещение: во время
+// вызванных выборов он убирает рандомизацию election timeout в трети
+// вызовов и повышает вероятность коллизий таймаутов (повторные раунды
+// выборов). Он НЕ является источником смен лидера и НЕ является
+// предметом assert'а этого теста: при живом связном лидере follower не
+// достигает election timeout (heartbeat приходит на порядок чаще), а
+// Pre-Vote запрещает рост терма — смена лидера от хука структурно
+// невозможна (ADR-015 Evidence п.4). Наблюдаемый эффект хука проверяет
+// TestElectionTimeout_ForcedReelectionHook на распределении значений
+// electionTimeout().
 func TestClusterConvergence_ForcedReelections(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
-	// Test-only хук: electionTimeout возвращает ReelectionTimeoutMs в трети
-	// случаев, вызывая частые смены лидера.
+	// Стресс-смещение таймаутов выборов (см. doc выше). t.Setenv делает
+	// тест serial — t.Parallel не используется.
 	t.Setenv("RAFT_FORCE_MORE_REELECTION", "1")
 
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
 
-	const numCmds = 20
+	const (
+		// numCmds — длина потока команд (сохранено из прежней версии теста).
+		numCmds = 20
+		// forcedLeaderChanges — число вызванных тестом смен лидера.
+		forcedLeaderChanges = 2
+	)
+	// cmdsBetweenFailovers — инъекции распределены равными долями потока
+	// команд: forcedLeaderChanges смен делят поток на forcedLeaderChanges+1
+	// участков.
+	const cmdsBetweenFailovers = numCmds / (forcedLeaderChanges + 1)
+
+	observed := make([]leaderObservation, 0, forcedLeaderChanges)
 	for i := 0; i < numCmds; i++ {
-		lid, _ := h.CheckSingleLeader()
-		future := h.cluster[lid].Apply(i, 0)
-		if err := waitFuture(t, future, 10*time.Second); err != nil {
-			t.Fatalf("Apply(%d) завершился с ошибкой: %v", i, err)
+		submitToCurrentLeader(t, h, i)
+
+		if len(observed) < forcedLeaderChanges && (i+1)%cmdsBetweenFailovers == 0 {
+			observed = append(observed, forceLeaderChange(t, h))
 		}
 	}
 
-	// Сходимость: последняя команда присутствует в логе коммитов всех узлов.
-	// Интеграционный тест с реальными таймерами — опрос с дедлайном.
-	err := h.waitFor(
-		fmt.Sprintf("cmd=%d committed on all connected peers", numCmds-1),
-		10*time.Second,
-		func() bool {
-			for i := 0; i < h.n; i++ {
-				if !h.connected[i] {
-					continue
-				}
-				found := false
-				for _, c := range h.commits[i] {
-					if c.Data.(int) == numCmds-1 {
-						found = true
-						break
-					}
-				}
-				if !found {
-					return false
-				}
-			}
-			return true
-		},
-		h.commitsDiag,
-	)
-	if err != nil {
-		t.Fatalf("кластер не сошёлся к команде %d: %v", numCmds-1, err)
+	if len(observed) < forcedLeaderChanges {
+		t.Fatalf(
+			"наблюдалось %d смен лидера, ожидалось >= %d; последовательность: %v",
+			len(observed), forcedLeaderChanges, observed,
+		)
 	}
+
+	// Финальная сходимость — предикат committedOn (равные длины commits у
+	// всех подключённых узлов и одинаковый Index записи). Прежнее ad-hoc
+	// условие «команда присутствует в commits» строго слабее и удалено.
+	h.WaitForCommitAll(numCmds-1, commitBudgetAfterFailover)
+}
+
+// leaderObservation — наблюдённая смена лидера: кто стал лидером и в
+// каком терме. Используется в диагностике assert'а по числу смен.
+type leaderObservation struct {
+	leaderID int
+	term     int
+}
+
+func (o leaderObservation) String() string {
+	return fmt.Sprintf("(leader=%d, term=%d)", o.leaderID, o.term)
+}
+
+// submitBudget — общий дедлайн отправки одной команды с учётом повторов.
+const submitBudget = 3 * commitBudgetAfterFailover
+
+// maxSubmitAttempts — предел числа попыток отправки одной команды
+// (дополнительно к дедлайну submitBudget).
+const maxSubmitAttempts = 8
+
+// submitToCurrentLeader отправляет команду cmd текущему лидеру и ждёт её
+// коммита. Во время вызванной смены лидера Apply может вернуть
+// ErrNotLeader/ErrLeadershipLost — это штатный исход гонки с failover'ом,
+// и команда повторяется на текущем лидере в пределах submitBudget.
+// Ослаблением assert'а повтор не является: итоговая проверка теста —
+// сходимость ВСЕХ подключённых узлов по предикату committedOn, а не
+// успех конкретной попытки. Любая иная ошибка — немедленный t.Fatalf.
+func submitToCurrentLeader(t *testing.T, h *Harness, cmd int) {
+	t.Helper()
+
+	deadline := time.Now().Add(submitBudget)
+	for attempt := 1; ; attempt++ {
+		lid, _ := h.CheckSingleLeader()
+		err := waitFuture(t, h.cluster[lid].Apply(cmd, 0), commitBudgetAfterFailover)
+		if err == nil {
+			return
+		}
+		if !errors.Is(err, ErrNotLeader) && !errors.Is(err, ErrLeadershipLost) {
+			t.Fatalf("Apply(%d) на узле %d завершился с ошибкой: %v", cmd, lid, err)
+		}
+		if attempt >= maxSubmitAttempts || !time.Now().Before(deadline) {
+			t.Fatalf(
+				"Apply(%d) не удалось закоммитить за %d попыток в бюджете %v; последняя ошибка: %v\n  %s",
+				cmd, attempt, submitBudget, err, h.nodeStates(),
+			)
+		}
+	}
+}
+
+// forceLeaderChange вызывает смену лидера инъекцией сбоя и возвращает
+// наблюдённую смену.
+//
+// Инвариант кворума: в кластере из 3 узлов отключение лидера оставляет
+// ровно кворум (2 из 3), поэтому новый лидер избирается. Отключённый
+// старый лидер до реконнекта остаётся «призрачным лидером» в своём терме
+// (CheckQuorum в реализации отсутствует, шага step-down по отсутствию
+// кворума нет) — поэтому в этом окне используется waitForNewLeaderExcept,
+// который смотрит только на подключённые узлы, кроме исключённого, а
+// CheckSingleLeader (падающий при двух лидерах) вызывается ТОЛЬКО после
+// ReconnectPeer и WaitForSingleLeader, когда призрачный лидер уже
+// сложил полномочия.
+func forceLeaderChange(t *testing.T, h *Harness) leaderObservation {
+	t.Helper()
+
+	oldLeader, oldTerm := h.CheckSingleLeader()
+	h.DisconnectPeer(oldLeader)
+
+	newLeader, newTerm := waitForNewLeaderExcept(t, h, oldLeader, leaderElectionBudget)
+	if newLeader == oldLeader {
+		t.Fatalf("смены лидера не произошло: лидером остался узел %d", oldLeader)
+	}
+	if newTerm <= oldTerm {
+		t.Fatalf(
+			"терм не вырос при смене лидера: было (leader=%d, term=%d), стало (leader=%d, term=%d)",
+			oldLeader, oldTerm, newLeader, newTerm,
+		)
+	}
+
+	h.ReconnectPeer(oldLeader)
+	h.WaitForSingleLeader(leaderElectionBudget)
+
+	return leaderObservation{leaderID: newLeader, term: newTerm}
 }
 
 // newAliasTestCM создаёт минимальный ConsensusModule в состоянии follower с

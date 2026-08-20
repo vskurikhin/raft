@@ -22,10 +22,13 @@ type Values struct {
 	Number      int
 	Peers       map[int]net.Addr
 
-	// TraceLogLevel — порог отладочных сообщений (raft.TraceCM, kvservice.TraceKV).
+	// TraceLogLevel — порог отладочных сообщений трассировки; передаётся
+	// в raft.TraceConfig.Level и kvservice.TraceConfig.Level.
 	TraceLogLevel int
-	// TraceLogFile — путь к файлу трассировки; пустая строка — stderr.
-	TraceLogFile string
+	// TraceCMLogFile — путь к файлу трассировки ConsensusModule; пустая строка — stderr.
+	TraceCMLogFile string
+	// TraceKVLogFile — путь к файлу трассировки Key-Value; пустая строка — stderr.
+	TraceKVLogFile string
 	// DataDir — директория для persistent-хранилища узла; пустая строка —
 	// вычисляется путь по умолчанию в cmd/main.go.
 	DataDir string
@@ -37,8 +40,9 @@ func ParseFlags() Values {
 	rpcAddressFlag := fs.String("rpc-addr", ":9990", "RPC server listen address")
 	numberFlag := fs.Int("number", -1, "")
 	peersFlag := fs.String("peers", "", "Comma-separated list of peers servers (id=host:port)")
-	traceLogLevelFlag := fs.Int("trace-log-level", 1, "Trace log level for raft.TraceCM and kvservice.TraceKV")
-	traceLogFileFlag := fs.String("trace-log-file", "", "Trace log file path (empty = stderr)")
+	traceLogLevelFlag := fs.Int("trace-log-level", 1, "Trace log level for the raft and kvservice packages")
+	traceCMLogFileFlag := fs.String("trace-cm-log-file", "", "Trace consensus module log file path (empty = stderr)")
+	traceKVLogFileFlag := fs.String("trace-kv-log-file", "", "Trace key-value database log file path (empty = stderr)")
 	dataDirFlag := fs.String("data-dir", "", "Directory for persistent storage")
 
 	// Test-бинарники пакета cmd передают собственные -test.* флаги;
@@ -65,13 +69,14 @@ func ParseFlags() Values {
 	}
 
 	return Values{
-		HTTPAddress:   httpAddress,
-		RPCAddress:    rpcAddress,
-		Number:        *numberFlag,
-		Peers:         peers,
-		TraceLogLevel: *traceLogLevelFlag,
-		TraceLogFile:  *traceLogFileFlag,
-		DataDir:       *dataDirFlag,
+		HTTPAddress:    httpAddress,
+		RPCAddress:     rpcAddress,
+		Number:         *numberFlag,
+		Peers:          peers,
+		TraceLogLevel:  *traceLogLevelFlag,
+		TraceCMLogFile: *traceCMLogFileFlag,
+		TraceKVLogFile: *traceKVLogFileFlag,
+		DataDir:        *dataDirFlag,
 	}
 }
 

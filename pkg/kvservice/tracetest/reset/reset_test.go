@@ -2,7 +2,7 @@
 // pkg/kvservice: сценарий вывода по умолчанию (stderr-путь). Один
 // бинарник на один сценарий конфигурации (ADR-004, NEW-14);
 // симметрично pkg/raft/tracetest/reset. Бинарник конфигурируется
-// значением "" однократно с самого начала — единственная успешная
+// пустым LogFile однократно с самого начала — единственная успешная
 // конфигурация процесса; reset-through-re-set запрещён строгим
 // set-once. Эмиттер трассировки — kvs.ServeHTTP.
 package reset_test
@@ -25,12 +25,17 @@ import (
 // ведётся из HTTP-горутины через log.Default(), чтение — из теста.
 var buf syncBuffer
 
+// traceLevel — порог трассировки бинарника. Задаётся явно: эмиттер
+// сценария (kvs.ServeHTTP) печатается под гейтом traceKV > 0,
+// а TraceConfig{} означает выключенную трассировку.
+const traceLevel = 1
+
 // TestMain выполняет log.SetOutput ДО конфигурации (безопасно в
 // выделенном бинарнике) и единственную успешную конфигурацию
-// трассировки процесса: SetTraceLogFile("").
+// трассировки процесса: SetTrace с пустым LogFile.
 func TestMain(m *testing.M) {
 	log.SetOutput(&buf)
-	if err := kvservice.SetTraceLogFile(""); err != nil {
+	if err := kvservice.SetTrace(kvservice.TraceConfig{Level: traceLevel}); err != nil {
 		_, _ = os.Stderr.WriteString("kvservice: trace configuration failed: " + err.Error() + "\n")
 		os.Exit(1)
 	}
@@ -42,12 +47,12 @@ func TestTraceReset(t *testing.T) {
 	t.Cleanup(leaktest.CheckTimeout(t, raft.LeaktestBudget))
 
 	// Строгий set-once: повторный вызов — ошибка контракта.
-	if err := kvservice.SetTraceLogFile(""); err == nil {
-		t.Fatal("SetTraceLogFile: want contract error, got nil")
+	if err := kvservice.SetTrace(kvservice.TraceConfig{Level: traceLevel}); err == nil {
+		t.Fatal("SetTrace: want contract error, got nil")
 	}
 
 	// Создаём сервис; эмиттер — kvs.ServeHTTP; запись идёт в
-	// стандартный логгер (путь конфигурации ""), файл трассировки
+	// стандартный логгер (пустой LogFile), файл трассировки
 	// не создаётся.
 	kvs := newTestService(t)
 	if err := kvs.ServeHTTP(":0"); err != nil {

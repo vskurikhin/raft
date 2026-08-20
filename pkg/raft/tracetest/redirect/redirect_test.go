@@ -3,7 +3,7 @@
 // конфигурации (ADR-004, NEW-14): окно конфигурации процессное и
 // необратимое, сценарии redirect и reset взаимоисключащи в одном
 // процессе. Строгий set-once: ровно один успешный вызов
-// SetTraceLogFile на процесс; любой повторный вызов — ошибка контракта.
+// SetTrace на процесс; любой повторный вызов — ошибка контракта.
 package redirect_test
 
 import (
@@ -16,6 +16,11 @@ import (
 	"github.com/vskurikhin/raft/pkg/raft"
 )
 
+// traceLevel — порог трассировки бинарника. Задаётся явно: эмиттер
+// сценария (cm.Stop) печатает на уровне 0 и виден только при Level > 0,
+// а TraceConfig{} означает выключенную трассировку.
+const traceLevel = 1
+
 func TestTraceRedirect(t *testing.T) {
 	// Порядок cleanup (LIFO): остановка CM → проверка leaktest.
 	t.Cleanup(leaktest.CheckTimeout(t, raft.LeaktestBudget))
@@ -26,9 +31,9 @@ func TestTraceRedirect(t *testing.T) {
 	// прогоном процесса (процессный и необратимый контракт) — полный
 	// сценарий выполняется один раз на процесс.
 	bad := filepath.Join(t.TempDir(), "no-such-dir", "trace.log")
-	err := raft.SetTraceLogFile(bad)
+	err := raft.SetTrace(raft.TraceConfig{Level: traceLevel, LogFile: bad})
 	if err == nil {
-		t.Fatalf("SetTraceLogFile(%q): want error, got nil", bad)
+		t.Fatalf("SetTrace(%q): want error, got nil", bad)
 	}
 	if strings.Contains(err.Error(), "exactly once") {
 		t.Skip("trace configuration window consumed by a previous run")
@@ -38,13 +43,13 @@ func TestTraceRedirect(t *testing.T) {
 	// путём обязан быть успешным и является ЕДИНСТВЕННОЙ успешной
 	// конфигурацией процесса.
 	path := filepath.Join(t.TempDir(), "raft-trace.log")
-	if err := raft.SetTraceLogFile(path); err != nil {
-		t.Fatalf("SetTraceLogFile: %v", err)
+	if err := raft.SetTrace(raft.TraceConfig{Level: traceLevel, LogFile: path}); err != nil {
+		t.Fatalf("SetTrace: %v", err)
 	}
 
 	// Строгий set-once: повторный вызов ДО создания CM — ошибка контракта.
-	if err := raft.SetTraceLogFile(path); err == nil {
-		t.Fatal("SetTraceLogFile: want contract error before CM creation, got nil")
+	if err := raft.SetTrace(raft.TraceConfig{Level: traceLevel, LogFile: path}); err == nil {
+		t.Fatal("SetTrace: want contract error before CM creation, got nil")
 	}
 
 	// Создаём CM (InmemTransport + MapStorage, без кластера).
@@ -69,8 +74,14 @@ func TestTraceRedirect(t *testing.T) {
 	})
 
 	// Эмиттер трассировки — cm.Stop() (traceLogf(0, "CM.Stop called /
-	// becomes Dead"), печатается при TraceCM=1 > 0): после Stop файл
+	// becomes Dead"), печатается при traceCM=1 > 0): после Stop файл
 	// не пуст.
+	//
+	// Эта же проверка закрывает требование «ошибка I/O не изменила
+	// состояние трассировки»: неуспешный вызов выше не израсходовал окно
+	// (иначе успешная конфигурация вернула бы ошибку контракта) и не
+	// оставил порог непригодным для печати уровня 0 (иначе файл был бы
+	// пуст).
 	cm.Stop()
 
 	data, err := os.ReadFile(path)
@@ -82,7 +93,7 @@ func TestTraceRedirect(t *testing.T) {
 	}
 
 	// fail-fast: повторный вызов ПОСЛЕ создания CM — ошибка контракта.
-	if err := raft.SetTraceLogFile(path); err == nil {
-		t.Fatal("SetTraceLogFile: want contract error after CM creation, got nil")
+	if err := raft.SetTrace(raft.TraceConfig{Level: traceLevel, LogFile: path}); err == nil {
+		t.Fatal("SetTrace: want contract error after CM creation, got nil")
 	}
 }

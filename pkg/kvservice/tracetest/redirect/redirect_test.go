@@ -2,7 +2,7 @@
 // pkg/kvservice: сценарий перенаправления в файл. Один бинарник на один
 // сценарий конфигурации (ADR-004, NEW-14); симметрично
 // pkg/raft/tracetest/redirect. Строгий set-once: ровно один успешный
-// вызов SetTraceLogFile на процесс; любой повторный вызов — ошибка
+// вызов SetTrace на процесс; любой повторный вызов — ошибка
 // контракта. Эмиттер трассировки — kvs.ServeHTTP.
 package redirect_test
 
@@ -18,6 +18,11 @@ import (
 	"github.com/vskurikhin/raft/pkg/raft"
 )
 
+// traceLevel — порог трассировки бинарника. Задаётся явно: эмиттер
+// сценария (kvs.ServeHTTP) печатается под гейтом traceKV > 0,
+// а TraceConfig{} означает выключенную трассировку.
+const traceLevel = 1
+
 func TestTraceRedirect(t *testing.T) {
 	// Порядок cleanup (LIFO): остановка сервиса → проверка leaktest.
 	t.Cleanup(leaktest.CheckTimeout(t, raft.LeaktestBudget))
@@ -28,9 +33,9 @@ func TestTraceRedirect(t *testing.T) {
 	// прогоном процесса (процессный и необратимый контракт) — полный
 	// сценарий выполняется один раз на процесс.
 	bad := filepath.Join(t.TempDir(), "no-such-dir", "trace.log")
-	err := kvservice.SetTraceLogFile(bad)
+	err := kvservice.SetTrace(kvservice.TraceConfig{Level: traceLevel, LogFile: bad})
 	if err == nil {
-		t.Fatalf("SetTraceLogFile(%q): want error, got nil", bad)
+		t.Fatalf("SetTrace(%q): want error, got nil", bad)
 	}
 	if strings.Contains(err.Error(), "exactly once") {
 		t.Skip("trace configuration window consumed by a previous run")
@@ -40,13 +45,24 @@ func TestTraceRedirect(t *testing.T) {
 	// путём обязан быть успешным и является ЕДИНСТВЕННОЙ успешной
 	// конфигурацией процесса.
 	path := filepath.Join(t.TempDir(), "kv-trace.log")
-	if err := kvservice.SetTraceLogFile(path); err != nil {
-		t.Fatalf("SetTraceLogFile: %v", err)
+	if err := kvservice.SetTrace(kvservice.TraceConfig{Level: traceLevel, LogFile: path}); err != nil {
+		t.Fatalf("SetTrace: %v", err)
 	}
 
 	// Строгий set-once: повторный вызов ДО создания сервиса — ошибка контракта.
-	if err := kvservice.SetTraceLogFile(path); err == nil {
-		t.Fatal("SetTraceLogFile: want contract error before service creation, got nil")
+	contractErr := kvservice.SetTrace(kvservice.TraceConfig{Level: traceLevel, LogFile: path})
+	if contractErr == nil {
+		t.Fatal("SetTrace: want contract error before service creation, got nil")
+	}
+
+	// Ошибка контракта формулируется в терминологии СВОЕГО пакета:
+	// kvservice/KVService, а не ConsensusModule (регрессия на копипасту
+	// текста ошибки из pkg/raft).
+	if !strings.Contains(contractErr.Error(), "kvservice") {
+		t.Errorf("contract error %q does not mention kvservice", contractErr)
+	}
+	if strings.Contains(contractErr.Error(), "ConsensusModule") {
+		t.Errorf("contract error %q mentions ConsensusModule of another package", contractErr)
 	}
 
 	// Создаём KVService; сторожевой флаг traceCMCreated поднимается
@@ -54,7 +70,7 @@ func TestTraceRedirect(t *testing.T) {
 	kvs := newTestService(t)
 
 	// Эмиттер трассировки — kvs.ServeHTTP (traceLogf("serving HTTP on %s"),
-	// печатается при TraceKV=1 > 0): после запуска файл не пуст.
+	// печатается при traceKV=1 > 0): после запуска файл не пуст.
 	if err := kvs.ServeHTTP(":0"); err != nil {
 		t.Fatalf("ServeHTTP: %v", err)
 	}
@@ -73,8 +89,8 @@ func TestTraceRedirect(t *testing.T) {
 	}
 
 	// fail-fast: повторный вызов ПОСЛЕ создания сервиса — ошибка контракта.
-	if err := kvservice.SetTraceLogFile(path); err == nil {
-		t.Fatal("SetTraceLogFile: want contract error after service creation, got nil")
+	if err := kvservice.SetTrace(kvservice.TraceConfig{Level: traceLevel, LogFile: path}); err == nil {
+		t.Fatal("SetTrace: want contract error after service creation, got nil")
 	}
 }
 

@@ -415,7 +415,7 @@ func (cm *ConsensusModule) leaderSendSnapshot(peerID, term int) {
 // (ADR-P07-008 п.3): печатается фактически присвоенное значение
 // nextIndex (ранее ошибочно печаталось ni-1), а также matchIndex и поля
 // конфликта ответа — ровно тот набор, которого не хватило при разборе
-// обоих инцидентов. Выделена в чистую функцию: мутация TraceCM и
+// обоих инцидентов. Выделена в чистую функцию: мутация traceCM и
 // _traceLogger в тестах запрещена (ADR-P06-005), формат проверяется
 // unit-тестом функции.
 func failedAETrace(peerID, nextIndex, matchIndex, conflictIndex, conflictTerm int) string {

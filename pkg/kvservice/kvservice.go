@@ -19,24 +19,20 @@ import (
 	"github.com/vskurikhin/raft/pkg/raft"
 )
 
-// TraceKV — порог детализации отладочных сообщений KV-сервиса (traceLogf).
-// Сообщение выводится, если TraceKV > 0. Значение задаётся флагом
-// --trace-log-level командной строки, по умолчанию 1.
-var TraceKV = 1
+// traceKV — порог детализации отладочных сообщений KV-сервиса (traceLogf).
+// Сообщение выводится, если traceKV > 0. Значение задаётся полем
+// TraceConfig.Level единственного успешного вызова SetTrace, по
+// умолчанию 1. Изменяется только до старта горутин.
+var traceKV = 1
 
 // _traceLogger — логгер отладочных сообщений KV-сервиса (traceLogf).
 // По умолчанию выводит в стандартный логгер (stderr). Перенаправляется
-// в файл функцией SetTraceLogFile.
+// в файл функцией SetTrace.
 var _traceLogger = log.Default()
-
-// _traceLogFile — открытый файл трассировки; nil, если вывод в stderr.
-//
-//nolint:unused
-var _traceLogFile *os.File
 
 // traceConfigured — сторожевой флаг строгого set-once: единственная
 // успешная конфигурация трассировки на процесс уже выполнена.
-// Устанавливается только успешным вызовом SetTraceLogFile
+// Устанавливается только успешным вызовом SetTrace
 // (вызов, завершившийся ошибкой I/O, окно не расходует).
 var traceConfigured atomic.Bool
 
@@ -44,34 +40,59 @@ var traceConfigured atomic.Bool
 // KVService. Устанавливается конструктором New/NewKVService.
 var traceCMCreated atomic.Bool
 
-// SetTraceLogFile конфигурирует трассировку (traceLogf): путь к файлу
-// журнала; пустая строка — вывод в стандартный логгер. Файл открывается
-// в режиме добавления и создаётся при необходимости.
+// TraceConfig — параметры трассировки KV-сервиса, передаваемые SetTrace.
+// Тип является простым носителем значений: у него нет методов и он не
+// подразумевает расширения поведением.
+type TraceConfig struct {
+	// Level — порог детализации: трассировка KV-сервиса печатается,
+	// если Level > 0. Level == 0 означает, что трассировка выключена;
+	// нулевое значение НЕ трактуется как «уровень по умолчанию 1».
+	Level int
+
+	// LogFile — путь к файлу журнала трассировки. Файл открывается в
+	// режиме добавления и создаётся при необходимости. Пустая строка
+	// означает вывод в стандартный логгер (stderr).
+	LogFile string
+}
+
+// SetTrace конфигурирует трассировку KV-сервиса (traceLogf): порог
+// детализации cfg.Level и назначение вывода cfg.LogFile. Пустой
+// cfg.LogFile — вывод в стандартный логгер; иначе файл открывается в
+// режиме добавления и создаётся при необходимости. Значение
+// cfg.Level == 0 выключает трассировку и не подменяется значением
+// по умолчанию.
 //
-// Контракт (строгий set-once-before-first-service, симметрично pkg/raft):
-// функция успешна ровно один раз на процесс, до создания первого
-// KVService. Первый успешный вызов выигрывает и замораживает
-// конфигурацию; состояние трассировки после этого read-only. Любой
-// повторный вызов — детерминированная ошибка контракта, в том числе
-// до создания сервиса; вызов после создания — та же ошибка. Вызов,
-// завершившийся ошибкой I/O, окно конфигурации не расходует.
-func SetTraceLogFile(path string) error {
+// Контракт (строгий set-once-before-first-service, симметрично
+// pkg/raft): функция успешна ровно один раз на процесс, до создания
+// первого KVService. Первый успешный вызов выигрывает и замораживает
+// конфигурацию — и логгер, и порог; состояние трассировки после этого
+// read-only. Любой повторный вызов — детерминированная ошибка
+// контракта, в том числе до создания сервиса; вызов после создания —
+// та же ошибка. Вызов, завершившийся ошибкой I/O, окно конфигурации не
+// расходует и не изменяет состояние трассировки.
+//
+// SetTrace — единственная точка конфигурации трассировки пакета.
+func SetTrace(cfg TraceConfig) error {
 	if traceConfigured.Load() || traceCMCreated.Load() {
 		return fmt.Errorf(
 			"kvservice: trace configuration must be set exactly once, " +
 				"before the first KVService is created; repeated calls are forbidden",
 		)
 	}
-	if path == "" {
+	if cfg.LogFile == "" {
+		traceKV = cfg.Level
 		_traceLogger = log.Default()
 		traceConfigured.Store(true)
 		return nil
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	// Порог присваивается только после успешного открытия файла:
+	// вызов, завершившийся ошибкой I/O, окно конфигурации не расходует
+	// и обязан оставить состояние трассировки прежним.
+	f, err := os.OpenFile(cfg.LogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return err
 	}
-	_traceLogFile = f
+	traceKV = cfg.Level
 	_traceLogger = log.New(f, "", log.LstdFlags|log.Lmicroseconds)
 	traceConfigured.Store(true)
 	return nil
@@ -139,7 +160,7 @@ type Config struct {
 func New(cfg *Config, readyChan <-chan any) *KVService {
 	gob.Register(Command{})
 
-	// Сторожевой флаг контракта трассировки: конфигурация SetTraceLogFile
+	// Сторожевой флаг контракта трассировки: конфигурация SetTrace
 	// разрешена только до создания первого сервиса (строгий set-once).
 	traceCMCreated.Store(true)
 
@@ -510,9 +531,9 @@ func (kvs *KVService) handleCAS(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
-// traceLogf выводит отладочное сообщение, если TraceKV > 0.
+// traceLogf выводит отладочное сообщение, если traceKV > 0.
 func (kvs *KVService) traceLogf(format string, args ...any) {
-	if TraceKV > 0 {
+	if traceKV > 0 {
 		format = fmt.Sprintf("[kv %d] ", kvs.id) + format
 		_traceLogger.Printf(format, args...)
 	}

@@ -22,6 +22,10 @@ TRACE_LOG_RAFT1=$(GOBASE)/$(PROJECTNAME)kv-1.trace
 TRACE_LOG_RAFT2=$(GOBASE)/$(PROJECTNAME)kv-2.trace
 TRACE_LOG_RAFT3=$(GOBASE)/$(PROJECTNAME)kv-3.trace
 
+TRACE_LOG_KVBD1=$(GOBASE)/$(PROJECTNAME)kvdb-1.trace
+TRACE_LOG_KVBD2=$(GOBASE)/$(PROJECTNAME)kvdb-2.trace
+TRACE_LOG_KVBD3=$(GOBASE)/$(PROJECTNAME)kvdb-3.trace
+
 STD_ERR_RAFT1=$(GOBASE)/$(PROJECTNAME)kv-1.stderr
 STD_ERR_RAFT2=$(GOBASE)/$(PROJECTNAME)kv-2.stderr
 STD_ERR_RAFT3=$(GOBASE)/$(PROJECTNAME)kv-3.stderr
@@ -67,13 +71,13 @@ stop: stop-raft
 
 start-raft: stop-raft
 	@echo "  >  $(PROJECTNAME) is available at $(HTTP1_PORT)"
-	@-$(GOBIN)/$(PROJECTNAME)kv -number 1 -http-addr=":$(HTTP1_PORT)" -rpc-addr=":$(RAFT1_PORT)" -peers="2=:$(RAFT2_PORT),3=:$(RAFT3_PORT)" -trace-log-level 10 --trace-log-file "$(TRACE_LOG_RAFT1)" 2>"$(STD_ERR_RAFT1)" & echo $$! > $(PID_RAFT1)
+	@-$(GOBIN)/$(PROJECTNAME)kv -number 1 -http-addr=":$(HTTP1_PORT)" -rpc-addr=":$(RAFT1_PORT)" -peers="2=:$(RAFT2_PORT),3=:$(RAFT3_PORT)" -trace-log-level 10 --trace-cm-log-file "$(TRACE_LOG_RAFT1)" --trace-kv-log-file "$(TRACE_LOG_KVBD1)" 2>"$(STD_ERR_RAFT1)" & echo $$! > $(PID_RAFT1)
 	@cat $(PID_RAFT1) | sed "/^/s/^/  \>  PID1: /"
 	@echo "  >  $(PROJECTNAME) is available at $(HTTP2_PORT)"
-	@-$(GOBIN)/$(PROJECTNAME)kv -number 2 -http-addr=":$(HTTP2_PORT)" -rpc-addr=":$(RAFT2_PORT)" -peers="1=:$(RAFT1_PORT),3=:$(RAFT3_PORT)" -trace-log-level 10 --trace-log-file "$(TRACE_LOG_RAFT2)" 2>"$(STD_ERR_RAFT2)" & echo $$! > $(PID_RAFT2)
+	@-$(GOBIN)/$(PROJECTNAME)kv -number 2 -http-addr=":$(HTTP2_PORT)" -rpc-addr=":$(RAFT2_PORT)" -peers="1=:$(RAFT1_PORT),3=:$(RAFT3_PORT)" -trace-log-level 10 --trace-cm-log-file "$(TRACE_LOG_RAFT2)" --trace-kv-log-file "$(TRACE_LOG_KVBD2)" 2>"$(STD_ERR_RAFT2)" & echo $$! > $(PID_RAFT2)
 	@cat $(PID_RAFT2) | sed "/^/s/^/  \>  PID2: /"
 	@echo "  >  $(PROJECTNAME) is available at $(HTTP3_PORT)"
-	@-$(GOBIN)/$(PROJECTNAME)kv -number 3 -http-addr=":$(HTTP3_PORT)" -rpc-addr=":$(RAFT3_PORT)" -peers="1=:$(RAFT1_PORT),2=:$(RAFT2_PORT)" -trace-log-level 10 --trace-log-file "$(TRACE_LOG_RAFT3)" 2>"$(STD_ERR_RAFT3)" & echo $$! > $(PID_RAFT3)
+	@-$(GOBIN)/$(PROJECTNAME)kv -number 3 -http-addr=":$(HTTP3_PORT)" -rpc-addr=":$(RAFT3_PORT)" -peers="1=:$(RAFT1_PORT),2=:$(RAFT2_PORT)" -trace-log-level 10 --trace-cm-log-file "$(TRACE_LOG_KVBD3)" --trace-kv-log-file "$(TRACE_LOG_RAFT3)" 2>"$(STD_ERR_RAFT3)" & echo $$! > $(PID_RAFT3)
 	@cat $(PID_RAFT3) | sed "/^/s/^/  \>  PID3: /"
 	@-$(GOBIN)/loadkv -get-percent 75 -peers ":$(HTTP1_PORT),:$(HTTP2_PORT),:$(HTTP3_PORT)" -request-rate 1000 > ./loadkv-1.out 2>&1  & echo $$! > $(PID_LOADKV)
 	@cat $(PID_RAFT3) | sed "/^/s/^/  \>  PID3: /"
@@ -99,24 +103,37 @@ build: go-build-raft
 
 ## clean: Clean build files. Runs `go clean` internally.
 clean: go-clean
-	@-rm -rf ./loadkv-1.out
+	@-rm -rf ./loadkv-1.out 2> /dev/null || true
 	@-rm -rf ./data
+	@-touch "$(STD_ERR_RAFT3)"
 	@-rm "$(STD_ERR_RAFT3)"
+	@-touch "$(STD_ERR_RAFT2)"
 	@-rm "$(STD_ERR_RAFT2)"
+	@-touch "$(STD_ERR_RAFT1)"
 	@-rm "$(STD_ERR_RAFT1)"
+	@-touch "$(TRACE_LOG_KVBD3)"
+	@-rm "$(TRACE_LOG_KVBD3)"
+	@-touch "$(TRACE_LOG_KVBD2)"
+	@-rm "$(TRACE_LOG_KVBD2)"
+	@-touch "$(TRACE_LOG_KVBD1)"
+	@-rm "$(TRACE_LOG_KVBD1)"
+	@-touch "$(TRACE_LOG_RAFT3)"
 	@-rm "$(TRACE_LOG_RAFT3)"
+	@-touch "$(TRACE_LOG_RAFT2)"
 	@-rm "$(TRACE_LOG_RAFT2)"
+	@-touch "$(TRACE_LOG_RAFT1)"
 	@-rm "$(TRACE_LOG_RAFT1)"
-	@-rm $(GOBIN)/loadkv
-	@-rm $(GOBIN)/$(PROJECTNAME)kv
+	@-rm $(GOBIN)/loadkv 2> /dev/null || true
+	@-rm $(GOBIN)/$(PROJECTNAME)kv 2> /dev/null || true
+	@-go clean -testcache
 
 go-compile: go-build-raft
 
 go-build-raft:
 	@echo "  >  Building $(PROJECTNAME)kv binary..."
-	@GOPATH=$(GOPATH) GOBIN=$(GOBIN) cd $(CMD_SERVER) && go build -o $(GOBIN)/$(PROJECTNAME)kv $(GOFILES)
+	@cd $(CMD_SERVER) && go build -o $(GOBIN)/$(PROJECTNAME)kv $(GOFILES)
 	@echo "  >  Building loadkv binary..."
-	@GOPATH=$(GOPATH) GOBIN=$(GOBIN) cd $(CMD_SERVER)/load && go build -o $(GOBIN)/loadkv $(GOFILES)
+	@cd $(CMD_SERVER)/load && go build -o $(GOBIN)/loadkv $(GOFILES)
 
 # 1. Generate the list of packages to include, excluding 'mocks'
 # go list ./... lists all packages; grep -v excludes lines containing 'mocks'
@@ -124,22 +141,23 @@ go-coverage:
 	CVPKG=$(go list ./... | grep -v '/mocks' | tr '\n' ',')
 	# 2. Run tests with coverage analysis applied only to the specified packages
 	# @GOPATH=$(GOPATH) GOBIN=$(GOBIN) go test -coverpkg=$(CVPKG) -coverprofile=coverage.out ./...
-	@GOPATH=$(GOPATH) GOBIN=$(GOBIN) go test -coverprofile=coverage.out ./...
+	@go test -coverprofile=coverage.out ./...
 	# 3. (Optional) Generate the HTML report
-	@GOPATH=$(GOPATH) GOBIN=$(GOBIN) go tool cover -html=coverage.out -o docs/coverage.html
+	@go tool cover -html=coverage.out -o docs/coverage.html
 
-# Тестовые и lint-цели НЕ переопределяют GOPATH: проект — Go-модуль,
-# GOPATH для него не нужен, а значение "$(GOBASE)/vendor:..." заставляет
-# go создать каталог $(GOBASE)/vendor как GOPATH-корень. Появление
-# vendor/ в корне модуля переводит go в vendor-режим и ломает любую
-# сборку ошибкой "inconsistent vendoring".
 go-test:
-	@echo "  >  Running tests: $(PKG) $(TESTFLAGS)"
-	@go test $(TESTFLAGS) $(PKG)
+	@echo "  >  Running tests: pkg/raft $(TESTFLAGS)"
+	@go test $(TESTFLAGS) ./pkg/raft
+	@echo "  >  Running tests: pkg/raft/tracetest/... $(TESTFLAGS)"
+	@go test $(TESTFLAGS) ./pkg/raft/tracetest/...
+	@echo "  >  Running tests: pkg/kvservice/... $(TESTFLAGS)"
+	@go test $(TESTFLAGS) ./pkg/kvservice/...
+	@echo "  >  Running tests: pkg $(TESTFLAGS)"
+	@go test $(TESTFLAGS) ./pkg
 
 go-test-race:
-	@echo "  >  Running tests with -race: $(PKG) $(TESTFLAGS)"
-	@go test -race $(TESTFLAGS) $(PKG)
+	@echo "  >  Running tests with -race: ./pkg/... $(TESTFLAGS)"
+	@go test -race $(TESTFLAGS) ./pkg/...
 
 go-lint:
 	@echo "  >  Running golangci-lint: $(PKG) $(LINTFLAGS)"
@@ -147,7 +165,7 @@ go-lint:
 
 go-get:
 	@echo "  >  Checking if there is any missing dependencies..."
-	@GOPATH=$(GOPATH) GOBIN=$(GOBIN) go get $(get)
+	@go get $(get)
 
 .PHONY: go-update-deps
 go-update-deps:
@@ -155,17 +173,17 @@ go-update-deps:
 	@for m in $$(go list -mod=readonly -m -f '{{ if and (not .Indirect) (not .Main)}}{{.Path}}{{end}}' all); do \
 		go get $$m; \
 	done
-	go mod tidy
+	@go mod tidy
 ifneq (,$(wildcard vendor))
-	go mod vendor
+	@go mod vendor
 endif
 
 go-install:
-	@GOPATH=$(GOPATH) GOBIN=$(GOBIN) go install $(GOFILES)
+	go install $(GOFILES)
 
 go-clean:
 	@echo "  >  Cleaning build cache"
-	@GOPATH=$(GOPATH) GOBIN=$(GOBIN) go clean
+	@go clean
 
 .PHONY: test test-race lint go-test go-test-race go-lint
 

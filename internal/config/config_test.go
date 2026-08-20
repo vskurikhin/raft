@@ -154,8 +154,11 @@ func TestParseFlagsTraceLogDefaults(t *testing.T) {
 	if v.TraceLogLevel != 1 {
 		t.Errorf("TraceLogLevel = %d, want default 1", v.TraceLogLevel)
 	}
-	if v.TraceLogFile != "" {
-		t.Errorf("TraceLogFile = %q, want default empty", v.TraceLogFile)
+	if v.TraceCMLogFile != "" {
+		t.Errorf("TraceCMLogFile = %q, want default empty", v.TraceCMLogFile)
+	}
+	if v.TraceKVLogFile != "" {
+		t.Errorf("TraceKVLogFile = %q, want default empty", v.TraceKVLogFile)
 	}
 }
 
@@ -163,14 +166,25 @@ func TestParseFlagsTraceLog(t *testing.T) {
 	origArgs := os.Args
 	t.Cleanup(func() { os.Args = origArgs })
 
-	os.Args = []string{"raft", "-number", "1", "--trace-log-level", "16", "--trace-log-file", "/tmp/raft-trace.log"}
+	// Пути трассировки расщеплены на два независимых флага, поэтому им
+	// передаются РАЗЛИЧНЫЕ значения: одинаковые значения не отличили бы
+	// расщепление от заполнения обоих полей из одного источника.
+	os.Args = []string{
+		"raft", "-number", "1",
+		"--trace-log-level", "16",
+		"--trace-cm-log-file", "/tmp/raft-trace-cm.log",
+		"--trace-kv-log-file", "/tmp/raft-trace-kv.log",
+	}
 
 	v := ParseFlags()
 	if v.TraceLogLevel != 16 {
 		t.Errorf("TraceLogLevel = %d, want 16", v.TraceLogLevel)
 	}
-	if v.TraceLogFile != "/tmp/raft-trace.log" {
-		t.Errorf("TraceLogFile = %q, want /tmp/raft-trace.log", v.TraceLogFile)
+	if v.TraceCMLogFile != "/tmp/raft-trace-cm.log" {
+		t.Errorf("TraceCMLogFile = %q, want /tmp/raft-trace-cm.log", v.TraceCMLogFile)
+	}
+	if v.TraceKVLogFile != "/tmp/raft-trace-kv.log" {
+		t.Errorf("TraceKVLogFile = %q, want /tmp/raft-trace-kv.log", v.TraceKVLogFile)
 	}
 }
 

@@ -1,9 +1,9 @@
 // Package reset_test — test-бинарник контракта трассировки pkg/raft:
 // сценарий вывода по умолчанию (stderr-путь). Один бинарник на один
 // сценарий конфигурации (ADR-004, NEW-14). Бинарник конфигурируется
-// значением "" однократно с самого начала — единственная успешная
+// пустым LogFile однократно с самого начала — единственная успешная
 // конфигурация процесса; сценарий reset-through-re-set
-// (SetTraceLogFile(tmp) → SetTraceLogFile("")) запрещён строгим
+// (SetTrace(tmp) → SetTrace("")) запрещён строгим
 // set-once и в тестах отсутствует.
 package reset_test
 
@@ -24,12 +24,17 @@ import (
 // ведётся из горутин CM через log.Default(), чтение — из теста.
 var buf syncBuffer
 
+// traceLevel — порог трассировки бинарника. Задаётся явно: эмиттер
+// сценария (cm.Stop) печатает на уровне 0 и виден только при Level > 0,
+// а TraceConfig{} означает выключенную трассировку.
+const traceLevel = 1
+
 // TestMain выполняет log.SetOutput ДО конфигурации (безопасно в
 // выделенном бинарнике) и единственную успешную конфигурацию
-// трассировки процесса: SetTraceLogFile("").
+// трассировки процесса: SetTrace с пустым LogFile.
 func TestMain(m *testing.M) {
 	log.SetOutput(&buf)
-	if err := raft.SetTraceLogFile(""); err != nil {
+	if err := raft.SetTrace(raft.TraceConfig{Level: traceLevel}); err != nil {
 		_, _ = os.Stderr.WriteString("raft: trace configuration failed: " + err.Error() + "\n")
 		os.Exit(1)
 	}
@@ -41,8 +46,8 @@ func TestTraceReset(t *testing.T) {
 	t.Cleanup(leaktest.CheckTimeout(t, raft.LeaktestBudget))
 
 	// Строгий set-once: повторный вызов — ошибка контракта.
-	if err := raft.SetTraceLogFile(""); err == nil {
-		t.Fatal("SetTraceLogFile: want contract error, got nil")
+	if err := raft.SetTrace(raft.TraceConfig{Level: traceLevel}); err == nil {
+		t.Fatal("SetTrace: want contract error, got nil")
 	}
 
 	// Создаём CM (InmemTransport + MapStorage, без кластера).
@@ -66,7 +71,7 @@ func TestTraceReset(t *testing.T) {
 	})
 
 	// Эмиттер трассировки — cm.Stop(); запись идёт в стандартный
-	// логгер (путь конфигурации ""), файл трассировки не создаётся.
+	// логгер (пустой LogFile), файл трассировки не создаётся.
 	cm.Stop()
 
 	deadline := time.Now().Add(2 * time.Second)

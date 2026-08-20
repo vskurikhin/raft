@@ -328,11 +328,11 @@ func (cm *ConsensusModule) stdoutTracePrintln(msg string) {
 	cm.mu.Unlock()
 }
 
-// traceLockedLogf выводит отладочное сообщение, если TraceCM > level.
+// traceLockedLogf выводит отладочное сообщение, если traceCM > level.
 // Ожидается, что cm.mu уже заблокирован вызывающим кодом, поэтому
 // состояние (cm.cmState.state, cm.id, cm.cmState.currentTerm) читается напрямую.
 func (cm *ConsensusModule) traceLockedLogf(level int, format string, args ...any) {
-	if level < TraceCM {
+	if level < traceCM {
 		format = fmt.Sprintf("[%c,N:%d,T:%03d] ", stateLetter(cm.cmState.state), cm.id, cm.cmState.currentTerm) +
 			format
 		_traceLogger.Printf(format, args...)
@@ -344,7 +344,7 @@ func (cm *ConsensusModule) traceLockedLogf(level int, format string, args ...any
 // прочитать состояние без data race. Для вызовов из кода, который уже
 // держит cm.mu, используйте traceLockedLogf — иначе будет deadlock.
 func (cm *ConsensusModule) traceLogf(level int, format string, args ...any) {
-	if level < TraceCM {
+	if level < traceCM {
 		cm.mu.Lock()
 		cm.traceLockedLogf(level, format, args...)
 		cm.mu.Unlock()

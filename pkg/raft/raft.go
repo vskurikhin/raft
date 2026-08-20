@@ -174,7 +174,7 @@ func NewConsensusModule(
 	if isNilInterface(transport) {
 		log.Fatalln("raft: NewConsensusModule: transport is nil")
 	}
-	// Флаг контракта трассировки: конфигурация SetTraceLogFile (строгий set-once).
+	// Флаг контракта трассировки: конфигурация SetTrace (строгий set-once).
 	traceCMCreated.Store(true)
 	cm := new(ConsensusModule)
 	cm.id = id
