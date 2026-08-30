@@ -234,7 +234,7 @@ func (h *snapshotHarness) SubmitToServer(serverID int, cmd string) int {
 			return -1
 		}
 		return future.Index()
-	case <-time.After(submitTimeout):
+	case <-time.After(_submitTimeout):
 		return -1
 	}
 }
@@ -794,8 +794,8 @@ func (h *snapshotHarness) waitForSingleLeader() int {
 // прекращаются. При пороге 5 и 30 командах существовала бы необратимая
 // зона S ∈ {26..29}, из которой система по своим правилам не выходит.
 //
-// Бюджет каждого ожидания — snapshotConvergenceBudget: худший случай
-// схождения при интервале снимков 50 мс — applyBatchInterval + 2 интервала
+// Бюджет каждого ожидания — _snapshotConvergenceBudget: худший случай
+// схождения при интервале снимков 50 мс — _applyBatchInterval + 2 интервала
 // снимков = 150 мс, запас более чем 14-кратный.
 func TestSnapshot_MultipleSnapshots(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
@@ -815,7 +815,7 @@ func TestSnapshot_MultipleSnapshots(t *testing.T) {
 	// cmState.state == Leader (чтение под cm.mu), а не фиксированные паузы.
 	err := waitCond(
 		"single node becomes leader",
-		leaderElectionBudget,
+		_leaderElectionBudget,
 		func() bool {
 			cm.mu.Lock()
 			defer cm.mu.Unlock()
@@ -854,7 +854,7 @@ func TestSnapshot_MultipleSnapshots(t *testing.T) {
 		t.Helper()
 		desc := fmt.Sprintf("lastSnapshotIndex >= %d", wantIdx)
 		err := waitCond(
-			desc, snapshotConvergenceBudget,
+			desc, _snapshotConvergenceBudget,
 			func() bool {
 				cm.mu.Lock()
 				defer cm.mu.Unlock()
@@ -1598,6 +1598,15 @@ func TestReplicationBackoff_BoundsAttemptsToUnavailablePeer(t *testing.T) {
 // задержки (1000 мс) проверяется детерминированно в
 // TestReplicationBackoffDelay_Clamp; здесь дедлайн 3 с — запас на
 // contention полного набора тестов (in-memory harness, один процесс).
+//
+// Обнуление счётчика проверяется как ограниченное во времени условие:
+// между ростом matchIndex и опросом проходят интервал опроса, задержки
+// планировщика под -race и легитимные новые транспортные ошибки, поэтому
+// на возврат счётчика к нулю отводится окно 1500 мс = потолок задержки
+// повторов (1000 мс) + таймаут inmem-транспорта (500 мс). Сверх окна —
+// отказ: органический рост счётчика с нуля до наблюдаемых значений
+// занимает больше этого окна, то есть невозврат означает дефект, а не
+// переходное состояние.
 func TestReplicationBackoff_RecoveryAfterReconnect(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
@@ -1651,19 +1660,39 @@ func TestReplicationBackoff_RecoveryAfterReconnect(t *testing.T) {
 	// Ждём первого успешного RPC (matchIndex на лидере растёт выше
 	// значения, зафиксированного до отключения).
 	deadline := start.Add(3000 * time.Millisecond)
+	// growthSeenAt — момент первого наблюдения роста matchIndex; от него
+	// отсчитывается окно возврата счётчика транспортных ошибок к нулю.
+	var growthSeenAt time.Time
+	const resetGrace = 1500 * time.Millisecond
 	for {
 		cm := h.cluster[leaderID]
 		cm.mu.Lock()
 		mi := cm.leaderState.matchIndex[followerID]
 		rf := cm.leaderState.replFailures[followerID]
+		ni := cm.leaderState.nextIndex[followerID]
+		term := cm.cmState.currentTerm
+		state := cm.cmState.state
 		cm.mu.Unlock()
 		if mi > matchBefore {
-			if rf != 0 {
-				t.Fatalf("replFailures = %d after first success, want 0", rf)
+			if rf == 0 {
+				return
 			}
-			return
+			if growthSeenAt.IsZero() {
+				growthSeenAt = time.Now()
+			}
+			// Окно возврата: потолок задержки повторов (1000 мс) +
+			// таймаут inmem-транспорта (500 мс).
+			if elapsed := time.Since(growthSeenAt); elapsed > resetGrace {
+				t.Fatalf(
+					"replFailures = %d still non-zero %v after matchIndex growth "+
+						"(matchIndex=%d, nextIndex=%d, term=%d, state=%v), want reset within %v",
+					rf, elapsed.Round(time.Millisecond), mi, ni, term, state, resetGrace,
+				)
+			}
 		}
-		if time.Now().After(deadline) {
+		// Дедлайн относится к росту matchIndex: после его наблюдения окно
+		// ожидания задаётся resetGrace (худший суммарный бюджет — 4,5 с).
+		if growthSeenAt.IsZero() && time.Now().After(deadline) {
 			t.Fatal("first successful RPC delayed beyond backoff ceiling + load margin")
 		}
 		// poll-интервал condition-wait (не фиксированная пауза).

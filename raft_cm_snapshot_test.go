@@ -3,6 +3,7 @@ package raft
 import (
 	"bytes"
 	"encoding/gob"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -25,7 +26,7 @@ func (f *failingSnapshotStore) Create(_, _ int, _ Configuration, _ int) (Snapsho
 	f.mu.Lock()
 	f.creates++
 	f.mu.Unlock()
-	return nil, fmt.Errorf("create failed")
+	return nil, errors.New("create failed")
 }
 
 func (f *failingSnapshotStore) List() ([]*SnapshotMeta, error) {
@@ -33,7 +34,7 @@ func (f *failingSnapshotStore) List() ([]*SnapshotMeta, error) {
 }
 
 func (f *failingSnapshotStore) Open(_ string) (*SnapshotMeta, io.ReadCloser, error) {
-	return nil, nil, fmt.Errorf("open failed")
+	return nil, nil, errors.New("open failed")
 }
 
 func (f *failingSnapshotStore) createCount() int {
@@ -45,7 +46,7 @@ func (f *failingSnapshotStore) createCount() int {
 // TestRunSnapshots_TakeSnapshotErrorDoesNotCrash проверяет,
 // что ошибка takeSnapshot не роняет процесс: цикл снимков продолжает
 // работать и повторяет попытки (Create вызывается снова). Сама ошибка
-// логируется через traceLogf(0, ...) — проверка через перехват лога
+// логируется через traceLogf(_traceLevelKeyEvents, ...) — проверка через перехват лога
 // не выполняется, чтобы не мутировать глобальный логгер из теста.
 func TestRunSnapshots_TakeSnapshotErrorDoesNotCrash(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
@@ -747,12 +748,26 @@ func TestSnapshot_UnappliedBatchesReplayedAfterRestart(t *testing.T) {
 	// Фаза 2: шлюз закрыт — записи попадают в журнал и в очередь машины
 	// состояний, но не применяются.
 	const pendingCommands = 3
+	// Базовая линия отметки применения, зафиксированная до
+	// диспетчеризации команд фазы 2: условие ниже опирается только на
+	// прирост отметки и не зависит от служебных записей, дошедших до
+	// машины состояний ранее (noop и пр.).
+	baseDispatched, _ := readWatermarks(cm)
 	for i := appliedCommands; i < appliedCommands+pendingCommands; i++ {
 		cm.Apply(fmt.Sprintf("k%d=v%d", i, i), 0)
 	}
-	waitForCondition(t, 5*time.Second, "pending commands dispatched to the FSM queue", func() bool {
-		dispatched, applied := readWatermarks(cm)
-		return dispatched > applied && fsm.enteredCount() > appliedCommands
+	// Инвариант: отметка применения растёт только при обработке
+	// фиксации, а фиксация возможна лишь после записи журнала на диск
+	// (персист выполняется при добавлении записей в журнал — до
+	// продвижения индекса фиксации; сама отметка присваивается в начале
+	// processLogs, до постановки батча в очередь машины состояний).
+	// Поэтому продвижение отметки до базовой линии + 3 гарантирует
+	// присутствие всех трёх команд фазы 2 в журнале на диске: остановка
+	// не может застать диспетчеризацию, и после перезапуска все три
+	// записи будут переиграны.
+	waitForCondition(t, 5*time.Second, "pending commands committed to the durable log", func() bool {
+		dispatched, _ := readWatermarks(cm)
+		return dispatched >= baseDispatched+pendingCommands
 	})
 
 	// Останавливаем узел: Apply обязан завершаться, поэтому переводим

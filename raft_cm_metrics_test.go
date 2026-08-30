@@ -18,7 +18,7 @@ import (
 // утверждения о ЗНАЧЕНИЯХ агрегатов (count/sumUs/среднее) делаются только на
 // CM без запущенной stats — собранном литералом (&ConsensusModule{} /
 // new(ConsensusModule)). Утверждения о поведении допустимы на любом CM.
-// Ни один тест не изменяет traceCM и не вызывает SetTrace
+// Ни один тест не изменяет _traceCM и не вызывает SetTrace
 // (.doc/flaky-test.md).
 
 // TestLatencyObserveNonBlockingExactMean — (литеральный CM).
@@ -121,7 +121,7 @@ func TestLatencyZeroValueCMMetricPaths(t *testing.T) {
 
 	cm := &ConsensusModule{}
 	cm.storage = NewMapStorage()
-	cm.fsmMutateCh = make(chan []*commitTuple, batchApplyBuffer)
+	cm.fsmMutateCh = make(chan []*commitTuple, _batchApplyBuffer)
 	cm.shutdownCh = make(chan struct{})
 	cm.leaderState.inflight = make(map[int]*logFuture)
 	cm.cmState.state = Follower
@@ -182,7 +182,7 @@ func TestLatencyZeroValueCMMetricPaths(t *testing.T) {
 // TestLatencyAttributionPerCM — (два литеральных CM). После observe
 // на CM1 обязаны выполняться одновременно CM1.count > 0 И CM2.count == 0:
 // парное положительное утверждение исключает вакуумный проход (P06R2-02).
-// Проверка по значениям агрегатов, без печатного вывода и без мутации traceCM.
+// Проверка по значениям агрегатов, без печатного вывода и без мутации _traceCM.
 func TestLatencyAttributionPerCM(t *testing.T) {
 	cm1 := new(ConsensusModule)
 	cm2 := new(ConsensusModule)
@@ -219,21 +219,21 @@ func TestLatencyReportFormat(t *testing.T) {
 	got := rep.format()
 	want := "AE= 1.25ms, BatchingFSM= 2.50ms, Election= 3.75ms, FSMSnapSh= 4.00ms," +
 		" InstSnapShot= 5.25ms, ProcessLog= 6.50ms, RqPVt= 7.75ms, RqVote= 8.00ms," +
-		" SendBatch= 9.25ms, TakeSnapshot=10.50ms, TmOutNowRq=11.75ms"
+		" SendBatch= 9.25ms, TakeSnap=10.50ms, TmOutNowRq=11.75ms"
 	if got != want {
 		t.Fatalf("format() = %q\nwant      = %q", got, want)
 	}
 }
 
 // TestLatencyTraceEnabledPredicate — (read-only проверка гейта).
-// Значение traceCM не изменяется: ценность теста — фиксация
+// Значение _traceCM не изменяется: ценность теста — фиксация
 // направления сравнения (<, а не <=) относительно текущего порога.
 func TestLatencyTraceEnabledPredicate(t *testing.T) {
-	if !traceEnabled(traceCM - 1) {
-		t.Errorf("traceEnabled(traceCM-1) = false, want true")
+	if !traceEnabled(_traceCM - 1) {
+		t.Errorf("traceEnabled(_traceCM-1) = false, want true")
 	}
-	if traceEnabled(traceCM) {
-		t.Errorf("traceEnabled(traceCM) = true, want false")
+	if traceEnabled(_traceCM) {
+		t.Errorf("traceEnabled(_traceCM) = true, want false")
 	}
 }
 
@@ -241,7 +241,7 @@ func TestLatencyTraceEnabledPredicate(t *testing.T) {
 // текст трассировки неудачного AE печатает фактически
 // присвоенное значение nextIndex (не ni-1) и поля matchIndex/ConflictIndex/
 // ConflictTerm — ровно тот набор, которого не хватило при разборе обоих
-// инцидентов. Формат проверяется через чистую функцию: мутация traceCM и
+// инцидентов. Формат проверяется через чистую функцию: мутация _traceCM и
 // _traceLogger в тестах запрещена (P06R2-02 T5c).
 func TestFailedAETraceReportsActualNextIndex(t *testing.T) {
 	// Значения инцидента: фактически присвоенный nextIndex = 0 при
@@ -273,7 +273,7 @@ func TestRaftCountersReportFormat(t *testing.T) {
 		matchIndex: map[int]int{2: 29, 1: 24},
 	}
 	got := c.report(ls)
-	want := "ISsent=7 ISrecv=5 ISstale=2 AErej=7 NIrejIgn=1 BndViol=0 SnapLag=3 BatchSkip=2 p1:ni=25/mi=24 p2:ni=30/mi=29"
+	want := "ISsent=7 ISrecv=5 ISstale=2 AErej=7 NIrejIgn=1 BndViol=0 SnapLag=3 BatchSkip=2 VrfDone=0 VrfWtd=0 AESent=0 VrfRedisp=0 VrfRedispSupp=0 p1:ni=25/mi=24 p2:ni=30/mi=29"
 	if got != want {
 		t.Fatalf("report = %q\nwant   = %q", got, want)
 	}
@@ -296,10 +296,11 @@ func TestCounters_DistinguishSnapshotLoop(t *testing.T) {
 	tracker := newCommitmentTracker(0, 1, -1, make(chan int, 1))
 	cm := &ConsensusModule{
 		leaderState: leaderState{
-			nextIndex:         map[int]int{1: 1},
-			matchIndex:        map[int]int{1: -1},
-			inflightAE:        map[int]*atomic.Bool{1: new(atomic.Bool)},
-			commitmentTracker: tracker,
+			nextIndex:              map[int]int{1: 1},
+			matchIndex:             map[int]int{1: -1},
+			inflightAE:             map[int]*atomic.Bool{1: new(atomic.Bool)},
+			nextVerifyRedispatchAt: make(map[int]time.Time),
+			commitmentTracker:      tracker,
 		},
 		cmState: cmState{
 			state:             Leader,
@@ -337,8 +338,8 @@ func TestCounters_DistinguishSnapshotLoop(t *testing.T) {
 		cm.leaderState.matchIndex[1] = -1
 		cm.mu.Unlock()
 
-		cm.leaderSendAEsToPeer(1, 1, 0) // ветка снимка → успех IS
-		cm.leaderSendAEsToPeer(1, 1, 0) // ветка AE → отказ CI=0
+		cm.leaderSendAEsToPeer(1, 1, 0, true) // ветка снимка → успех IS
+		cm.leaderSendAEsToPeer(1, 1, 0, true) // ветка AE → отказ CI=0
 	}
 
 	cm.mu.Lock()
@@ -433,7 +434,7 @@ func TestLatencyFsmApplyCountsBatches(t *testing.T) {
 	fsm := &countBatchesFSM{}
 	cm := new(ConsensusModule)
 	cm.fsm = fsm
-	cm.fsmMutateCh = make(chan []*commitTuple, batchApplyBuffer)
+	cm.fsmMutateCh = make(chan []*commitTuple, _batchApplyBuffer)
 	cm.shutdownCh = make(chan struct{})
 	// runFSM регистрируется в cm.wg: Stop() становится барьером
 	// (возврат Stop() гарантирует завершение runFSM).

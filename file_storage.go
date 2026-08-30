@@ -1,10 +1,12 @@
 package raft
 
 import (
+	"bytes"
 	"encoding/gob"
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 )
@@ -20,7 +22,23 @@ type FileStorage struct {
 	dir     string
 	data    map[string][]byte
 	hasData bool
+	writes  int
 }
+
+var _ Storage = (*FileStorage)(nil)
+
+const (
+	// _dataFileSuffix — суффикс файла данных: каждый ключ Storage
+	// хранится в файле <ключ>.dat; часть формата имён файлов на диске.
+	_dataFileSuffix = ".dat"
+
+	// _tmpFileSuffix — суффикс временного файла атомарной записи
+	// (запись, fsync, переименование). Значение совпадает с суффиксом
+	// временных директорий хранилища снимков (_tmpSuffix), но это разные
+	// форматы: константы не связываются, правка одного формата не
+	// должна менять другой.
+	_tmpFileSuffix = ".tmp"
+)
 
 // NewFileStorage создаёт FileStorage в указанной директории, создавая её
 // при необходимости и загружая существующие .dat-файлы в in-memory кэш.
@@ -40,11 +58,22 @@ func NewFileStorage(dir string) *FileStorage {
 // При ошибке ФС процесс завершается через log.Fatalf, поэтому блокировка здесь
 // не снимается на путях ошибки — это не имеет значения,
 // так как процесс всё равно завершается.
+//
+// Инвариант: после возврата Set на диске долговечно лежит value, а кэш хранит
+// собственную копию, побайтово равную value, независимо от последующих мутаций
+// среза вызывающим. Ввод-вывод пропускается ровно тогда, когда на диске уже
+// лежит это значение: ключ есть в кэше и закэшированная копия побайтово равна
+// value. Пропуск долговечности не ослабляет — требуемое значение уже на диске.
 func (fs *FileStorage) Set(key string, value []byte) {
 	fs.mu.Lock()
 
-	path := filepath.Join(fs.dir, key+".dat")
-	tmpPath := path + ".tmp"
+	if cached, found := fs.data[key]; found && bytes.Equal(cached, value) {
+		fs.mu.Unlock()
+		return
+	}
+
+	path := filepath.Join(fs.dir, key+_dataFileSuffix)
+	tmpPath := path + _tmpFileSuffix
 
 	f, err := os.Create(tmpPath)
 	if err != nil {
@@ -70,17 +99,24 @@ func (fs *FileStorage) Set(key string, value []byte) {
 		log.Fatalf("FileStorage.Set: sync dir %s: %v", fs.dir, err)
 	}
 
-	fs.data[key] = value
+	fs.data[key] = slices.Clone(value)
 	fs.hasData = true
+	fs.writes++
 	fs.mu.Unlock()
 }
 
 // Get возвращает значение key из in-memory кэша.
+//
+// Возвращается защитная копия: вызывающий может мутировать полученный срез,
+// не затрагивая ни кэш, ни содержимое диска.
 func (fs *FileStorage) Get(key string) ([]byte, bool) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	v, ok := fs.data[key]
-	return v, ok
+	if !ok {
+		return nil, false
+	}
+	return slices.Clone(v), true
 }
 
 // HasData возвращает true, если в хранилище есть хотя бы один .dat-файл
@@ -89,6 +125,15 @@ func (fs *FileStorage) HasData() bool {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	return fs.hasData
+}
+
+// writeCount возвращает число фактически выполненных записей на диск.
+// Служебный счётчик наблюдаемости для тестов и бенчмарков пакета: вызовы Set,
+// пропущенные из-за совпадения значения с закэшированным, в него не входят.
+func (fs *FileStorage) writeCount() int {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	return fs.writes
 }
 
 // loadAll читает все .dat-файлы из директории в in-memory кэш. Вызывается
@@ -101,10 +146,10 @@ func (fs *FileStorage) loadAll() {
 	}
 	for _, entry := range entries {
 		name := entry.Name()
-		if !strings.HasSuffix(name, ".dat") {
+		if !strings.HasSuffix(name, _dataFileSuffix) {
 			continue
 		}
-		key := strings.TrimSuffix(name, ".dat")
+		key := strings.TrimSuffix(name, _dataFileSuffix)
 		f, err := os.Open(filepath.Join(fs.dir, name))
 		if err != nil {
 			continue

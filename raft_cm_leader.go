@@ -5,6 +5,11 @@ import (
 	"time"
 )
 
+// _leadershipTransferPollInterval — период опроса nextIndex целевого
+// узла при догонке в передаче лидерства: до завершения догонки цикл
+// повторяет сигнал репликации с этим интервалом.
+const _leadershipTransferPollInterval = 10 * time.Millisecond
+
 // AddNonvoter добавляет новый не голосующий сервер или обновляет адрес существующего.
 func (cm *ConsensusModule) AddNonvoter(id ServerID, addr ServerAddress) IndexFuture {
 	future := &configurationChangeFuture{
@@ -246,7 +251,7 @@ func (cm *ConsensusModule) appendConfigurationEntry(future *configurationChangeF
 	cm.leaderState.commitmentTracker.commit(cm.cmState.lastLogIndex, cm.lookupTermLocked)
 	savedCommitIndex := cm.cmState.commitIndex
 	if newCI := cm.leaderState.commitmentTracker.getCommitIndex(); newCI > cm.cmState.commitIndex {
-		cm.traceLockedLogf(2, "leader sets commitIndex := %d", newCI)
+		cm.traceLockedLogf(_traceLevelProgress, "leader sets commitIndex := %d", newCI)
 		cm.cmState.commitIndex = newCI
 	}
 	// Значение снимается в критической секции до Unlock (RISK-002):
@@ -344,16 +349,13 @@ func (cm *ConsensusModule) handleLeadershipTransfer(future *leadershipTransferFu
 		done := make(chan error, 1)
 		cm.goSpawn(func() {
 			for {
-				// Отправляем сигнал репликации целевому узлу.
-				// Эпоха верификации снимается под cm.mu для каждого
-				// вызова — как в leaderSendAEs.
-				cm.mu.Lock()
-				dispatchEpoch := cm.leaderState.verifyEpoch
-				cm.mu.Unlock()
-				cm.leaderSendAEsToPeer(targetID, savedCurrentTerm, dispatchEpoch)
+				// Отправляем сигнал репликации целевому узлу через ту же
+				// дедупликацию, что и рассылка лидера: догоняющий цикл не
+				// порождает второго отправителя одному соседу.
+				cm.leaderSendAEsToPeerIfIdle(targetID, savedCurrentTerm)
 
 				// Ждём короткий интервал, затем проверяем nextIndex.
-				time.Sleep(10 * time.Millisecond)
+				time.Sleep(_leadershipTransferPollInterval)
 
 				cm.mu.Lock()
 				if cm.leaderState.nextIndex[targetID] > lastIdx {
@@ -432,109 +434,38 @@ func (cm *ConsensusModule) handleLeadershipTransfer(future *leadershipTransferFu
 //
 // После выхода из цикла все ожидающие future из списка inflight
 // получают ошибку ErrLeadershipLost, после чего список очищается.
-//
-//nolint:funlen,gocognit
 func (cm *ConsensusModule) runLeaderLoop() {
 	startNow := time.Now()
+	cm.mu.Lock()
+	cm.leaderLoopsAlive++
+	cm.mu.Unlock()
 	defer func() {
 		cm.mu.Lock()
-		if cm.leaderState.leadershipTransferFuture != nil {
-			atomic.StoreInt32(&cm.leaderState.leadershipTransferInProgress, 0)
-			cm.leaderState.leadershipTransferFuture.respond(ErrLeadershipLost)
-			cm.leaderState.leadershipTransferFuture = nil
-		}
-		if len(cm.leaderState.pendingVerify) > 0 {
-			for _, vf := range cm.leaderState.pendingVerify {
-				vf.respond(ErrLeadershipLost)
-			}
-			cm.leaderState.pendingVerify = nil
-		}
-		inflightCount := len(cm.leaderState.inflight)
-		cm.traceLockedLogf(1, "leaderLoop exit: responding to %d inflight futures", inflightCount)
-		for _, future := range cm.leaderState.inflight {
-			future.respond(ErrLeadershipLost)
-		}
-		cm.leaderState.inflight = make(map[int]*logFuture)
-
-		// Сбросить inflightAE для всех соседей при выходе из leader loop.
-		// Это гарантирует, что "зависшие" true флаги (CAS успешен,
-		// но горутина не стартовала из-за завершения цикла) не блокируют
-		// следующего лидера.
-		//
-		// nil-проверка защищает от nil-элемента: если конфигурация
-		// изменилась после старта лидера, а leader loop завершился до
-		// вызова startStopReplicationLocked для нового peer, inflightAE[peerID]
-		// может быть nil. Store на nil *atomic.Bool паникует без recover().
-		for peerID := range cm.leaderState.inflightAE {
-			if cm.leaderState.inflightAE[peerID] != nil {
-				cm.leaderState.inflightAE[peerID].Store(false)
-			}
-		}
+		cm.leaderLoopExitCleanupLocked()
 		cm.mu.Unlock()
 		elapsed := time.Since(startNow)
-		cm.traceLogf(1, "leaderLoop exit: elapsed=%v", elapsed)
+		cm.traceLogf(_traceLevelLoops, "leaderLoop exit: elapsed=%v", elapsed)
 	}()
 
 	heartbeatTicker := time.NewTicker(HeartbeatTimeoutMs * time.Millisecond)
 	defer heartbeatTicker.Stop()
 
-	applyTicker := time.NewTicker(applyBatchInterval)
+	// Страховка на случай пропущенного уведомления о фиксации: основной
+	// путь применения — ветка commitCh, применяющая записи по факту
+	// фиксации.
+	applyTicker := time.NewTicker(_applyBatchInterval)
 	defer applyTicker.Stop()
 
 	for {
 		select {
 		case future := <-cm.applyCh:
-			cm.mu.Lock()
-			if cm.cmState.state != Leader {
-				cm.mu.Unlock()
-				future.respond(ErrNotLeader)
+			if !cm.handleLeaderApplyBatch(future, heartbeatTicker) {
 				return
 			}
-			cm.mu.Unlock()
-
-			ready := []*logFuture{future}
-		groupCommit:
-			for range leaderBatchSize - 1 {
-				select {
-				case f := <-cm.applyCh:
-					ready = append(ready, f)
-				default:
-					break groupCommit
-				}
-			}
-			cm.dispatchLogs(ready)
-			// Немедленная репликация после записи в журнал.
-			cm.leaderSendAEs()
-
-			heartbeatTicker.Stop()
-			heartbeatTicker.Reset(HeartbeatTimeoutMs * time.Millisecond)
 
 		case newCommitIndex := <-cm.commitCh:
-			cm.mu.Lock()
-			if newCommitIndex > cm.cmState.commitIndex {
-				cm.traceLockedLogf(2, "leader sets commitIndex := %d", newCommitIndex)
-				cm.cmState.commitIndex = newCommitIndex
-
-				// Обновить committed конфигурацию, если latest был зафиксирован.
-				if cm.cmState.configurations.latestIndex > cm.cmState.configurations.committedIndex &&
-					newCommitIndex >= cm.cmState.configurations.latestIndex {
-					cm.cmState.configurations.committed = cm.cmState.configurations.latest
-					cm.cmState.configurations.committedIndex = cm.cmState.configurations.latestIndex
-				}
-
-				// Проверить, остался ли лидер в committed конфигурации.
-				if !hasVote(cm.cmState.configurations.committed, cm.id) {
-					cm.traceLockedLogf(1, "leader stepping down: not in committed configuration")
-					cm.becomeFollowerLocked(cm.cmState.currentTerm)
-					cm.mu.Unlock()
-					return
-				}
-				cm.mu.Unlock()
-				// Не вызываем processLogs здесь — накапливаем commitIndex
-				// до следующего тика applyTicker для объединения батчей.
-				cm.leaderSendAEs()
-			} else {
-				cm.mu.Unlock()
+			if !cm.handleLeaderCommitAdvance(newCommitIndex) {
+				return
 			}
 
 		case <-applyTicker.C:
@@ -552,7 +483,7 @@ func (cm *ConsensusModule) runLeaderLoop() {
 
 		case <-cm.stepDown:
 			cm.mu.Lock()
-			cm.traceLockedLogf(1, "leader stepping down")
+			cm.traceLockedLogf(_traceLevelLoops, "leader stepping down")
 			if cm.leaderState.leadershipTransferFuture != nil {
 				atomic.StoreInt32(&cm.leaderState.leadershipTransferInProgress, 0)
 				cm.leaderState.leadershipTransferFuture.respond(nil)
@@ -562,50 +493,17 @@ func (cm *ConsensusModule) runLeaderLoop() {
 			return
 
 		case <-heartbeatTicker.C:
+			cm.mu.Lock()
+			cm.leaderState.heartbeatTicks++
+			cm.mu.Unlock()
+			cm.checkQuorumContact()
 			cm.leaderSendAEs()
 
 		case future := <-cm.configurationChangeChIfStable():
 			cm.appendConfigurationEntry(future)
 
 		case vf := <-cm.verifyCh:
-			cm.mu.Lock()
-			if cm.cmState.state != Leader {
-				vf.respond(ErrNotLeader)
-				cm.mu.Unlock()
-				break
-			}
-			// Порог кворума — от набора голосующих актуальной (latest)
-			// конфигурации, вычисленный в момент обработки запроса,
-			// а не в момент вызова VerifyLeader.
-			if !hasVote(cm.cmState.configurations.latest, cm.id) {
-				// Лидер не голосующий собственной конфигурации (self-removal):
-				// подтвердить кворумное лидерство нельзя.
-				vf.respond(ErrNotLeader)
-				cm.mu.Unlock()
-				break
-			}
-			vf.quorumSize = quorumSize(len(voterIDs(cm.cmState.configurations.latest)))
-
-			// Привязка запроса к раунду: эпоха инкрементируется под cm.mu,
-			// голоса засчитываются только от AE с dispatchEpoch >= epoch.
-			cm.leaderState.verifyEpoch++
-			vf.epoch = cm.leaderState.verifyEpoch
-
-			// Self-голос лидера (ReadIndex: узел знает свой журнал).
-			vf.vote(cm.id, true)
-			if vf.votes >= vf.quorumSize {
-				cm.mu.Unlock()
-				break
-			}
-			cm.leaderState.pendingVerify = append(cm.leaderState.pendingVerify, vf)
-			// Снимок длины под cm.mu: чтение len(pendingVerify) вне
-			// блокировки гоняло с записью списка из горутин репликации.
-			// Механика списка и снятия завершённых — без изменений.
-			firstPending := len(cm.leaderState.pendingVerify) == 1
-			cm.mu.Unlock()
-			if firstPending {
-				cm.leaderSendAEs()
-			}
+			cm.handleVerifyRequest(vf)
 
 		case future := <-cm.leaderState.leadershipTransferCh:
 			// Запуск graceful передачи лидерства.
@@ -618,6 +516,232 @@ func (cm *ConsensusModule) runLeaderLoop() {
 	}
 }
 
+// leaderLoopExitCleanupLocked приводит состояние лидера в порядок при выходе
+// из его цикла: уменьшает счётчик живых циклов, отвечает ошибкой потери
+// лидерства ожидающему future передачи лидерства, ожидающим запросам
+// подтверждения лидерства и всем ожидающим записям журнала, после чего
+// сбрасывает флаги активных горутин репликации.
+//
+// Требует удержания cm.mu; блокировку не берёт и не снимает.
+func (cm *ConsensusModule) leaderLoopExitCleanupLocked() {
+	cm.leaderLoopsAlive--
+	if cm.leaderState.leadershipTransferFuture != nil {
+		atomic.StoreInt32(&cm.leaderState.leadershipTransferInProgress, 0)
+		cm.leaderState.leadershipTransferFuture.respond(ErrLeadershipLost)
+		cm.leaderState.leadershipTransferFuture = nil
+	}
+	if len(cm.leaderState.pendingVerify) > 0 {
+		for _, vf := range cm.leaderState.pendingVerify {
+			vf.respond(ErrLeadershipLost)
+		}
+		cm.leaderState.pendingVerify = nil
+	}
+	inflightCount := len(cm.leaderState.inflight)
+	cm.traceLockedLogf(_traceLevelLoops, "leaderLoop exit: responding to %d inflight futures", inflightCount)
+	for _, future := range cm.leaderState.inflight {
+		future.respond(ErrLeadershipLost)
+	}
+	cm.leaderState.inflight = make(map[int]*logFuture)
+
+	// Сбросить inflightAE для всех соседей при выходе из leader loop.
+	// Это гарантирует, что "зависшие" true флаги (CAS успешен,
+	// но горутина не стартовала из-за завершения цикла) не блокируют
+	// следующего лидера.
+	//
+	// nil-проверка защищает от nil-элемента: если конфигурация
+	// изменилась после старта лидера, а leader loop завершился до
+	// вызова startStopReplicationLocked для нового peer, inflightAE[peerID]
+	// может быть nil. Store на nil *atomic.Bool паникует без recover().
+	for peerID := range cm.leaderState.inflightAE {
+		if cm.leaderState.inflightAE[peerID] != nil {
+			cm.leaderState.inflightAE[peerID].Store(false)
+		}
+	}
+}
+
+// handleLeaderApplyBatch обрабатывает команду клиента, взятую циклом лидера
+// из канала команд: добирает из того же канала ещё до _leaderBatchSize - 1
+// команд, записывает всю группу в журнал одной записью, немедленно рассылает
+// её соседям и сдвигает тик пульса. Тикер пульса — переменная цикла, а не
+// состояние модуля, поэтому передаётся указателем.
+//
+// Возвращает false, когда узел перестал быть лидером: цикл лидера в этом
+// случае завершается. Самостоятельно управляет cm.mu.
+func (cm *ConsensusModule) handleLeaderApplyBatch(
+	future *logFuture, heartbeatTicker *time.Ticker,
+) (keepRunning bool) {
+	cm.mu.Lock()
+	if cm.cmState.state != Leader {
+		cm.mu.Unlock()
+		future.respond(ErrNotLeader)
+		return false
+	}
+	cm.mu.Unlock()
+
+	ready := []*logFuture{future}
+groupCommit:
+	for range _leaderBatchSize - 1 {
+		select {
+		case f := <-cm.applyCh:
+			ready = append(ready, f)
+		default:
+			break groupCommit
+		}
+	}
+	cm.dispatchLogs(ready)
+	// Немедленная репликация после записи в журнал.
+	cm.leaderSendAEs()
+
+	heartbeatTicker.Stop()
+	heartbeatTicker.Reset(HeartbeatTimeoutMs * time.Millisecond)
+	return true
+}
+
+// handleLeaderCommitAdvance обрабатывает уведомление из канала фиксации:
+// продвигает индекс фиксации, при необходимости объявляет зафиксированной
+// актуальную конфигурацию, затем рассылает новый индекс соседям и применяет
+// зафиксированные записи. Уведомление не новее текущего индекса не делает
+// ничего.
+//
+// Возвращает false, когда лидер перестал быть голосующим зафиксированной
+// конфигурации и шагнул вниз: цикл лидера в этом случае завершается.
+// Самостоятельно управляет cm.mu.
+func (cm *ConsensusModule) handleLeaderCommitAdvance(newCommitIndex int) (keepRunning bool) {
+	cm.mu.Lock()
+	if newCommitIndex > cm.cmState.commitIndex {
+		cm.traceLockedLogf(_traceLevelProgress, "leader sets commitIndex := %d", newCommitIndex)
+		cm.cmState.commitIndex = newCommitIndex
+
+		// Обновить committed конфигурацию, если latest был зафиксирован.
+		if cm.cmState.configurations.latestIndex > cm.cmState.configurations.committedIndex &&
+			newCommitIndex >= cm.cmState.configurations.latestIndex {
+			cm.cmState.configurations.committed = cm.cmState.configurations.latest
+			cm.cmState.configurations.committedIndex = cm.cmState.configurations.latestIndex
+		}
+
+		// Проверить, остался ли лидер в committed конфигурации.
+		if !hasVote(cm.cmState.configurations.committed, cm.id) {
+			cm.traceLockedLogf(_traceLevelLoops, "leader stepping down: not in committed configuration")
+			cm.counters.stepDowns.configExit.Add(1)
+			cm.becomeFollowerLocked(cm.cmState.currentTerm)
+			cm.mu.Unlock()
+			return false
+		}
+		cm.mu.Unlock()
+		// Рассылка нового индекса фиксации соседям выполняется
+		// первой: применение к машине состояний её не задерживает.
+		cm.leaderSendAEs()
+		// Применение по факту фиксации, без ожидания тика.
+		// processLogs сам захватывает cm.mu, поэтому вызывается
+		// только после её освобождения.
+		cm.processLogs(newCommitIndex)
+	} else {
+		cm.mu.Unlock()
+	}
+	return true
+}
+
+// handleVerifyRequest обрабатывает запрос подтверждения лидерства: считает
+// порог кворума по набору голосующих актуальной конфигурации на момент
+// обработки, открывает новый раунд подтверждения, засчитывает собственный
+// голос лидера и, если его одного недостаточно, ставит запрос в очередь
+// ожидающих и будит рассылку соседям.
+//
+// Каждый выход из метода продолжает цикл лидера. Самостоятельно управляет
+// cm.mu.
+func (cm *ConsensusModule) handleVerifyRequest(vf *verifyFuture) {
+	cm.mu.Lock()
+	if cm.cmState.state != Leader {
+		vf.respond(ErrNotLeader)
+		cm.mu.Unlock()
+		return
+	}
+	// Порог кворума — от набора голосующих актуальной (latest)
+	// конфигурации, вычисленный в момент обработки запроса,
+	// а не в момент вызова VerifyLeader.
+	if !hasVote(cm.cmState.configurations.latest, cm.id) {
+		// Лидер не голосующий собственной конфигурации (self-removal):
+		// подтвердить кворумное лидерство нельзя.
+		vf.respond(ErrNotLeader)
+		cm.mu.Unlock()
+		return
+	}
+	vf.quorumSize = quorumSize(len(voterIDs(cm.cmState.configurations.latest)))
+
+	// Привязка запроса к раунду: эпоха инкрементируется под cm.mu,
+	// голоса засчитываются только от AE с dispatchEpoch >= epoch.
+	cm.leaderState.verifyEpoch++
+	vf.epoch = cm.leaderState.verifyEpoch
+
+	// Self-голос лидера (ReadIndex: узел знает свой журнал).
+	vf.vote(cm.id, true)
+	if vf.votes >= vf.quorumSize {
+		cm.mu.Unlock()
+		return
+	}
+	vf.enqueuedAtHeartbeat = cm.leaderState.heartbeatTicks
+	cm.leaderState.pendingVerify = append(cm.leaderState.pendingVerify, vf)
+	// Снимок длины под cm.mu: чтение len(pendingVerify) вне
+	// блокировки гоняло с записью списка из горутин репликации.
+	// Механика списка и снятия завершённых — без изменений.
+	firstPending := len(cm.leaderState.pendingVerify) == 1
+	cm.mu.Unlock()
+	if firstPending {
+		cm.leaderSendAEs()
+	}
+}
+
+// checkQuorumContact шагает вниз, в ведомые, если кворум голосующих
+// актуальной конфигурации не отвечал дольше checkQuorumTimeout. Вызывается
+// из цикла лидера по тику пульса; собственных горутин и таймеров не заводит.
+//
+// Состояние переводится в Follower, но цикл не завершается немедленно:
+// becomeFollowerLocked кладёт токен в канал шага вниз, и цикл забирает
+// собственный токен на ближайшей итерации — той же веткой, что и при
+// обнаружении большего терма. Немедленный возврат оставил бы токен в канале
+// ёмкости 1 и завершил бы следующий цикл лидера этого узла.
+//
+// Самостоятельно захватывает и освобождает cm.mu.
+func (cm *ConsensusModule) checkQuorumContact() {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	if cm.cmState.state != Leader || cm.quorumContactedLocked(time.Now()) {
+		return
+	}
+	cm.traceLockedLogf(
+		_traceLevelKeyEvents,
+		"leader stepping down: no contact with quorum of voters for %v",
+		cm.checkQuorumTimeout,
+	)
+	cm.counters.stepDowns.checkQuorum.Add(1)
+	cm.becomeFollowerLocked(cm.cmState.currentTerm)
+}
+
+// quorumContactedLocked сообщает, отвечал ли кворум голосующих актуальной
+// конфигурации в пределах checkQuorumTimeout к моменту now. Собственный узел
+// считается контактировавшим всегда; отсутствующая отметка трактуется как
+// «контакт только что был».
+// Требует удержания cm.mu.
+func (cm *ConsensusModule) quorumContactedLocked(now time.Time) bool {
+	voters := voterIDs(cm.cmState.configurations.latest)
+	if len(voters) == 0 {
+		return true
+	}
+	contacted := 0
+	for _, voterID := range voters {
+		if voterID == cm.id {
+			contacted++
+			continue
+		}
+		last, ok := cm.leaderState.lastContact[voterID]
+		if !ok || now.Sub(last) <= cm.checkQuorumTimeout {
+			contacted++
+		}
+	}
+	return contacted >= quorumSize(len(voters))
+}
+
 // startLeaderLocked переводит cm в состояние лидера и запускает единый leaderLoop.
 // Требует удержания cm.mu.
 func (cm *ConsensusModule) startLeaderLocked() {
@@ -625,10 +749,28 @@ func (cm *ConsensusModule) startLeaderLocked() {
 	cm.cmState.leaderLastContact = time.Now()
 	cm.cmState.leaderID = cm.id
 
+	// Токен предыдущего лидерства, который никто не забрал, завершил бы
+	// новый цикл лидера сразу после запуска, не переведя состояние
+	// в Follower. Забираем его здесь: канал ёмкости 1, оставленное
+	// значение относится к уже завершённому циклу.
+	select {
+	case <-cm.stepDown:
+	default:
+	}
+
 	// Создание состояния задержки повторов вместе с nextIndex/matchIndex
 	// карты свежие на каждое лидерство.
 	cm.leaderState.replFailures = make(map[int]int)
 	cm.leaderState.lastAttempt = make(map[int]time.Time)
+	// Отметки контакта не переносятся между термами: каждому лидерству —
+	// своя карта. Момент вступления считается контактом со всеми соседями,
+	// иначе проверка кворума сработала бы до первого пульса.
+	cm.leaderState.lastContact = make(map[int]time.Time)
+	// Окно троттлинга перерассылок не переносится между лидерствами: каждому
+	// лидерству — своя карта, поэтому первая перерассылка нового лидерства
+	// немедленна (отсутствующий ключ — окно свободно).
+	cm.leaderState.nextVerifyRedispatchAt = make(map[int]time.Time)
+	now := time.Now()
 
 	cfg := cm.cmState.configurations.latest
 	for _, s := range cfg.ConfigServers {
@@ -638,6 +780,7 @@ func (cm *ConsensusModule) startLeaderLocked() {
 		}
 		cm.leaderState.nextIndex[peerID] = cm.cmState.lastLogIndex + 1
 		cm.leaderState.matchIndex[peerID] = -1
+		cm.leaderState.lastContact[peerID] = now
 
 		// Инициализировать inflightAE для нового peer.
 		if cm.leaderState.inflightAE[peerID] == nil {
@@ -646,7 +789,7 @@ func (cm *ConsensusModule) startLeaderLocked() {
 		cm.leaderState.inflightAE[peerID].Store(false)
 	}
 	cm.traceLockedLogf(
-		0, "becomes Leader; term=%d, nextIndex=%v, matchIndex=%v; len(log)=%d",
+		_traceLevelKeyEvents, "becomes Leader; term=%d, nextIndex=%v, matchIndex=%v; len(log)=%d",
 		cm.cmState.currentTerm, cm.leaderState.nextIndex, cm.leaderState.matchIndex, len(cm.cmState.log),
 	)
 
@@ -702,6 +845,7 @@ func (cm *ConsensusModule) ensureReplicationForLocked(cfg Configuration) {
 		if _, ok := cm.leaderState.nextIndex[peerID]; !ok {
 			cm.leaderState.nextIndex[peerID] = cm.cmState.lastLogIndex + 1
 			cm.leaderState.matchIndex[peerID] = -1
+			cm.recordContactLocked(peerID)
 		}
 		if _, ok := cm.leaderState.inflightAE[peerID]; !ok {
 			cm.leaderState.inflightAE[peerID] = new(atomic.Bool)
@@ -731,6 +875,7 @@ func (cm *ConsensusModule) startStopReplicationLocked(cfg Configuration) {
 			delete(cm.leaderState.inflightAE, peerID)
 			delete(cm.leaderState.nextIndex, peerID)
 			delete(cm.leaderState.matchIndex, peerID)
+			delete(cm.leaderState.lastContact, peerID)
 		}
 	}
 	cm.ensureReplicationForLocked(cfg)

@@ -9,69 +9,65 @@ import (
 	"time"
 )
 
-const submitTimeout = 5 * time.Second
+const _submitTimeout = 5 * time.Second
 
 // Test-only константы бюджетов (единственный владелец).
 // Разделение Protocol timeout / Test deadline / Poll interval.
 
 const (
-	// maxElectionTimeout — максимальный election timeout:
+	// _maxElectionTimeout — максимальный election timeout:
 	// 2*ReelectionTimeoutMs = 762ms.
-	maxElectionTimeout = 2 * ReelectionTimeoutMs * time.Millisecond
+	_maxElectionTimeout = 2 * ReelectionTimeoutMs * time.Millisecond
 
-	// preVoteRound — worst-case раунда Pre-Vote (≈ maxElectionTimeout).
-	preVoteRound = maxElectionTimeout
+	// _preVoteRound — worst-case раунда Pre-Vote (≈ _maxElectionTimeout).
+	_preVoteRound = _maxElectionTimeout
 
-	// inmemRPCTimeout — именованная копия значения InmemTransport.timeout
-	// (transport_inmem.go:35). При рассинхроне с транспортом источник
-	// истины — транспорт.
-	inmemRPCTimeout = 500 * time.Millisecond
+	// _inmemRPCTimeout — тайм-аут одного RPC внутрипроцессного
+	// транспорта; ссылается на _inmemTransportTimeout, рассинхрон
+	// с транспортом исключён компилятором.
+	_inmemRPCTimeout = _inmemTransportTimeout
 
-	// commitBudgetSteady — бюджет ожидания фиксации при устоявшемся лидере:
-	// 4*(applyBatchInterval + inmemRPCTimeout) = 4*(50ms+500ms) = 2.2s.
-	commitBudgetSteady = 4 * (applyBatchInterval + inmemRPCTimeout)
+	// _commitBudgetSteady — бюджет ожидания фиксации при устоявшемся лидере:
+	// 4*(_applyBatchInterval + _inmemRPCTimeout) = 4*(50ms+500ms) = 2.2s.
+	_commitBudgetSteady = 4 * (_applyBatchInterval + _inmemRPCTimeout)
 
-	// failoverBudgetMargin — запас бюджета after-failover для поглощения
+	// _failoverBudgetMargin — запас бюджета after-failover для поглощения
 	// межфазных задержек (worst-case 2*762 + 762 + 50 + 200 ≈ 2.5s).
-	failoverBudgetMargin = 200 * time.Millisecond
+	_failoverBudgetMargin = 200 * time.Millisecond
 
-	// commitBudgetAfterFailover — бюджет ожидания фиксации для сценариев
+	// _commitBudgetAfterFailover — бюджет ожидания фиксации для сценариев
 	// с возможными перевыборами (disconnect/restart/leadership transfer):
-	// 2*maxElectionTimeout + preVoteRound + applyBatchInterval + запас ≈ 2.5–3s.
-	commitBudgetAfterFailover = 2*maxElectionTimeout + preVoteRound + applyBatchInterval + failoverBudgetMargin
+	// 2*_maxElectionTimeout + _preVoteRound + _applyBatchInterval + запас ≈ 2.5–3s.
+	_commitBudgetAfterFailover = 2*_maxElectionTimeout + _preVoteRound + _applyBatchInterval + _failoverBudgetMargin
 
-	// LeaktestBudget — единый бюджет leaktest:
-	// max(inmemRPCTimeout, TCPRPCTimeout) + 100ms = 600ms.
-	LeaktestBudget = 600 * time.Millisecond
-
-	// leaderElectionBudget — бюджет ожидания выборов лидера
-	// (§9 architecture.md): 2*maxElectionTimeout + preVoteRound ≈ 2.3s.
+	// _leaderElectionBudget — бюджет ожидания выборов лидера
+	// (§9 architecture.md): 2*_maxElectionTimeout + _preVoteRound ≈ 2.3s.
 	// Применяется CheckSingleLeader вместо прежнего необоснованного
 	// окна 8×150ms = 1.2s.
-	leaderElectionBudget = 2*maxElectionTimeout + preVoteRound
+	_leaderElectionBudget = 2*_maxElectionTimeout + _preVoteRound
 
-	// singleLeaderBudget — бюджет схождения кластера к единственному лидеру.
-	// Два независимых worst-case: выборы (leaderElectionBudget) и задержка
+	// _singleLeaderBudget — бюджет схождения кластера к единственному лидеру.
+	// Два независимых worst-case: выборы (_leaderElectionBudget) и задержка
 	// step-down призрачного лидера прежнего терма, ограниченная потолком
-	// задержки повторов репликации (maxReplicationBackoff):
+	// задержки повторов репликации (_maxReplicationBackoff):
 	// 2286ms + 1000ms = 3286ms.
-	singleLeaderBudget = leaderElectionBudget + maxReplicationBackoff
+	_singleLeaderBudget = _leaderElectionBudget + _maxReplicationBackoff
 
-	// snapshotConvergenceBudget — бюджет схождения снимка к вершине журнала.
+	// _snapshotConvergenceBudget — бюджет схождения снимка к вершине журнала.
 	// Вывод при интервале снимков, заданном тестом (например, 50 мс):
 	// после возврата последнего Apply машина состояний догоняет журнал
-	// не позднее чем за applyBatchInterval (50 мс), а ближайший тик цикла
+	// не позднее чем за _applyBatchInterval (50 мс), а ближайший тик цикла
 	// снимков создаёт снимок с индексом машины состояний; худший случай —
-	// applyBatchInterval + 2*snapshotInterval = 150 мс при интервале 50 мс.
-	// Значение берётся равным commitBudgetSteady = 2.2 с: тот же способ
+	// _applyBatchInterval + 2*snapshotInterval = 150 мс при интервале 50 мс.
+	// Значение берётся равным _commitBudgetSteady = 2.2 с: тот же способ
 	// вывода из констант, запас более чем 14-кратный, отдельная константа
 	// с литералом не вводится.
-	snapshotConvergenceBudget = commitBudgetSteady
+	_snapshotConvergenceBudget = _commitBudgetSteady
 
-	// pollInterval — интервал опроса condition-wait примитивов
+	// _pollInterval — интервал опроса condition-wait примитивов
 	// (Poll interval модели §9 architecture.md: 5–10ms). Не зависит
 	// от бюджета ожидания.
-	pollInterval = 10 * time.Millisecond
+	_pollInterval = 10 * time.Millisecond
 )
 
 func init() {
@@ -284,15 +280,20 @@ func (h *Harness) DisconnectPeer(id int) {
 	h.mu.Unlock()
 }
 
-// ReconnectPeer повторно подключает сервер ко всем остальным серверам кластера.
+// ReconnectPeer повторно подключает сервер к остальным живым серверам
+// кластера, логически подключённым в этот момент. Сервер, отключённый
+// отдельным вызовом DisconnectPeer, остаётся изолированным: восстановление
+// связи с ним нарушило бы учёт connected и делало бы «отключённый» узел
+// участником кворума.
 //
-// Значения alive снимаются под h.mu до работы с транспортами; мутация
-// connected — отдельной короткой секцией.
+// Значения alive и connected снимаются под h.mu до работы с транспортами;
+// мутация connected — отдельной короткой секцией.
 func (h *Harness) ReconnectPeer(id int) {
 	tlog("Reconnect %d", id)
 	alive := h.aliveSnapshot()
+	connected := h.connectedSnapshot()
 	for j := 0; j < h.n; j++ {
-		if j != id && alive[j] {
+		if j != id && alive[j] && connected[j] {
 			h.transports[id].Connect(ServerID(j), h.transports[j])
 			h.transports[j].Connect(ServerID(id), h.transports[id])
 		}
@@ -420,11 +421,11 @@ func (h *Harness) RestartPeer(id int) {
 // и транспорт узла подключён ко всем соседям, с которыми связь ожидается
 // (alive && connected — разрыв с логически отключённым соседом не является
 // неготовностью, иначе ожидание тянулось бы до исчерпания бюджета).
-// Бюджет — commitBudgetSteady (условия обычно истинны сразу — опрос
+// Бюджет — _commitBudgetSteady (условия обычно истинны сразу — опрос
 // немедленный).
 func (h *Harness) waitForPeerReady(id int) {
 	h.t.Helper()
-	deadline := time.Now().Add(commitBudgetSteady)
+	deadline := time.Now().Add(_commitBudgetSteady)
 	for time.Now().Before(deadline) {
 		// Значения alive/connected снимаются под h.mu, Report()
 		// вызывается вне её (инвариант границ).
@@ -450,7 +451,7 @@ func (h *Harness) waitForPeerReady(id int) {
 		// poll-интервал condition-wait (не фиксированная пауза).
 		time.Sleep(5 * time.Millisecond)
 	}
-	h.t.Fatalf("restarted peer %d did not become ready within %v", id, commitBudgetSteady)
+	h.t.Fatalf("restarted peer %d did not become ready within %v", id, _commitBudgetSteady)
 }
 
 // PeerDropCallsAfterN — больше не поддерживается (RPCProxy удалён).
@@ -472,9 +473,9 @@ func (h *Harness) PeerDontDropCalls(id int) {
 // допустимое переходное состояние: изолированный лидер прежнего терма не
 // имеет кворума, ничего не фиксирует и уходит в step-down только при первом
 // контакте с большим термом, который откладывается задержкой повторов
-// репликации до maxReplicationBackoff; опрос продолжается до схождения.
+// репликации до _maxReplicationBackoff; опрос продолжается до схождения.
 //
-// Бюджет — singleLeaderBudget = leaderElectionBudget + maxReplicationBackoff
+// Бюджет — _singleLeaderBudget = _leaderElectionBudget + _maxReplicationBackoff
 // (два независимых worst-case: выборы и step-down призрачного лидера).
 // Значения connected снимаются под h.mu, Report() опрашивается вне
 // блокировки (инвариант границ). По исчерпании бюджета (ноль лидеров либо
@@ -482,7 +483,7 @@ func (h *Harness) PeerDontDropCalls(id int) {
 // диагностикой nodeStates() (id, роль, терм, connected, alive).
 func (h *Harness) CheckSingleLeader() (int, int) {
 	h.t.Helper()
-	return h.waitSingleLeader(singleLeaderBudget)
+	return h.waitSingleLeader(_singleLeaderBudget)
 }
 
 // waitSingleLeader — общая логика опроса для CheckSingleLeader и
@@ -535,13 +536,13 @@ func (h *Harness) pollSingleLeader(budget time.Duration) (int, int, error) {
 		if !time.Now().Before(deadline) {
 			break
 		}
-		time.Sleep(pollInterval)
+		time.Sleep(_pollInterval)
 	}
 
 	return -1, -1, fmt.Errorf(
 		"no single leader within budget %v (polled %v):\n"+
 			"  expected: exactly one leader among connected peers (election safety)",
-		budget, pollInterval,
+		budget, _pollInterval,
 	)
 }
 
@@ -579,7 +580,7 @@ func (h *Harness) nodeStates() string {
 // логикой опроса (Election Safety: два лидера в одном терме — немедленный
 // фатальный отказ; в разных термах — переходное состояние, шаг-down
 // изолированного лидера откладывается задержкой повторов репликации
-// до maxReplicationBackoff). По исчерпании бюджета — фатальный отказ
+// до _maxReplicationBackoff). По исчерпании бюджета — фатальный отказ
 // с диагностикой nodeStates(), без повторного прохода по бюджету.
 func (h *Harness) WaitForSingleLeader(timeout time.Duration) (int, int) {
 	h.t.Helper()
@@ -612,7 +613,7 @@ func (h *Harness) CheckNoLeader() {
 	}
 }
 
-// waitFor опрашивает предикат cond с интервалом pollInterval, пока он
+// waitFor опрашивает предикат cond с интервалом _pollInterval, пока он
 // не станет истинным либо не истечёт budget.
 //
 // Контракт блокировки (§8 architecture.md,,): cond и diag
@@ -651,11 +652,11 @@ func (h *Harness) waitFor(desc string, budget time.Duration, cond func() bool, d
 	return fmt.Errorf("%s\n  %s", err, h.nodeStates())
 }
 
-// waitCond опрашивает предикат cond с интервалом pollInterval, пока он
+// waitCond опрашивает предикат cond с интервалом _pollInterval, пока он
 // не станет истинным либо не истечёт budget; возвращает nil при успехе,
 // иначе ошибку с бюджетом, описанием и деталями diag.
 //
-// Тестовая инфраструктура по назначению. Файл testharness.go размещён вне
+// Тестовая инфраструктура по назначению. Файл harness_test.go размещён вне
 // _test-сборки по историческим причинам (внешние потребители харнесса
 // живут в других пакетах) и компилируется в обычную сборку пакета raft,
 // поэтому waitCond попадает в production-бинарники как неиспользуемый код;
@@ -675,7 +676,7 @@ func waitCond(desc string, budget time.Duration, cond func() bool, diag func() s
 		if !time.Now().Before(deadline) {
 			break
 		}
-		time.Sleep(pollInterval)
+		time.Sleep(_pollInterval)
 	}
 
 	details := ""
@@ -684,7 +685,7 @@ func waitCond(desc string, budget time.Duration, cond func() bool, diag func() s
 	}
 	return fmt.Errorf(
 		"wait timeout (budget %v, polled %v):\n  expected: %s\n  %s",
-		budget, pollInterval, desc, details,
+		budget, _pollInterval, desc, details,
 	)
 }
 
@@ -752,6 +753,76 @@ func (h *Harness) committedOn(cmd int) (nc int, converged bool) {
 	return nc, false
 }
 
+// commitValuesOn возвращает (nc, lengthsConverged):
+//   - nc — число подключённых узлов, у которых команда cmd присутствует
+//     в h.commits (в любой позиции);
+//   - lengthsConverged == true, когда у всех подключённых узлов равные
+//     длины списков фиксации.
+//
+// В отличие от committedOn, не требует одинаковой позиции/Index записи:
+// после перевыборов предыстории журналов могут расходиться (перезапись
+// незафиксированного хвоста), и для проверки восстановления достаточно
+// наличия команды по значению. Предикат non-fatal (не вызывает
+// t.Error*/t.Fatal*).
+//
+// Контракт: h.mu must be held.
+func (h *Harness) commitValuesOn(cmd int) (nc int, lengthsConverged bool) {
+	commitsLen := -1
+	lengthsEqual := true
+	for i := 0; i < h.n; i++ {
+		if !h.connected[i] {
+			continue
+		}
+		if commitsLen < 0 {
+			commitsLen = len(h.commits[i])
+		} else if len(h.commits[i]) != commitsLen {
+			lengthsEqual = false
+		}
+		for c := range h.commits[i] {
+			if v, ok := h.commits[i][c].Data.(int); ok && v == cmd {
+				nc++
+				break
+			}
+		}
+	}
+	if commitsLen < 0 {
+		return nc, false
+	}
+	return nc, lengthsEqual
+}
+
+// checkCommittedValues утверждает наличие команды cmd по значению на
+// каждом подключённом узле, не требуя одинаковой позиции/Index записи
+// (см. commitValuesOn). Чистый assert БЕЗ ожидания: вызывается после
+// wait по commitValuesOn, когда cmd уже присутствует на всех
+// подключённых узлах; наличие монотонно, поэтому assert не гоняется с
+// коллектором.
+func (h *Harness) checkCommittedValues(cmd int) {
+	h.t.Helper()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	nc := 0
+	for i := 0; i < h.n; i++ {
+		if !h.connected[i] {
+			continue
+		}
+		nc++
+		found := false
+		for c := range h.commits[i] {
+			if v, ok := h.commits[i][c].Data.(int); ok && v == cmd {
+				found = true
+				break
+			}
+		}
+		if !found {
+			h.t.Fatalf("cmd=%d not committed on connected peer %d: commits[%d] = %v", cmd, i, i, h.commits[i])
+		}
+	}
+	if nc == 0 {
+		h.t.Fatalf("cmd=%d: no connected peers", cmd)
+	}
+}
+
 // commitsDiag возвращает строку состояния h.commits для диагностики.
 // Контракт: h.mu must be held.
 func (h *Harness) commitsDiag() string {
@@ -799,7 +870,10 @@ func (h *Harness) CheckCommitted(cmd int) (nc int, index int) {
 		cmdAtC := -1
 		for i := 0; i < h.n; i++ {
 			if h.connected[i] {
-				cmdOfN := h.commits[i][c].Data.(int)
+				cmdOfN, ok := h.commits[i][c].Data.(int)
+				if !ok {
+					h.t.Fatalf("commits[%d][%d]: data %T is not int", i, c, h.commits[i][c].Data)
+				}
 				if cmdAtC >= 0 {
 					if cmdOfN != cmdAtC {
 						h.t.Errorf("got %d, want %d at h.commits[%d][%d]", cmdOfN, cmdAtC, i, c)
@@ -846,16 +920,16 @@ func (h *Harness) CheckCommittedN(cmd int, n int) {
 // подключённых серверах и затем проверяет фиксацию assert'ом
 // CheckCommittedN.
 //
-// Бюджет по умолчанию — commitBudgetAfterFailover: сценарий вызова
+// Бюджет по умолчанию — _commitBudgetAfterFailover: сценарий вызова
 // может содержать перевыборы. Для сценариев с заведомо устоявшимся
-// лидером используйте WaitForCommitBudget(cmd, n, commitBudgetSteady).
+// лидером используйте WaitForCommitBudget(cmd, n, _commitBudgetSteady).
 func (h *Harness) WaitForCommit(cmd int, n int) {
 	h.t.Helper()
-	h.WaitForCommitBudget(cmd, n, commitBudgetAfterFailover)
+	h.WaitForCommitBudget(cmd, n, _commitBudgetAfterFailover)
 }
 
 // WaitForCommitBudget — WaitForCommit с явным бюджетом ожидания
-// (commitBudgetSteady / commitBudgetAfterFailover —).
+// (_commitBudgetSteady / _commitBudgetAfterFailover —).
 //
 // Схема (§8 architecture.md): wait по предикату сходимости committedOn
 // (под h.mu) → assert CheckCommittedN (без h.mu). Раннего return без
@@ -906,6 +980,46 @@ func (h *Harness) WaitForCommitAll(cmd int, timeout time.Duration) {
 	h.CheckCommitted(cmd)
 }
 
+// WaitForCommitConvergedValues ждёт, пока списки фиксации подключённых
+// узлов не сойдутся по длине и команда cmd не появится минимум на n
+// подключённых узлах, затем утверждает наличие cmd по значению на всех
+// подключённых узлах.
+//
+// В отличие от WaitForCommit, не требует одинаковой позиции/Index записи:
+// после перевыборов предыстории журналов могут расходиться (перезапись
+// незафиксированного хвоста), и это требование невыполнимо; для проверки
+// восстановления достаточно наличия команды по значению.
+//
+// Бюджет по умолчанию — _commitBudgetAfterFailover.
+func (h *Harness) WaitForCommitConvergedValues(cmd int, n int) {
+	h.t.Helper()
+	h.WaitForCommitConvergedValuesBudget(cmd, n, _commitBudgetAfterFailover)
+}
+
+// WaitForCommitConvergedValuesBudget — WaitForCommitConvergedValues
+// с явным бюджетом ожидания.
+//
+// Схема: wait по предикату commitValuesOn (равные длины и наличие cmd
+// на >= n узлах) под h.mu → assert checkCommittedValues (без h.mu).
+// Наличие cmd монотонно, поэтому assert выполняется и при успешном
+// ожидании, и при исчерпании бюджета (ожидание не слабее assert'а).
+func (h *Harness) WaitForCommitConvergedValuesBudget(cmd int, n int, budget time.Duration) {
+	h.t.Helper()
+	desc := fmt.Sprintf("cmd=%d present on >=%d connected peers (converged lengths)", cmd, n)
+	err := h.waitFor(
+		desc, budget,
+		func() bool {
+			nc, lengthsConverged := h.commitValuesOn(cmd)
+			return nc >= n && lengthsConverged
+		},
+		h.commitsDiag,
+	)
+	if err != nil {
+		h.t.Errorf("WaitForCommitConvergedValues %v", err)
+	}
+	h.checkCommittedValues(cmd)
+}
+
 // waitForSuffrage ждёт, пока узел observerID не увидит в своей последней
 // конфигурации сервер target с правом голоса suffrage — наблюдаемый признак
 // того, что изменение членства дошло до этого узла и применено.
@@ -926,12 +1040,12 @@ func (h *Harness) waitForSuffrage(observerID int, target ServerID, suffrage Serv
 		if !time.Now().Before(deadline) {
 			break
 		}
-		time.Sleep(pollInterval)
+		time.Sleep(_pollInterval)
 	}
 	h.t.Fatalf(
 		"waitForSuffrage timeout (budget %v, polled %v):\n"+
 			"  expected: server %d sees server %d with suffrage %v\n  %s",
-		budget, pollInterval, observerID, target, suffrage, h.nodeStates(),
+		budget, _pollInterval, observerID, target, suffrage, h.nodeStates(),
 	)
 }
 
@@ -965,12 +1079,12 @@ func (h *Harness) waitForIsolated(id int, budget time.Duration) {
 		if !time.Now().Before(deadline) {
 			break
 		}
-		time.Sleep(pollInterval)
+		time.Sleep(_pollInterval)
 	}
 	h.t.Fatalf(
 		"waitForIsolated timeout (budget %v, polled %v):\n"+
 			"  expected: server %d is disconnected from every live peer\n  %s",
-		budget, pollInterval, id, h.nodeStates(),
+		budget, _pollInterval, id, h.nodeStates(),
 	)
 }
 
@@ -1007,13 +1121,38 @@ func (h *Harness) waitForApplyInflight(id int, want int, budget time.Duration) {
 		if !time.Now().Before(deadline) {
 			break
 		}
-		time.Sleep(pollInterval)
+		time.Sleep(_pollInterval)
 	}
 	h.t.Fatalf(
 		"waitForApplyInflight timeout (budget %v, polled %v):\n"+
 			"  expected: server %d has >=%d inflight Apply futures (got %d)\n  %s",
-		budget, pollInterval, id, want, h.applyInflightCount(id), h.nodeStates(),
+		budget, _pollInterval, id, want, h.applyInflightCount(id), h.nodeStates(),
 	)
+}
+
+// lastLogIndex возвращает индекс последней записи журнала узла id.
+// Читается под cm.mu; h.mu не участвует.
+func (h *Harness) lastLogIndex(id int) int {
+	cm := h.cluster[id]
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	return cm.cmState.lastLogIndex
+}
+
+// waitForLastLogIndex ждёт, пока журнал узла id не дорастёт до индекса want:
+// команда, отправленная клиентом, дошла до лидерского цикла и записана
+// в журнал. Барьер не зависит от скорости применения к машине состояний,
+// в отличие от ожидания непустой очереди inflight.
+func (h *Harness) waitForLastLogIndex(id, want int, budget time.Duration) {
+	h.t.Helper()
+	if err := waitCond(
+		"log of the node reaches the expected index",
+		budget,
+		func() bool { return h.lastLogIndex(id) >= want },
+		func() string { return "lastLogIndex = " + itoa(h.lastLogIndex(id)) },
+	); err != nil {
+		h.t.Fatalf("waitForLastLogIndex(server %d, want %d): %v\n  %s", id, want, err, h.nodeStates())
+	}
 }
 
 // CheckNotCommitted проверяет, что команда cmd ещё не зафиксирована.
@@ -1030,7 +1169,10 @@ func (h *Harness) CheckNotCommitted(cmd int) {
 	for i := 0; i < h.n; i++ {
 		if h.connected[i] {
 			for c := 0; c < len(h.commits[i]); c++ {
-				gotCmd := h.commits[i][c].Data.(int)
+				gotCmd, ok := h.commits[i][c].Data.(int)
+				if !ok {
+					h.t.Fatalf("commits[%d][%d]: data %T is not int", i, c, h.commits[i][c].Data)
+				}
 				if gotCmd == cmd {
 					h.t.Errorf("found %d at commits[%d][%d], expected none", cmd, i, c)
 				}
@@ -1054,16 +1196,9 @@ func (h *Harness) SubmitToServer(serverId int, cmd any) int {
 			return -1
 		}
 		return future.Index()
-	case <-time.After(submitTimeout):
+	case <-time.After(_submitTimeout):
 		return -1
 	}
-}
-
-// DisconnectAll отключает все соединения указанного транспорта.
-func (t *InmemTransport) DisconnectAll() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.peers = make(map[ServerID]*InmemTransport)
 }
 
 func tlog(format string, a ...any) {
