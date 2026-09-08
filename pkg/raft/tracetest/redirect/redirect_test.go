@@ -12,6 +12,8 @@ import (
 
 	"github.com/fortytw2/leaktest"
 	"github.com/vskurikhin/raft"
+	"github.com/vskurikhin/raft/pkg/raft/store"
+	"github.com/vskurikhin/raft/pkg/raft/transp"
 )
 
 // traceLevel — порог трассировки бинарника. Задаётся явно: эмиттер
@@ -61,8 +63,8 @@ func TestTraceRedirect(t *testing.T) {
 	}()
 	ready := make(chan any)
 	cm := raft.NewConsensusModule(
-		0, []int{}, raft.NewInmemTransport("trace-redirect"),
-		raft.NewMapStorage(), raft.NewCommitChannelFSM(commitCh), ready,
+		0, []int{}, transp.NewInmemTransport("trace-redirect"),
+		store.NewMapStorage(), raft.NewCommitChannelFSM(commitCh), ready,
 	)
 	close(ready)
 	t.Cleanup(func() {
@@ -71,8 +73,8 @@ func TestTraceRedirect(t *testing.T) {
 		<-readerDone
 	})
 
-	// Эмиттер трассировки — cm.Stop() (traceLogf(0, "CM.Stop called /
-	// becomes Dead"), печатается при traceCM=1 > 0): после Stop файл
+	// Эмиттер трассировки — cm.Stop() (traceLogf(_traceLevelKeyEvents, "CM.Stop called /
+	// becomes Dead"), печатается при _traceCM=1 > 0): после Stop файл
 	// не пуст.
 	//
 	// Эта же проверка закрывает требование «ошибка I/O не изменила

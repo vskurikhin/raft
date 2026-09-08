@@ -19,27 +19,33 @@ import (
 // resetMetrics обнуляет счётчики и накопители времени ответа между тестами.
 func resetMetrics() {
 	counters := []*atomic.Uint64{
-		&getOK, &getFail, &putOK, &putFail, &verifyOK, &verifyBad,
-		&getDone, &putDone, &verifyDone, &dropped, &latencyDropped,
+		&_getOK, &_getFail, &_putOK, &_putFail, &_verifyOK, &_verifyBad,
+		&_weakGetOK, &_weakGetFail, &_deleteOK, &_deleteFail,
+		&_deleteVerifyOK, &_deleteVerifyBad,
+		&_getDone, &_putDone, &_verifyDone,
+		&_weakGetDone, &_deleteDone, &_deleteVerifyDone,
+		&_dropped, &_latencyDropped,
 	}
 	for _, counter := range counters {
 		counter.Store(0)
 	}
-	getLatency = newLatencyRecorder(latencyPrealloc, 0)
-	putLatency = newLatencyRecorder(latencyPrealloc, 0)
+	_getLatency = newLatencyRecorder(_latencyPrealloc, 0)
+	_putLatency = newLatencyRecorder(_latencyPrealloc, 0)
+	_weakGetLatency = newLatencyRecorder(_latencyPrealloc, 0)
+	_deleteLatency = newLatencyRecorder(_latencyPrealloc, 0)
 }
 
 // setValues подменяет параметры прогона и набор ключей на время теста.
 func setValues(t *testing.T, v config.Values) {
 	t.Helper()
-	origValues, origKeys := values, keys
+	origValues, origKeys := _values, _keys
 	t.Cleanup(func() {
-		values, keys = origValues, origKeys
+		_values, _keys = origValues, origKeys
 	})
-	values = v
-	keys = make([]string, v.KeyCount)
-	for i := range keys {
-		keys[i] = fmt.Sprintf("key-%d", i)
+	_values = v
+	_keys = make([]string, v.KeyCount)
+	for i := range _keys {
+		_keys[i] = fmt.Sprintf("key-%d", i)
 	}
 }
 
@@ -69,6 +75,24 @@ func (s *kvStub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		value, found := s.data[req.Key]
 		s.mu.Unlock()
 		encode(w, getResponse{RespStatus: statusOK, KeyFound: found, Value: value})
+	case strings.HasPrefix(r.URL.Path, "/weak-get/"):
+		// Слабое чтение в стабе ведёт себя как обычное чтение: возвращает
+		// значение ключа без изменения состояния хранилища. Ключ передаётся
+		// path-сегментом GET-запроса (r.URL.Path уже декодирован).
+		key := strings.TrimPrefix(r.URL.Path, "/weak-get/")
+		s.mu.Lock()
+		value, found := s.data[key]
+		s.mu.Unlock()
+		encode(w, getResponse{RespStatus: statusOK, KeyFound: found, Value: value})
+	case strings.HasPrefix(r.URL.Path, "/delete/"):
+		// Удаление извлекает прежнее значение ключа и убирает его из карты.
+		var req getRequest
+		decode(w, r, &req)
+		s.mu.Lock()
+		prev, found := s.data[req.Key]
+		delete(s.data, req.Key)
+		s.mu.Unlock()
+		encode(w, deleteResponse{RespStatus: statusOK, KeyFound: found, PrevValue: prev})
 	case strings.HasPrefix(r.URL.Path, "/put/"):
 		var req putRequest
 		decode(w, r, &req)
@@ -97,6 +121,13 @@ type getResponse struct {
 }
 
 type putResponse struct {
+	RespStatus int
+	KeyFound   bool
+	PrevValue  string
+}
+
+// deleteResponse — ответ удаления, дублирующий DeleteResponse клиента.
+type deleteResponse struct {
 	RespStatus int
 	KeyFound   bool
 	PrevValue  string
@@ -181,7 +212,7 @@ func TestGenerateLimitsConcurrency(t *testing.T) {
 			if peak := maxInFlight.Load(); peak > int64(concurrency) {
 				t.Errorf("max in flight = %d, want at most %d", peak, concurrency)
 			}
-			if getDone.Load() == 0 {
+			if _getDone.Load() == 0 {
 				t.Error("no operations completed")
 			}
 			if inFlight.Load() != 0 {
@@ -212,8 +243,8 @@ func TestGenerateCountsDroppedTicks(t *testing.T) {
 	defer cancel()
 	generate(ctx, client, time.Millisecond, 1)
 
-	if dropped.Load() == 0 {
-		t.Error("dropped = 0, want > 0 for a saturated semaphore")
+	if _dropped.Load() == 0 {
+		t.Error("_dropped = 0, want > 0 for a saturated semaphore")
 	}
 }
 
@@ -246,18 +277,24 @@ func TestOperationCountersCountEachOperationOnce(t *testing.T) {
 	if requests := uint64(stub.requests.Load()); done != requests {
 		t.Errorf("done total = %d, HTTP requests = %d, want equal", done, requests)
 	}
-	if getFail.Load() != 0 || putFail.Load() != 0 {
-		t.Errorf("unexpected failures: get=%d put=%d", getFail.Load(), putFail.Load())
+	if _getFail.Load() != 0 || _putFail.Load() != 0 {
+		t.Errorf("unexpected failures: get=%d put=%d", _getFail.Load(), _putFail.Load())
 	}
-	if verifyBad.Load() != 0 {
-		t.Errorf("verifyBad = %d, want 0", verifyBad.Load())
+	if _verifyBad.Load() != 0 {
+		t.Errorf("_verifyBad = %d, want 0", _verifyBad.Load())
 	}
-	if putDone.Load() != verifyDone.Load() {
-		t.Errorf("putDone = %d, verifyDone = %d, want equal", putDone.Load(), verifyDone.Load())
+	if _putDone.Load() != _verifyDone.Load() {
+		t.Errorf("_putDone = %d, _verifyDone = %d, want equal", _putDone.Load(), _verifyDone.Load())
 	}
-	samples, _ := getLatency.from(0)
-	if uint64(len(samples)) != getDone.Load()+verifyDone.Load() {
-		t.Errorf("GET latency samples = %d, want %d", len(samples), getDone.Load()+verifyDone.Load())
+	// Латентность чтения (GET) и перечитывания (verify) учитывается в разных
+	// рекордерах: verify использует слабое чтение и пишет в _weakGetLatency.
+	samples, _ := _getLatency.from(0)
+	if uint64(len(samples)) != _getDone.Load() {
+		t.Errorf("GET latency samples = %d, want %d", len(samples), _getDone.Load())
+	}
+	weakSamples, _ := _weakGetLatency.from(0)
+	if uint64(len(weakSamples)) != _verifyDone.Load() {
+		t.Errorf("WEAK GET latency samples = %d, want %d", len(weakSamples), _verifyDone.Load())
 	}
 }
 
@@ -317,16 +354,16 @@ func TestOperationCountersOnErrorPaths(t *testing.T) {
 				cancel()
 			}
 
-			if getDone.Load() != operations {
-				t.Errorf("getDone = %d, want %d", getDone.Load(), operations)
+			if _getDone.Load() != operations {
+				t.Errorf("_getDone = %d, want %d", _getDone.Load(), operations)
 			}
-			if getFail.Load() != operations {
-				t.Errorf("getFail = %d, want %d", getFail.Load(), operations)
+			if _getFail.Load() != operations {
+				t.Errorf("_getFail = %d, want %d", _getFail.Load(), operations)
 			}
-			if getOK.Load() != 0 {
-				t.Errorf("getOK = %d, want 0", getOK.Load())
+			if _getOK.Load() != 0 {
+				t.Errorf("_getOK = %d, want 0", _getOK.Load())
 			}
-			if samples, _ := getLatency.from(0); len(samples) != operations {
+			if samples, _ := _getLatency.from(0); len(samples) != operations {
 				t.Errorf("latency samples = %d, want %d", len(samples), operations)
 			}
 		})
@@ -351,8 +388,8 @@ func TestObserveCountsDroppedLatency(t *testing.T) {
 		t.Fatal("запись времени ответа заблокировала горутину запроса")
 	}
 
-	if latencyDropped.Load() != 1 {
-		t.Errorf("latencyDropped = %d, want 1", latencyDropped.Load())
+	if _latencyDropped.Load() != 1 {
+		t.Errorf("_latencyDropped = %d, want 1", _latencyDropped.Load())
 	}
 	if samples, total := recorder.from(0); total != 1 || len(samples) != 1 {
 		t.Errorf("recorded = %d samples, want 1", total)
@@ -389,5 +426,212 @@ func TestPercentileAndMean(t *testing.T) {
 	}
 	if got := percentile(nil, 50); got != 0 {
 		t.Errorf("p50 of empty = %v, want 0", got)
+	}
+}
+
+// TestChooseOp исчерпывающе проверяет лестницу распределения операций для
+// всех r ∈ [0,100) на наборах долей, покрывающих все режимы: нулевые новые
+// доли (инвариант текущего поведения), насыщение одной полосой, полная
+// лестница без усечения и усечения последней достигнутой полосы при сумме
+// долей больше 100. Тест полностью детерминирован и не использует посев
+// генератора случайных чисел.
+func TestChooseOp(t *testing.T) {
+	tests := []struct {
+		name string
+		d, w int
+		g    int
+		// want — эталон результата для каждого r из [0,100).
+		want func(r int) opKind
+	}{
+		{
+			// Нулевые новые доли: поведение и поток обращений к rand точно
+			// текущие — при r<G чтение, иначе запись.
+			name: "zero-new-bands",
+			d:    0, w: 0, g: 66,
+			want: func(r int) opKind {
+				if r < 66 {
+					return opGet
+				}
+				return opPut
+			},
+		},
+		{
+			// Только удаление: полоса DELETE занимает весь диапазон.
+			name: "delete-100",
+			d:    100, w: 0, g: 0,
+			want: func(r int) opKind { return opDelete },
+		},
+		{
+			// Только слабое чтение: полоса WEAK-GET занимает весь диапазон.
+			name: "weak-get-100",
+			d:    0, w: 100, g: 0,
+			want: func(r int) opKind { return opWeakGet },
+		},
+		{
+			// Полная лестница без усечения: DELETE+WEAK-GET+GET == 100,
+			// остаток PUT пуст.
+			name: "full-ladder-100",
+			d:    30, w: 20, g: 50,
+			want: func(r int) opKind {
+				switch {
+				case r < 30:
+					return opDelete
+				case r < 50:
+					return opWeakGet
+				default:
+					return opGet
+				}
+			},
+		},
+		{
+			// Сумма долей больше 100: последняя достигнутая полоса (GET)
+			// усекается до 100, PUT пуст.
+			name: "sum-over-100",
+			d:    40, w: 40, g: 40,
+			want: func(r int) opKind {
+				switch {
+				case r < 40:
+					return opDelete
+				case r < 80:
+					return opWeakGet
+				default:
+					return opGet
+				}
+			},
+		},
+		{
+			// DELETE+WEAK-GET > 100: WEAK-GET усекается, GET и PUT пусты.
+			name: "dw-over-100",
+			d:    60, w: 60, g: 0,
+			want: func(r int) opKind {
+				switch {
+				case r < 60:
+					return opDelete
+				default:
+					return opWeakGet
+				}
+			},
+		},
+		{
+			// DELETE > 100: DELETE усекается, все последующие полосы пусты.
+			name: "d-over-100",
+			d:    150, w: 0, g: 0,
+			want: func(r int) opKind { return opDelete },
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			// Исчерпывающая проверка по всем возможным значениям r ∈ [0,100).
+			for r := 0; r < 100; r++ {
+				got := chooseOp(r, test.d, test.w, test.g)
+				if want := test.want(r); got != want {
+					t.Errorf("chooseOp(%d, %d, %d, %d) = %v, want %v",
+						r, test.d, test.w, test.g, got, want)
+				}
+			}
+		})
+	}
+}
+
+// TestDeletePercentSaturating проверяет интеграционное поведение при
+// DeletePercent=100 и VerifyPercent=100: каждая операция — удаление, после
+// каждого успешного удаления выполняется verify-after-delete слабым чтением,
+// а сумма всех шести *Done равна числу выполненных HTTP-запросов.
+func TestDeletePercentSaturating(t *testing.T) {
+	resetMetrics()
+	setValues(t, config.Values{
+		Concurrency:   4,
+		DeletePercent: 100,
+		KeyCount:      8,
+		RequestRate:   500,
+		ValueSize:     128,
+		VerifyPercent: 100,
+	})
+
+	stub := newKVStub(0)
+	srv := httptest.NewServer(stub)
+	defer srv.Close()
+
+	client := kvclient.New([]string{serverAddr(t, srv)})
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	generate(ctx, client, 2*time.Millisecond, 4)
+
+	requests := uint64(stub.requests.Load())
+	if requests == 0 {
+		t.Fatal("no operations completed")
+	}
+	// Все операции — удаления: никаких чтений и записей других видов.
+	if got := _getDone.Load() + _putDone.Load() + _weakGetDone.Load() + _verifyDone.Load(); got != 0 {
+		t.Errorf("non-delete done = %d, want 0", got)
+	}
+	if got := _deleteDone.Load(); got == 0 {
+		t.Error("_deleteDone = 0, want > 0")
+	}
+	if got := _deleteOK.Load(); got != _deleteDone.Load() {
+		t.Errorf("_deleteOK = %d, want %d", got, _deleteDone.Load())
+	}
+	if got := _deleteFail.Load(); got != 0 {
+		t.Errorf("_deleteFail = %d, want 0", got)
+	}
+	// При VerifyPercent=100 каждое успешное удаление перечитывается слабым
+	// чтением: _deleteVerifyDone учитывается ровно по числу успешных удалений.
+	if got := _deleteVerifyDone.Load(); got != _deleteOK.Load() {
+		t.Errorf("_deleteVerifyDone = %d, want %d", got, _deleteOK.Load())
+	}
+	// Каждый HTTP-запрос — это либо delete, либо verify-after-delete.
+	if got := _deleteDone.Load() + _deleteVerifyDone.Load(); got != requests {
+		t.Errorf("delete+verify requests = %d, want %d", got, requests)
+	}
+	// Ключ после удаления в стабе не найден — все проверки успешны.
+	if got := _deleteVerifyOK.Load(); got != _deleteVerifyDone.Load() {
+		t.Errorf("_deleteVerifyOK = %d, want %d", got, _deleteVerifyDone.Load())
+	}
+	if got := _deleteVerifyBad.Load(); got != 0 {
+		t.Errorf("_deleteVerifyBad = %d, want 0", got)
+	}
+	// Сумма всех шести *Done равна числу выполненных HTTP-запросов: каждая
+	// операция (удаление или перечитывание) даёт ровно один запрос и один
+	// счётчик *Done.
+	if done := doneTotal(); done != requests {
+		t.Errorf("done total = %d, HTTP requests = %d, want equal", done, requests)
+	}
+}
+
+// TestWeakGetPercentSaturating проверяет интеграционное поведение при
+// WeakGetPercent=100: каждая операция — слабое чтение, _weakGetDone равен
+// числу HTTP-запросов стаба.
+func TestWeakGetPercentSaturating(t *testing.T) {
+	resetMetrics()
+	setValues(t, config.Values{
+		Concurrency:    4,
+		KeyCount:       8,
+		RequestRate:    500,
+		ValueSize:      128,
+		WeakGetPercent: 100,
+	})
+
+	stub := newKVStub(0)
+	srv := httptest.NewServer(stub)
+	defer srv.Close()
+
+	client := kvclient.New([]string{serverAddr(t, srv)})
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	generate(ctx, client, 2*time.Millisecond, 4)
+
+	requests := uint64(stub.requests.Load())
+	if requests == 0 {
+		t.Fatal("no operations completed")
+	}
+	// При WeakGetPercent=100 все операции — слабые чтения.
+	if got := _weakGetDone.Load(); got != requests {
+		t.Errorf("_weakGetDone = %d, want %d (all operations are weak-get)", got, requests)
+	}
+	if got := _weakGetOK.Load(); got != _weakGetDone.Load() {
+		t.Errorf("_weakGetOK = %d, want %d", got, _weakGetDone.Load())
+	}
+	if got := _weakGetFail.Load(); got != 0 {
+		t.Errorf("_weakGetFail = %d, want 0", got)
 	}
 }

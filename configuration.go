@@ -3,29 +3,10 @@ package raft
 import (
 	"bytes"
 	"encoding/gob"
+	"errors"
 	"fmt"
 	"slices"
 )
-
-// ServerSuffrage определяет, участвует ли сервер в голосовании.
-type ServerSuffrage int
-
-const (
-	Voter ServerSuffrage = iota + 1
-	Nonvoter
-)
-
-// ConfigServer — один сервер в конфигурации кластера Raft.
-type ConfigServer struct {
-	ID       ServerID
-	Address  ServerAddress
-	Suffrage ServerSuffrage
-}
-
-// Configuration — состав кластера Raft.
-type Configuration struct {
-	ConfigServers []ConfigServer
-}
 
 // ConfigurationChangeCommand — тип изменения конфигурации.
 type ConfigurationChangeCommand int
@@ -76,7 +57,7 @@ func DecodeConfiguration(data []byte) (Configuration, error) {
 // checkConfiguration проверяет конфигурацию на корректность.
 func checkConfiguration(cfg Configuration) error {
 	if len(cfg.ConfigServers) == 0 {
-		return fmt.Errorf("raft: configuration has no servers")
+		return errors.New("raft: configuration has no servers")
 	}
 	seenID := make(map[ServerID]bool)
 	seenAddr := make(map[ServerAddress]bool)
@@ -98,7 +79,7 @@ func checkConfiguration(cfg Configuration) error {
 		}
 	}
 	if !hasVoter {
-		return fmt.Errorf("raft: configuration has no voters")
+		return errors.New("raft: configuration has no voters")
 	}
 	return nil
 }

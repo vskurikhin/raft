@@ -12,6 +12,8 @@ import (
 	"github.com/fortytw2/leaktest"
 	"github.com/vskurikhin/raft"
 	"github.com/vskurikhin/raft/internal/config"
+	"github.com/vskurikhin/raft/pkg/raft/store"
+	"github.com/vskurikhin/raft/pkg/raft/transp"
 )
 
 // TestRunWithEmptyPeers запускает узел без соседей через runWith и
@@ -31,6 +33,30 @@ func TestRunWithEmptyPeers(t *testing.T) {
 	t.Cleanup(stop)
 }
 
+// TestRunWithNonDefaultNodeFlags запускает узел с нестандартными значениями
+// всех четырёх параметров узла: тайм-аут TCP RPC, размер пула, интервал
+// и порог снимков. Проверка значений внутри узла — поведенческая
+// (старт/стоп без ошибок, leaktest чист); маршрут значений теперь прямой —
+// тайм-аут и пул передаются аргументами NewTCPTransport в runWith, а
+// подстановка дефолтов транспорта покрыта тестами transport_tcp_test.go;
+// параметры снимков доказываются юнит-тестами server_test.go.
+func TestRunWithNonDefaultNodeFlags(t *testing.T) {
+	t.Cleanup(leaktest.CheckTimeout(t, raft.LeaktestBudget))
+
+	values := newTestValues(t)
+	values.Peers = map[int]net.Addr{}
+	values.TCPRPCTimeout = 500 * time.Millisecond
+	values.MaxPool = 8
+	values.SnapshotInterval = time.Second
+	values.SnapshotThreshold = 32
+
+	stop, err := runWith(&values)
+	if err != nil {
+		t.Fatalf("runWith with non-default node flags returned unexpectedly: %v", err)
+	}
+	t.Cleanup(stop)
+}
+
 // TestRunWithPeerConnect запускает узел, подключённый к серверу-соседу.
 func TestRunWithPeerConnect(t *testing.T) {
 	t.Cleanup(leaktest.CheckTimeout(t, raft.LeaktestBudget))
@@ -43,8 +69,18 @@ func TestRunWithPeerConnect(t *testing.T) {
 		for range commitChannel {
 		}
 	}()
-	peer := raft.NewServer(1, []int{}, raft.NewCommitChannelFSM(commitChannel), peerReady)
-	peer.Serve(":0")
+	peerTransport, err := transp.NewTCPTransport(":0", 0, 0)
+	if err != nil {
+		t.Fatalf("transp.NewTCPTransport: %v", err)
+	}
+	peer := raft.New(&raft.Config{
+		Fsm:       raft.NewCommitChannelFSM(commitChannel),
+		PeerIds:   []int{},
+		ServerID:  1,
+		Storage:   store.NewMapStorage(),
+		Transport: peerTransport,
+	}, peerReady)
+	peer.Serve()
 	close(peerReady)
 	t.Cleanup(func() {
 		peer.Shutdown()
@@ -163,8 +199,10 @@ func TestStartPprofServesProfiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET %s: %v", url, err)
 	}
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("GET %s: status = %d, want 200", url, resp.StatusCode)
+	if resp != nil {
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("GET %s: status = %d, want 200", url, resp.StatusCode)
+		}
 	}
 }
