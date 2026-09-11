@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/fortytw2/leaktest"
+	"github.com/vskurikhin/raft/pkg/raft/contract"
+	"github.com/vskurikhin/raft/pkg/raft/store"
 )
 
 // -- Тесты подсистемы latency-метрик. ---
@@ -18,7 +20,7 @@ import (
 // утверждения о ЗНАЧЕНИЯХ агрегатов (count/sumUs/среднее) делаются только на
 // CM без запущенной stats — собранном литералом (&ConsensusModule{} /
 // new(ConsensusModule)). Утверждения о поведении допустимы на любом CM.
-// Ни один тест не изменяет traceCM и не вызывает SetTrace
+// Ни один тест не изменяет _traceCM и не вызывает SetTrace
 // (.doc/flaky-test.md).
 
 // TestLatencyObserveNonBlockingExactMean — (литеральный CM).
@@ -120,8 +122,8 @@ func TestLatencyZeroValueCMMetricPaths(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	cm := &ConsensusModule{}
-	cm.storage = NewMapStorage()
-	cm.fsmMutateCh = make(chan []*commitTuple, batchApplyBuffer)
+	cm.storage = store.NewMapStorage()
+	cm.fsmMutateCh = make(chan []*commitTuple, _batchApplyBuffer)
 	cm.shutdownCh = make(chan struct{})
 	cm.leaderState.inflight = make(map[int]*logFuture)
 	cm.cmState.state = Follower
@@ -182,7 +184,7 @@ func TestLatencyZeroValueCMMetricPaths(t *testing.T) {
 // TestLatencyAttributionPerCM — (два литеральных CM). После observe
 // на CM1 обязаны выполняться одновременно CM1.count > 0 И CM2.count == 0:
 // парное положительное утверждение исключает вакуумный проход (P06R2-02).
-// Проверка по значениям агрегатов, без печатного вывода и без мутации traceCM.
+// Проверка по значениям агрегатов, без печатного вывода и без мутации _traceCM.
 func TestLatencyAttributionPerCM(t *testing.T) {
 	cm1 := new(ConsensusModule)
 	cm2 := new(ConsensusModule)
@@ -226,14 +228,14 @@ func TestLatencyReportFormat(t *testing.T) {
 }
 
 // TestLatencyTraceEnabledPredicate — (read-only проверка гейта).
-// Значение traceCM не изменяется: ценность теста — фиксация
+// Значение _traceCM не изменяется: ценность теста — фиксация
 // направления сравнения (<, а не <=) относительно текущего порога.
 func TestLatencyTraceEnabledPredicate(t *testing.T) {
-	if !traceEnabled(traceCM - 1) {
-		t.Errorf("traceEnabled(traceCM-1) = false, want true")
+	if !traceEnabled(_traceCM - 1) {
+		t.Errorf("traceEnabled(_traceCM-1) = false, want true")
 	}
-	if traceEnabled(traceCM) {
-		t.Errorf("traceEnabled(traceCM) = true, want false")
+	if traceEnabled(_traceCM) {
+		t.Errorf("traceEnabled(_traceCM) = true, want false")
 	}
 }
 
@@ -241,7 +243,7 @@ func TestLatencyTraceEnabledPredicate(t *testing.T) {
 // текст трассировки неудачного AE печатает фактически
 // присвоенное значение nextIndex (не ni-1) и поля matchIndex/ConflictIndex/
 // ConflictTerm — ровно тот набор, которого не хватило при разборе обоих
-// инцидентов. Формат проверяется через чистую функцию: мутация traceCM и
+// инцидентов. Формат проверяется через чистую функцию: мутация _traceCM и
 // _traceLogger в тестах запрещена (P06R2-02 T5c).
 func TestFailedAETraceReportsActualNextIndex(t *testing.T) {
 	// Значения инцидента: фактически присвоенный nextIndex = 0 при
@@ -434,7 +436,7 @@ func TestLatencyFsmApplyCountsBatches(t *testing.T) {
 	fsm := &countBatchesFSM{}
 	cm := new(ConsensusModule)
 	cm.fsm = fsm
-	cm.fsmMutateCh = make(chan []*commitTuple, batchApplyBuffer)
+	cm.fsmMutateCh = make(chan []*commitTuple, _batchApplyBuffer)
 	cm.shutdownCh = make(chan struct{})
 	// runFSM регистрируется в cm.wg: Stop() становится барьером
 	// (возврат Stop() гарантирует завершение runFSM).
@@ -534,7 +536,7 @@ func (f *countBatchesFSM) appliedCount() int {
 func (f *countBatchesFSM) Apply(*LogEntry) any { return nil }
 
 // Snapshot — заглушка; в T9 снимки не используются.
-func (f *countBatchesFSM) Snapshot() (FSMSnapshot, error) { return nil, ErrNotImplemented }
+func (f *countBatchesFSM) Snapshot() (FSMSnapshot, error) { return nil, contract.ErrNotImplemented }
 
 // Restore — заглушка; в T9 восстановление не используется.
-func (f *countBatchesFSM) Restore(io.ReadCloser) error { return ErrNotImplemented }
+func (f *countBatchesFSM) Restore(io.ReadCloser) error { return contract.ErrNotImplemented }

@@ -1,9 +1,15 @@
 package config
 
 import (
+	"bytes"
+	"flag"
 	"net"
 	"os"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/vskurikhin/raft"
 )
 
 func TestParsePeerAddress(t *testing.T) {
@@ -162,6 +168,36 @@ func TestParseFlagsTraceLogDefaults(t *testing.T) {
 	}
 }
 
+// TestParseFlagsNodeDefaults — сводная сверка контракта дефолтов четырёх
+// параметров узла. Таблица «флаг → ожидаемое значение» против единого
+// источника — raft.TCPRPCTimeout / DefaultMaxPool /
+// raft.DefaultSnapshotInterval / raft.DefaultSnapshotThreshold. Защита
+// от рассинхрона дефолтов между internal/config и пакетом raft (RISK-023).
+func TestParseFlagsNodeDefaults(t *testing.T) {
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
+
+	os.Args = []string{"raft", "-number", "1"}
+
+	v := ParseFlags()
+
+	cases := []struct {
+		name string
+		got  any
+		want any
+	}{
+		{"tcp-rpc-timeout", v.TCPRPCTimeout, raft.TCPRPCTimeout},
+		{"max-pool", v.MaxPool, DefaultMaxPool},
+		{"snapshot-interval", v.SnapshotInterval, raft.DefaultSnapshotInterval},
+		{"snapshot-threshold", v.SnapshotThreshold, raft.DefaultSnapshotThreshold},
+	}
+	for _, tc := range cases {
+		if tc.got != tc.want {
+			t.Errorf("%s = %v, want default %v", tc.name, tc.got, tc.want)
+		}
+	}
+}
+
 func TestParseFlagsTraceLog(t *testing.T) {
 	origArgs := os.Args
 	t.Cleanup(func() { os.Args = origArgs })
@@ -214,9 +250,9 @@ func TestParseFlagsDataDirDefault(t *testing.T) {
 
 func TestValuesImplements(t *testing.T) {
 	v := Values{
-		RPCAddress: mustParseAddr("127.0.0.1:9990"),
+		RPCAddress: mustParseAddr(t, "127.0.0.1:9990"),
 		Number:     0,
-		Peers:      map[int]net.Addr{1: mustParseAddr("127.0.0.1:9991")},
+		Peers:      map[int]net.Addr{1: mustParseAddr(t, "127.0.0.1:9991")},
 	}
 	if v.Number != 0 {
 		t.Errorf("RequestRate = %d, want 0", v.Number)
@@ -229,10 +265,11 @@ func TestValuesImplements(t *testing.T) {
 	}
 }
 
-func mustParseAddr(s string) net.Addr {
+func mustParseAddr(t *testing.T, s string) net.Addr {
+	t.Helper()
 	addr, err := net.ResolveTCPAddr("tcp", s)
 	if err != nil {
-		panic(err)
+		t.Fatalf("parse addr %q: %v", s, err)
 	}
 	return addr
 }
@@ -275,5 +312,243 @@ func TestParseFlagsProfiling(t *testing.T) {
 	}
 	if v.MutexProfileFraction != 5 {
 		t.Errorf("MutexProfileFraction = %d, want 5", v.MutexProfileFraction)
+	}
+}
+
+func TestParseFlagsMaxPoolDefaults(t *testing.T) {
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
+
+	os.Args = []string{"raft", "-number", "1"}
+
+	v := ParseFlags()
+	if v.MaxPool != DefaultMaxPool {
+		t.Errorf("MaxPool = %d, want default %d", v.MaxPool, DefaultMaxPool)
+	}
+	if DefaultMaxPool != 4 {
+		t.Errorf("DefaultMaxPool = %d, want 4", DefaultMaxPool)
+	}
+}
+
+func TestParseFlagsMaxPool(t *testing.T) {
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
+
+	os.Args = []string{
+		"raft", "-number", "1",
+		"--max-pool", "8",
+	}
+
+	v := ParseFlags()
+	if v.MaxPool != 8 {
+		t.Errorf("MaxPool = %d, want 8", v.MaxPool)
+	}
+}
+
+// TestParseFlagsTCPRPCTimeoutDefaults проверяет дефолт флага -tcp-rpc-timeout:
+// без флага поле Values.TCPRPCTimeout равно raft.TCPRPCTimeout (165 мс).
+// Одновременно это защита от рассинхрона дефолта между internal/config
+// и пакетом raft (RISK-023): единый источник — алиас raft.TCPRPCTimeout.
+func TestParseFlagsTCPRPCTimeoutDefaults(t *testing.T) {
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
+
+	os.Args = []string{"raft", "-number", "1"}
+
+	v := ParseFlags()
+	if v.TCPRPCTimeout != raft.TCPRPCTimeout {
+		t.Errorf("TCPRPCTimeout = %v, want default %v", v.TCPRPCTimeout, raft.TCPRPCTimeout)
+	}
+	if raft.TCPRPCTimeout != 165*time.Millisecond {
+		t.Errorf("raft.TCPRPCTimeout = %v, want 165ms", raft.TCPRPCTimeout)
+	}
+}
+
+// TestParseFlagsTCPRPCTimeout проверяет, что нестандартное значение
+// флага -tcp-rpc-timeout доезжает в поле Values.TCPRPCTimeout.
+func TestParseFlagsTCPRPCTimeout(t *testing.T) {
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
+
+	os.Args = []string{
+		"raft", "-number", "1",
+		"--tcp-rpc-timeout", "500ms",
+	}
+
+	v := ParseFlags()
+	if v.TCPRPCTimeout != 500*time.Millisecond {
+		t.Errorf("TCPRPCTimeout = %v, want 500ms", v.TCPRPCTimeout)
+	}
+}
+
+// TestParseFlagsSnapshotDefaults проверяет дефолты флагов снимков: без флага
+// поля Values.SnapshotInterval/SnapshotThreshold равны экспортированным
+// дефолтам пакета raft. Это защита от рассинхрона дефолтов между
+// internal/config и пакетом raft (RISK-023): единый источник —
+// raft.DefaultSnapshotInterval/raft.DefaultSnapshotThreshold.
+func TestParseFlagsSnapshotDefaults(t *testing.T) {
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
+
+	os.Args = []string{"raft", "-number", "1"}
+
+	v := ParseFlags()
+	if v.SnapshotInterval != raft.DefaultSnapshotInterval {
+		t.Errorf("SnapshotInterval = %v, want default %v", v.SnapshotInterval, raft.DefaultSnapshotInterval)
+	}
+	if v.SnapshotThreshold != raft.DefaultSnapshotThreshold {
+		t.Errorf("SnapshotThreshold = %d, want default %d", v.SnapshotThreshold, raft.DefaultSnapshotThreshold)
+	}
+	if raft.DefaultSnapshotInterval != 3*time.Second {
+		t.Errorf("raft.DefaultSnapshotInterval = %v, want 3s", raft.DefaultSnapshotInterval)
+	}
+	if raft.DefaultSnapshotThreshold != 1024 {
+		t.Errorf("raft.DefaultSnapshotThreshold = %d, want 1024", raft.DefaultSnapshotThreshold)
+	}
+}
+
+// TestParseFlagsSnapshot проверяет, что нестандартные значения флагов
+// -snapshot-interval и -snapshot-threshold доезжают в поля Values.
+func TestParseFlagsSnapshot(t *testing.T) {
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
+
+	os.Args = []string{
+		"raft", "-number", "1",
+		"--snapshot-interval", "10s",
+		"--snapshot-threshold", "2048",
+	}
+
+	v := ParseFlags()
+	if v.SnapshotInterval != 10*time.Second {
+		t.Errorf("SnapshotInterval = %v, want 10s", v.SnapshotInterval)
+	}
+	if v.SnapshotThreshold != 2048 {
+		t.Errorf("SnapshotThreshold = %d, want 2048", v.SnapshotThreshold)
+	}
+}
+
+// TestParseFlagsTimingDefaults проверяет дефолты четырёх временных флагов:
+// без флага поля Values равны экспортированным дефолтам пакета raft.
+func TestParseFlagsTimingDefaults(t *testing.T) {
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
+
+	os.Args = []string{"raft", "-number", "1"}
+
+	v := ParseFlags()
+	cases := []struct {
+		name string
+		got  time.Duration
+		want time.Duration
+	}{
+		{"heartbeat-timeout", v.HeartbeatTimeout, raft.DefaultHeartbeatTimeout},
+		{"ticker-timeout", v.TickerTimeout, raft.DefaultTickerTimeout},
+		{"reelection-timeout", v.ReelectionTimeout, raft.DefaultReelectionTimeout},
+		{"apply-batch-interval", v.ApplyBatchInterval, raft.DefaultApplyBatchInterval},
+	}
+	for _, tc := range cases {
+		if tc.got != tc.want {
+			t.Errorf("%s = %v, want default %v", tc.name, tc.got, tc.want)
+		}
+	}
+}
+
+// TestParseFlagsTiming проверяет, что нестандартные значения временных
+// флагов доезжают в поля Values.
+func TestParseFlagsTiming(t *testing.T) {
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
+
+	os.Args = []string{
+		"raft", "-number", "1",
+		"--heartbeat-timeout", "40ms",
+		"--ticker-timeout", "30ms",
+		"--reelection-timeout", "500ms",
+		"--apply-batch-interval", "60ms",
+	}
+
+	v := ParseFlags()
+	if v.HeartbeatTimeout != 40*time.Millisecond {
+		t.Errorf("HeartbeatTimeout = %v, want 40ms", v.HeartbeatTimeout)
+	}
+	if v.TickerTimeout != 30*time.Millisecond {
+		t.Errorf("TickerTimeout = %v, want 30ms", v.TickerTimeout)
+	}
+	if v.ReelectionTimeout != 500*time.Millisecond {
+		t.Errorf("ReelectionTimeout = %v, want 500ms", v.ReelectionTimeout)
+	}
+	if v.ApplyBatchInterval != 60*time.Millisecond {
+		t.Errorf("ApplyBatchInterval = %v, want 60ms", v.ApplyBatchInterval)
+	}
+}
+
+// TestValidateTimingFlags_Delegation проверяет, что обёртка делегирует
+// проверку raft.ValidateTiming: валидная четвёрка даёт nil, нарушение
+// даёт ошибку с именем параметра.
+func TestValidateTimingFlags_Delegation(t *testing.T) {
+	if err := validateTimingFlags(33*time.Millisecond, 21*time.Millisecond, 381*time.Millisecond, 50*time.Millisecond); err != nil {
+		t.Errorf("validateTimingFlags(pre-change defaults) = %v, want nil", err)
+	}
+
+	err := validateTimingFlags(200*time.Millisecond, 21*time.Millisecond, 381*time.Millisecond, 50*time.Millisecond)
+	if err == nil {
+		t.Fatal("validateTimingFlags = nil, want error for heartbeat 200ms")
+	}
+	if !strings.Contains(err.Error(), "heartbeat-timeout") || !strings.Contains(err.Error(), "82") {
+		t.Errorf("error %q must mention heartbeat-timeout and 82", err)
+	}
+}
+
+// TestParseFlagsTimingFailFast проверяет, что невалидная комбинация
+// временных флагов отклоняется с сообщением о параметре, значении и
+// требовании (проверяется на уровне обёртки, т.к. log.Fatalf завершает
+// процесс).
+func TestParseFlagsTimingFailFast(t *testing.T) {
+	err := validateTimingFlags(33*time.Millisecond, 21*time.Millisecond, 300*time.Millisecond, 50*time.Millisecond)
+	if err == nil {
+		t.Fatal("validateTimingFlags = nil, want error for C1 violation")
+	}
+	for _, want := range []string{"reelection-timeout", "heartbeat-timeout"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+}
+
+// TestParseFlagsTimingHelp проверяет, что подсказки временных флагов
+// содержат предупреждения о межпараметрических связях и фиксированном
+// check-quorum. Проверка по строкам подсказок, которые выводятся в -help.
+func TestParseFlagsTimingHelp(t *testing.T) {
+	fs := flag.NewFlagSet("raft", flag.ContinueOnError)
+	var buf bytes.Buffer
+	fs.SetOutput(&buf)
+	fs.Duration("heartbeat-timeout", raft.DefaultHeartbeatTimeout,
+		"Leader heartbeat interval (default 33ms). Upper bound derives from the "+
+			"fixed 330ms check-quorum timeout: beyond 82ms a leader steps down "+
+			"on a single lost packet; the 82ms bound is reachable only with "+
+			"reelection-timeout >= 10x heartbeat-timeout (with the default "+
+			"340ms the effective ceiling is 34ms)")
+	fs.Duration("ticker-timeout", raft.DefaultTickerTimeout,
+		"Election timer polling tick (default 20ms); must be at most "+
+			"reelection-timeout/10")
+	fs.Duration("reelection-timeout", raft.DefaultReelectionTimeout,
+		"Base of the randomized election timeout, actual timeout is in "+
+			"[reelection, 2*reelection) (default 340ms); must be at least 10x "+
+			"heartbeat-timeout; also gates the pre-vote suppression window "+
+			"[reelection, 2*reelection); check-quorum stays fixed at 330ms and "+
+			"does not scale with this flag")
+	fs.Duration("apply-batch-interval", raft.DefaultApplyBatchInterval,
+		"Leader-side safety-net apply batching interval (default 50ms); must "+
+			"not exceed reelection-timeout")
+	_ = fs.Parse([]string{"-h"})
+
+	help := buf.String()
+	for _, want := range []string{
+		"330", "82ms", "33ms", "check-quorum", "reelection-timeout/10", "10x heartbeat-timeout", "reelection-timeout",
+	} {
+		if !strings.Contains(help, want) {
+			t.Errorf("help output does not contain %q", want)
+		}
 	}
 }

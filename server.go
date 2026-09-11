@@ -7,92 +7,175 @@ import (
 	"time"
 )
 
-// Server — тонкая обёртка над TCPTransport и ConsensusModule для
+// TransportManager — транспорт с управлением соединениями и
+// завершением: расширяет Transport адресной книгой соседей и
+// закрытием. Требуется Server для подключения/отключения соседей
+// и остановки. Реализация — TCPTransport (pkg/raft/transp).
+type TransportManager interface {
+	Transport
+	Connect(peerID ServerID, addr string)
+	Disconnect(peerID ServerID)
+	DisconnectAll()
+	Close()
+}
+
+// Server — тонкая обёртка над транспортом и ConsensusModule для
 // обратной совместимости с cmd/main.go и pkg/kvservice.
 // В тестах (Harness) не используется — вместо него применяется
-// InmemTransport напрямую.
+// внутрипроцессный транспорт напрямую.
 type Server struct {
 	mu sync.Mutex
 
-	serverID int
-	peerIds  []int
-	maxPool  int
-
-	storage       Storage
 	fsm           FSM
 	snapshotStore SnapshotStore
+	storage       Storage
 
-	transport *TCPTransport
 	cm        *ConsensusModule
+	transport TransportManager
+
+	peerIds  []int
+	serverID int
 
 	ready <-chan any
 	quit  chan any
 
-	tcpRPCTimeout time.Duration
+	snapshotInterval  time.Duration
+	snapshotThreshold int
+
+	// Временные параметры узла (см. TimerConfig): копируются из Config
+	// и применяются к ConsensusModule в Serve.
+	applyBatchInterval time.Duration
+	heartbeatTimeout   time.Duration
+	reelectionTimeout  time.Duration
+	tickerTimeout      time.Duration
 }
 
 // Config — конфигурация для создания нового сервера Raft.
 type Config struct {
-	PeerAddresses map[int]net.Addr
-	PeerIds       []int
-	RPCAddress    string
-	ServerID      int
+	// ApplyBatchInterval — интервал батча применения записей к FSM
+	// (0 = умолчание).
+	ApplyBatchInterval time.Duration
 
 	Fsm FSM
 
-	// MaxPool — максимальное количество соединений в пуле на один целевой
-	// адрес (0 = defaultMaxPool).
-	MaxPool int
+	// HeartbeatTimeout — период пульса лидера (0 = умолчание).
+	HeartbeatTimeout time.Duration
+
+	PeerAddresses map[int]net.Addr
+	PeerIds       []int
+	ServerID      int
+
+	// ReelectionTimeout — база тайм-аута выборов (0 = умолчание).
+	ReelectionTimeout time.Duration
+
+	// SnapshotInterval — интервал проверки необходимости снимка
+	// (0 = дефолт конструктора).
+	SnapshotInterval time.Duration
 
 	// SnapshotStore — хранилище снимков. Если nil, снимки отключены.
 	SnapshotStore SnapshotStore
 
+	// SnapshotThreshold — минимальное количество записей после последнего
+	// снимка, при котором создаётся новый снимок (0 = дефолт конструктора).
+	SnapshotThreshold int
+
 	Storage Storage
 
-	TCPRPCTimeout time.Duration
+	// TickerTimeout — такт тикера выборов (0 = умолчание).
+	TickerTimeout time.Duration
+
+	// Transport — транспорт с адресной книгой соседей и закрытием,
+	// создаётся вызывающим и передаётся в Server.
+	Transport TransportManager
 }
 
 // New создаёт новый сервер Raft с заданной конфигурацией cfg, хранилищем storage,
 // каналом уведомления ready и FSM для применения зафиксированных записей журнала.
 func New(cfg *Config, ready <-chan any) *Server {
+	if IsNilInterface(cfg.Transport) {
+		panic("raft: Config.Transport is nil or typed nil: the transport must be created and passed by the caller")
+	}
 	s := &Server{
-		fsm:           cfg.Fsm,
-		maxPool:       cfg.MaxPool,
-		peerIds:       cfg.PeerIds,
-		quit:          make(chan any),
-		ready:         ready,
-		serverID:      cfg.ServerID,
-		snapshotStore: cfg.SnapshotStore,
-		storage:       cfg.Storage,
-		tcpRPCTimeout: cfg.TCPRPCTimeout,
+		applyBatchInterval: cfg.ApplyBatchInterval,
+		fsm:                cfg.Fsm,
+		heartbeatTimeout:   cfg.HeartbeatTimeout,
+		peerIds:            cfg.PeerIds,
+		quit:               make(chan any),
+		ready:              ready,
+		reelectionTimeout:  cfg.ReelectionTimeout,
+		serverID:           cfg.ServerID,
+		snapshotInterval:   cfg.SnapshotInterval,
+		snapshotStore:      cfg.SnapshotStore,
+		snapshotThreshold:  cfg.SnapshotThreshold,
+		storage:            cfg.Storage,
+		tickerTimeout:      cfg.TickerTimeout,
+		transport:          cfg.Transport,
 	}
 	return s
 }
 
-// NewServer создаёт новый сервер Raft с указанными идентификатором serverID,
-// списком идентификаторов узлов-соседей peerIds, хранилищем storage, каналом
-// уведомления ready и FSM для применения зафиксированных записей журнала.
-func NewServer(serverID int, peerIds []int, fsm FSM, ready <-chan any) *Server {
-	return New(&Config{
-		ServerID:      serverID,
-		Fsm:           fsm,
-		PeerIds:       peerIds,
-		Storage:       NewMapStorage(),
-		TCPRPCTimeout: TCPRPCTimeout,
-	}, ready)
-}
+// Serve создаёт ConsensusModule поверх переданного транспорта.
+func (s *Server) Serve() {
+	s.cm = NewConsensusModule(s.serverID, s.peerIds, s.transport, s.storage, s.fsm, s.ready, s.snapshotStore)
 
-// Serve запускает TCP-транспорт на указанном адресе и создаёт ConsensusModule.
-func (s *Server) Serve(address string) {
-	transport, err := NewTCPTransport(address, TCPRPCTimeout, s.maxPool)
-	if err != nil {
-		log.Fatalf("raft: failed to create TCPTransport: %v", err)
+	// Применение временных параметров из конфигурации сразу после создания
+	// CM и до закрытия ready — CM ещё не участвует в выборах. Нормализация
+	// «<= 0 → умолчание» выполняется безусловно, вне зависимости от того,
+	// включены ли снимки. Сеттер — единая точка записи временных полей.
+	heartbeat := s.heartbeatTimeout
+	if heartbeat <= 0 {
+		heartbeat = DefaultHeartbeatTimeout
 	}
-	s.mu.Lock()
-	s.transport = transport
-	s.mu.Unlock()
+	ticker := s.tickerTimeout
+	if ticker <= 0 {
+		ticker = DefaultTickerTimeout
+	}
+	reelection := s.reelectionTimeout
+	if reelection <= 0 {
+		reelection = DefaultReelectionTimeout
+	}
+	applyBatch := s.applyBatchInterval
+	if applyBatch <= 0 {
+		applyBatch = DefaultApplyBatchInterval
+	}
 
-	s.cm = NewConsensusModule(s.serverID, s.peerIds, transport, s.storage, s.fsm, s.ready, s.snapshotStore)
+	// Защитная проверка программного входа: эффективные значения после
+	// нормализации обязаны проходить валидацию. При нарушении — стратегия
+	// немедленного отказа (log.Fatalf) по прецеденту конструктора CM.
+	if err := ValidateTiming(TimerConfig{
+		ApplyBatch: applyBatch,
+		Heartbeat:  heartbeat,
+		Reelection: reelection,
+		Ticker:     ticker,
+	}); err != nil {
+		log.Fatalf("raft: Serve: invalid timing configuration: %v", err)
+	}
+
+	s.cm.setTimerConfig(TimerConfig{
+		ApplyBatch: applyBatch,
+		Heartbeat:  heartbeat,
+		Reelection: reelection,
+		Ticker:     ticker,
+	})
+
+	// Применение параметров снимков из конфигурации сразу после создания
+	// CM и до закрытия ready — CM ещё не участвует в выборах.
+	// Выполняется только при включённых снимках (snapshotStore != nil);
+	// нулевые и отрицательные значения заменяются дефолтами конструктора.
+	// Сеттер — единая точка записи параметров снимков; сигнал snapshotCh
+	// безопасен (shouldSnapshot — фильтр) и лишь ускоряет применение нового
+	// интервала.
+	if s.snapshotStore != nil {
+		interval := s.snapshotInterval
+		if interval <= 0 {
+			interval = DefaultSnapshotInterval
+		}
+		threshold := s.snapshotThreshold
+		if threshold <= 0 {
+			threshold = DefaultSnapshotThreshold
+		}
+		s.cm.SetSnapshotConfig(threshold, _defaultTrailingLogs, interval)
+	}
 }
 
 // Apply отправляет команду в Raft-кластер и возвращает ApplyFuture.
@@ -103,15 +186,13 @@ func (s *Server) Apply(cmd any, timeout time.Duration) ApplyFuture {
 	return s.cm.Apply(cmd, timeout)
 }
 
-// ConnectToPeerWithTimeout сохраняет адрес соседа в TCPTransport.
+// ConnectToPeerWithTimeout сохраняет адрес соседа в транспорте.
 // В новой архитектуре транспорт подключается лениво (при первом RPC).
 // Метод сохранён для обратной совместимости с kvservice.
 func (s *Server) ConnectToPeerWithTimeout(peerID int, addr net.Addr, _ time.Duration) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.transport != nil {
-		s.transport.Connect(ServerID(peerID), addr.String())
-	}
+	s.transport.Connect(ServerID(peerID), addr.String())
 	return nil
 }
 
@@ -124,9 +205,7 @@ func (s *Server) ConnectToPeer(peerID int, addr net.Addr) error {
 func (s *Server) DisconnectPeer(peerID int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.transport != nil {
-		s.transport.Disconnect(ServerID(peerID))
-	}
+	s.transport.Disconnect(ServerID(peerID))
 	return nil
 }
 
@@ -134,18 +213,13 @@ func (s *Server) DisconnectPeer(peerID int) error {
 func (s *Server) DisconnectAll() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.transport != nil {
-		s.transport.DisconnectAll()
-	}
+	s.transport.DisconnectAll()
 }
 
-// GetListenAddr возвращает адрес, на котором слушает TCPTransport.
+// GetListenAddr возвращает адрес, на котором слушает транспорт.
 func (s *Server) GetListenAddr() net.Addr {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.transport == nil {
-		return nil
-	}
 	addr, err := net.ResolveTCPAddr("tcp", string(s.transport.LocalAddr()))
 	if err != nil {
 		return nil
@@ -175,9 +249,7 @@ func (s *Server) VerifyLeader() Future {
 func (s *Server) Shutdown() {
 	s.cm.Stop()
 	s.mu.Lock()
-	if s.transport != nil {
-		s.transport.Close()
-	}
+	s.transport.Close()
 	s.mu.Unlock()
 	close(s.quit)
 }

@@ -3,9 +3,22 @@ package raft
 import (
 	"bytes"
 	"encoding/gob"
+	"errors"
 	"fmt"
 	"log"
 	"time"
+)
+
+// Ключи постоянного состояния в Storage. Имя файла данных на диске —
+// <ключ>.dat (FileStorage), поэтому написание ключей — формат
+// персистентности: изменение ключа делает уже записанные данные
+// нечитаемыми без переименования файлов.
+const (
+	_storageKeyCurrentTerm       = "currentTerm"
+	_storageKeyVotedFor          = "votedFor"
+	_storageKeyLog               = "log"
+	_storageKeyLastSnapshotIndex = "lastSnapshotIndex"
+	_storageKeyLastSnapshotTerm  = "lastSnapshotTerm"
 )
 
 // persistToStorage сохраняет постоянное состояние CM в cm.storage.
@@ -13,7 +26,7 @@ import (
 // (т.е. когда лог действительно изменился), что позволяет избежать
 // дорогого gob.Encode(cm.cmState.log) на каждом heartbeat или RPC.
 //
-// Порядок записи ключей важен для крэш-безопасности:
+// Порядок записи ключей важен для отказоустойчивости:
 // currentTerm, votedFor, lastSnapshotIndex, lastSnapshotTerm, затем log.
 // Снимок-ключи пишутся ДО усечённого лога: окно «лог усечён, а
 // lastSnapshotIndex старый/отсутствует» устраняется; обратное окно
@@ -26,85 +39,87 @@ func (cm *ConsensusModule) persistToStorage() {
 	start := time.Now()
 	defer func() {
 		elapsed := time.Since(start)
-		cm.traceLockedLogf(2, "persistToStorage elapsed %s", elapsed)
+		cm.traceLockedLogf(_traceLevelProgress, "persistToStorage elapsed %s", elapsed)
 	}()
 	var termData bytes.Buffer
 	if err := gob.NewEncoder(&termData).Encode(cm.cmState.currentTerm); err != nil {
 		log.Fatal(err)
 	}
-	cm.storage.Set("currentTerm", termData.Bytes())
+	cm.storage.Set(_storageKeyCurrentTerm, termData.Bytes())
 
 	var votedData bytes.Buffer
 	if err := gob.NewEncoder(&votedData).Encode(cm.cmState.votedFor); err != nil {
 		log.Fatal(err)
 	}
-	cm.storage.Set("votedFor", votedData.Bytes())
+	cm.storage.Set(_storageKeyVotedFor, votedData.Bytes())
 
 	var snapIdxData bytes.Buffer
 	if err := gob.NewEncoder(&snapIdxData).Encode(cm.cmState.lastSnapshotIndex); err != nil {
 		log.Fatal(err)
 	}
-	cm.storage.Set("lastSnapshotIndex", snapIdxData.Bytes())
+	cm.storage.Set(_storageKeyLastSnapshotIndex, snapIdxData.Bytes())
 
 	var snapTermData bytes.Buffer
 	if err := gob.NewEncoder(&snapTermData).Encode(cm.cmState.lastSnapshotTerm); err != nil {
 		log.Fatal(err)
 	}
-	cm.storage.Set("lastSnapshotTerm", snapTermData.Bytes())
+	cm.storage.Set(_storageKeyLastSnapshotTerm, snapTermData.Bytes())
 
 	if cm.cmState.logNeedsPersist {
 		var logData bytes.Buffer
 		if err := gob.NewEncoder(&logData).Encode(cm.cmState.log); err != nil {
 			log.Fatal(err)
 		}
-		cm.storage.Set("log", logData.Bytes())
+		cm.storage.Set(_storageKeyLog, logData.Bytes())
 		cm.cmState.logNeedsPersist = false
 	}
 }
 
 // restoreFromStorage восстанавливает постоянное состояние данного CM
 // из хранилища. Должен вызываться в конструкторе до запуска какой-либо
-// конкурентной работы.
+// конкурентной работы. Вызывает rebuildLastLogLocked и
+// rebuildTermIndexMapLocked без удержания cm.mu: это допустимо только
+// в однопоточном конструкторе, до запуска первой горутины.
 func (cm *ConsensusModule) restoreFromStorage() {
-	if termData, found := cm.storage.Get("currentTerm"); found {
-		d := gob.NewDecoder(bytes.NewBuffer(termData))
-		if err := d.Decode(&cm.cmState.currentTerm); err != nil {
-			log.Fatal(err)
-		}
-	} else {
+	termData, found := cm.storage.Get(_storageKeyCurrentTerm)
+	if !found {
 		log.Fatal("currentTerm not found in storage")
 	}
-	if votedData, found := cm.storage.Get("votedFor"); found {
-		d := gob.NewDecoder(bytes.NewBuffer(votedData))
-		if err := d.Decode(&cm.cmState.votedFor); err != nil {
-			log.Fatal(err)
-		}
-	} else {
+	d := gob.NewDecoder(bytes.NewBuffer(termData))
+	if err := d.Decode(&cm.cmState.currentTerm); err != nil {
+		log.Fatal(err)
+	}
+	votedData, found := cm.storage.Get(_storageKeyVotedFor)
+	if !found {
 		log.Fatal("votedFor not found in storage")
 	}
-	if logData, found := cm.storage.Get("log"); found {
-		d := gob.NewDecoder(bytes.NewBuffer(logData))
-		if err := d.Decode(&cm.cmState.log); err != nil {
-			log.Fatal(err)
-		}
-	} else {
+	d = gob.NewDecoder(bytes.NewBuffer(votedData))
+	if err := d.Decode(&cm.cmState.votedFor); err != nil {
+		log.Fatal(err)
+	}
+	logData, found := cm.storage.Get(_storageKeyLog)
+	if !found {
 		log.Fatal("log not found in storage")
+	}
+	d = gob.NewDecoder(bytes.NewBuffer(logData))
+	if err := d.Decode(&cm.cmState.log); err != nil {
+		log.Fatal(err)
 	}
 	if err := cm.checkSnapshotKeysConsistency(); err != nil {
 		log.Fatal(err)
 	}
-	cm.rebuildLastLog()
-	cm.rebuildTermIndexMap()
+	cm.rebuildLastLogLocked()
+	cm.rebuildTermIndexMapLocked()
 
 	cm.rebuildConfigurations()
 
-	if snapIdxData, found := cm.storage.Get("lastSnapshotIndex"); found {
+	if snapIdxData, found := cm.storage.Get(_storageKeyLastSnapshotIndex); found {
 		d := gob.NewDecoder(bytes.NewBuffer(snapIdxData))
 		if err := d.Decode(&cm.cmState.lastSnapshotIndex); err != nil {
 			log.Fatal(err)
 		}
 	}
-	if snapTermData, found := cm.storage.Get("lastSnapshotTerm"); found {
+	if snapTermData, found := cm.storage.Get(_storageKeyLastSnapshotTerm); found {
 		d := gob.NewDecoder(bytes.NewBuffer(snapTermData))
 		if err := d.Decode(&cm.cmState.lastSnapshotTerm); err != nil {
 			log.Fatal(err)
@@ -124,13 +139,13 @@ func (cm *ConsensusModule) checkSnapshotKeysConsistency() error {
 		return nil
 	}
 	firstIndex := cm.cmState.log[0].Index
-	if _, found := cm.storage.Get("lastSnapshotIndex"); !found {
+	if _, found := cm.storage.Get(_storageKeyLastSnapshotIndex); !found {
 		return fmt.Errorf(
 			"log compacted (first index %d) but lastSnapshotIndex missing in storage",
 			firstIndex,
 		)
 	}
-	if _, found := cm.storage.Get("lastSnapshotTerm"); !found {
+	if _, found := cm.storage.Get(_storageKeyLastSnapshotTerm); !found {
 		return fmt.Errorf(
 			"log compacted (first index %d) but lastSnapshotTerm missing in storage",
 			firstIndex,
@@ -146,7 +161,7 @@ func (cm *ConsensusModule) checkSnapshotKeysConsistency() error {
 // как у restoreFromStorage). Все ошибки и нарушения инвариантов
 // возвращаются вызывающему; решение о фатальности принимает вызывающий код.
 func (cm *ConsensusModule) restoreFromSnapshotStore() error {
-	if isNilInterface(cm.snapshotStore) {
+	if IsNilInterface(cm.snapshotStore) {
 		return nil
 	}
 	snapshots, err := cm.snapshotStore.List()
@@ -158,7 +173,7 @@ func (cm *ConsensusModule) restoreFromSnapshotStore() error {
 	if len(snapshots) > 0 {
 		latest := snapshots[0] // List упорядочен от новых к старым
 		if latest == nil || latest.ID == "" {
-			return fmt.Errorf("snapshot store returned invalid snapshot meta")
+			return errors.New("snapshot store returned invalid snapshot meta")
 		}
 		if latest.Index < cm.cmState.lastSnapshotIndex {
 			return fmt.Errorf(
@@ -187,7 +202,7 @@ func (cm *ConsensusModule) restoreFromSnapshotStore() error {
 			cm.cmState.configurations.latestIndex = meta.ConfigIndex
 		}
 		if meta.Index != cm.cmState.lastSnapshotIndex {
-			// Окно крэша между Close снимка и persistToStorage
+			// Окно сбоя между Close снимка и persistToStorage
 			// снимок в постоянном хранилище новее диска —
 			// самовосстановление метаданных из стора с повторным персистом.
 			cm.cmState.lastSnapshotIndex = meta.Index
@@ -205,7 +220,7 @@ func (cm *ConsensusModule) restoreFromSnapshotStore() error {
 		if cm.cmState.lastLogIndex < meta.Index {
 			// Пустой или короткий журнал (trailing=0): синхронизация
 			// lastLogIndex/lastLogTerm со снимком — симметрично
-			// handleInstallSnapshot. Иначе rebuildLastLog() оставил бы
+			// handleInstallSnapshot. Иначе rebuildLastLogLocked() оставил бы
 			// lastLogIndex = -1 при lastApplied > 0 (нарушение инварианта
 			// lastApplied <= lastLogIndex, новая запись получила бы
 			// индекс, уже покрытый снимком).

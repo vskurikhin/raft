@@ -309,14 +309,14 @@ func TestDisconnectLeaderAndFollower(t *testing.T) {
 
 	c := h.NewClient()
 	for r := 0; r < 10; r++ {
-		ctx, cancel := context.WithTimeout(context.Background(), 300*raft.Quantum*time.Millisecond)
-		_, _, err := c.Get(ctx, "key0")
+		ctx, cancel := context.WithTimeout(context.Background(), 900*time.Millisecond)
+		_, _, err := c.ConsensusGet(ctx, "key0")
 		cancel()
 		if err != nil {
 			break
 		}
 		// poll-интервал condition-wait: ждём, пока потеря кворума
-		// станет наблюдаемой (Get начнёт завершаться ошибкой).
+		// станет наблюдаемой (ConsensusGet начнёт завершаться ошибкой).
 		time.Sleep(50 * time.Millisecond)
 	}
 	h.CheckGetTimesOut(c, "key0")
@@ -459,7 +459,7 @@ func TestRestartServiceGetsNewPort(t *testing.T) {
 		t.Fatalf("service %d has no HTTP address after restart", victim)
 	}
 	if newAddr == oldAddr {
-		t.Fatalf("service %d reused address %q after restart on \":0\"", victim, newAddr)
+		t.Fatalf(`service %d reused address %q after restart on ":0"`, victim, newAddr)
 	}
 
 	// Перезапущенный сервис отвечает по НОВОМУ адресу: /verifyleader/
@@ -477,11 +477,11 @@ func TestRestartServiceGetsNewPort(t *testing.T) {
 // и отвечает как на лидере, так и на follower'е).
 func checkServiceReachable(t *testing.T, addr string) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 600*raft.Quantum*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 1800*time.Millisecond)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(
-		ctx, http.MethodPost, "http://"+addr+"/verifyleader/", http.NoBody,
+		ctx, http.MethodGet, "http://"+addr+"/verifyleader/", http.NoBody,
 	)
 	if err != nil {
 		t.Fatalf("cannot build request for %s: %v", addr, err)
