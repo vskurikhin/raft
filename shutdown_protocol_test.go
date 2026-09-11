@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/fortytw2/leaktest"
+	"github.com/vskurikhin/raft/pkg/raft/contract"
 )
 
 // stressIterationBudget — граница одной итерации стресс-тестов:
@@ -128,11 +129,11 @@ func TestJoinFiniteWhenReceiverStopped(t *testing.T) {
 
 	start := time.Now()
 	_, err := h.transports[0].AppendEntries(ServerID(1), AppendEntriesArgs{})
-	if !errors.Is(err, ErrEnqueueTimeout) {
+	if !errors.Is(err, contract.ErrEnqueueTimeout) {
 		t.Fatalf("AppendEntries: got %v, want ErrEnqueueTimeout", err)
 	}
-	if elapsed := time.Since(start); elapsed > 2*inmemRPCTimeout {
-		t.Fatalf("enqueue blocked for %v, want <= %v", elapsed, 2*inmemRPCTimeout)
+	if elapsed := time.Since(start); elapsed > 2*_inmemRPCTimeout {
+		t.Fatalf("enqueue blocked for %v, want <= %v", elapsed, 2*_inmemRPCTimeout)
 	}
 
 	// Join отправителя конечен.
@@ -186,7 +187,7 @@ func TestCrashPeerQuiesce(t *testing.T) {
 // вспомогательных горутин стресс-тестов; недостижимость условия
 // выражается возвратом -1.
 func (h *Harness) waitLeader() int {
-	deadline := time.Now().Add(commitBudgetAfterFailover)
+	deadline := time.Now().Add(_commitBudgetAfterFailover)
 	for time.Now().Before(deadline) {
 		for i := 0; i < h.n; i++ {
 			if h.connected[i] {

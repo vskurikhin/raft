@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/fortytw2/leaktest"
+	"github.com/vskurikhin/raft/pkg/raft/store"
 )
 
 // mockTransportAE — минимальная реализация Transport для тестов,
@@ -190,7 +191,7 @@ func TestLeaderSendAEs_Deduplication(t *testing.T) {
 	cm.leaderSendAEs()
 
 	// Негативный assert — budgeted negative window (классификация).
-	// Бюджет выведен из протокольной константы HeartbeatTimeoutMs:
+	// Бюджет выведен из протокольной константы DefaultHeartbeatTimeout:
 	// за интервал heartbeat сломанная дедупликация успела бы выполнить
 	// как минимум один AppendEntries.
 	//
@@ -200,7 +201,7 @@ func TestLeaderSendAEs_Deduplication(t *testing.T) {
 	// assert, уменьшение — ослабляет его.
 	// keep: timing — окно является предметом проверки в этом месте;
 	// наблюдаемого признака состояния здесь нет.
-	sleepMs(HeartbeatTimeoutMs)
+	sleepMs(int(DefaultHeartbeatTimeout.Milliseconds()))
 
 	if calls := mock.callCount.Load(); calls > 0 {
 		t.Errorf("expected 0 AppendEntries calls (dedup active), got %d", calls)
@@ -212,13 +213,13 @@ func TestLeaderSendAEs_Deduplication(t *testing.T) {
 	cm.leaderState.inflightAE[1].Store(false)
 	cm.leaderSendAEs()
 
-	deadline := time.Now().Add(inmemRPCTimeout)
+	deadline := time.Now().Add(_inmemRPCTimeout)
 	for mock.callCount.Load() == 0 {
 		if !time.Now().Before(deadline) {
 			t.Fatalf("expected AppendEntries call after inflightAE reset within %v, got 0",
-				inmemRPCTimeout)
+				_inmemRPCTimeout)
 		}
-		time.Sleep(pollInterval)
+		time.Sleep(_pollInterval)
 	}
 }
 
@@ -285,7 +286,7 @@ func TestInflightAE_DeferReset(t *testing.T) {
 //  1. ConsensusModule в состоянии Leader, lastSnapshotIndex = 3, журнал
 //     начинается после снимка (запись с индексом 4), nextIndex[1] = 3.
 //  2. Установить inflightAE[1] = true.
-//  3. Вызвать leaderSendAEsToPeer — предикат плана даёт replicationSnapshot
+//  3. Вызвать leaderSendAEsToPeer — предикат плана даёт _replicationSnapshot
 //     (prev = 2: 0 <= 2, 2 != lastSnapshotIndex = 3, 2 < first = 4), поэтому
 //     исполняется путь снимка (leaderSendSnapshot).
 //  4. Проверить, что InstallSnapshot действительно вызван (installCallCount
@@ -330,7 +331,7 @@ func TestInflightAE_DeferResetOnSnapshotPath(t *testing.T) {
 
 		id:        0,
 		transport: transport,
-		storage:   NewMapStorage(),
+		storage:   store.NewMapStorage(),
 		snapshotStore: &mockSnapshotStoreCfg{
 			listResult: []*SnapshotMeta{{ID: "snap-3", Index: 3, Term: 1, Size: 100}},
 			openMeta:   &SnapshotMeta{Index: 3, Term: 1, Size: 100},
@@ -503,21 +504,6 @@ func TestInflightAE_CASConcurrent(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-}
-
-// mockSnapshotStore — минимальная реализация SnapshotStore для тестов.
-type mockSnapshotStore struct {
-	SnapshotStore
-}
-
-func (m *mockSnapshotStore) List() ([]*SnapshotMeta, error) {
-	return []*SnapshotMeta{
-		{Index: 0, Term: 1, Size: 0},
-	}, nil
-}
-
-func (m *mockSnapshotStore) Open(_ string) (*SnapshotMeta, io.ReadCloser, error) {
-	return &SnapshotMeta{Index: 0, Term: 1, Size: 0}, io.NopCloser(bytes.NewReader(nil)), nil
 }
 
 // mockSnapshotStoreCfg — конфигурируемая реализация SnapshotStore для
@@ -1030,21 +1016,62 @@ func TestLeaderSendAEsToPeer_SnapshotPredicateBoundaries(t *testing.T) {
 }
 
 // TestReplicationBackoffDelay_Clamp — проверка формулы задержки
-// delay = min(HeartbeatTimeoutMs·2^min(f,5),
-// 1000) мс; при f >= 5 задержка не превышает потолок 1000 мс
-// (33·2⁵ = 1056 без ограничения диапазоном).
+// delay = min(base·2^min(f,5), ceiling), где потолок вычисляется от базы:
+// max(_minReplicationBackoff, _replicationBackoffHeartbeats × base).
+// На умолчальном пульсе 33 мс потолок 30·33 = 990 < 1000 мс проходит через
+// нижнее ограничение и равен ровно 1000 мс; ступени f=1…5 —
+// 66/132/264/528/1000 мс.
 func TestReplicationBackoffDelay_Clamp(t *testing.T) {
-	if got := replicationBackoffDelay(0); got != 0 {
+	if got := replicationBackoffDelay(DefaultHeartbeatTimeout, 0); got != 0 {
 		t.Fatalf("delay(0) = %v, want 0 (no backoff without failures)", got)
 	}
-	if got := replicationBackoffDelay(1); got != 66*time.Millisecond {
+	if got := replicationBackoffDelay(DefaultHeartbeatTimeout, 1); got != 66*time.Millisecond {
 		t.Fatalf("delay(1) = %v, want 66ms (33·2)", got)
 	}
-	if got := replicationBackoffDelay(5); got != 1000*time.Millisecond {
+	if got := replicationBackoffDelay(DefaultHeartbeatTimeout, 5); got != 1000*time.Millisecond {
 		t.Fatalf("delay(5) = %v, want 1000ms (clamped ceiling)", got)
 	}
-	if got := replicationBackoffDelay(50); got != 1000*time.Millisecond {
+	if got := replicationBackoffDelay(DefaultHeartbeatTimeout, 50); got != 1000*time.Millisecond {
 		t.Fatalf("delay(50) = %v, want 1000ms (clamped ceiling)", got)
+	}
+
+	// Вычисляемый потолок на умолчании побитово равен нижнему ограничению:
+	// на f=5 и f=6 экспонента упирается в ровно 1000 мс.
+	if got := replicationBackoffDelay(DefaultHeartbeatTimeout, 5); got != 1000*time.Millisecond {
+		t.Fatalf("delay(DefaultHB, 5) = %v, want bitwise 1000ms", got)
+	}
+	if got := replicationBackoffDelay(DefaultHeartbeatTimeout, 6); got != 1000*time.Millisecond {
+		t.Fatalf("delay(DefaultHB, 6) = %v, want bitwise 1000ms", got)
+	}
+
+	// При базе 5 мс потолок 1000 мс не связывает ни одну ступень:
+	// экспонента усекается на f=5 (5·2⁵ = 160 мс) и остаётся ниже потолка
+	// при любом числе ошибок — ступени 10/20/40/80/160 мс.
+	base5 := 5 * time.Millisecond
+	steps5 := []time.Duration{10, 20, 40, 80, 160}
+	for i, want := range steps5 {
+		f := i + 1
+		if got := replicationBackoffDelay(base5, f); got != want*time.Millisecond {
+			t.Fatalf("delay(5ms, %d) = %v, want %v", f, got, want*time.Millisecond)
+		}
+	}
+
+	// При базе MaxHeartbeatTimeout (82 мс — верх диапазона ValidateTiming)
+	// потолок 30·82 = 2460 мс связывает экспоненту на f=5:
+	// ступени 164/328/656/1312 мс, потолок побитово 2460 мс.
+	baseMax := MaxHeartbeatTimeout
+	stepsMax := []time.Duration{164, 328, 656, 1312}
+	for i, want := range stepsMax {
+		f := i + 1
+		if got := replicationBackoffDelay(baseMax, f); got != want*time.Millisecond {
+			t.Fatalf("delay(MaxHeartbeatTimeout, %d) = %v, want %v", f, got, want*time.Millisecond)
+		}
+	}
+	if got := replicationBackoffDelay(baseMax, 5); got != 2460*time.Millisecond {
+		t.Fatalf("delay(MaxHeartbeatTimeout, 5) = %v, want bitwise 2460ms (=30·82)", got)
+	}
+	if got := replicationBackoffDelay(baseMax, 6); got != 2460*time.Millisecond {
+		t.Fatalf("delay(MaxHeartbeatTimeout, 6) = %v, want bitwise 2460ms (=30·82)", got)
 	}
 }
 
@@ -1105,7 +1132,7 @@ func TestReplicationBackoff_LeaderStateReinitialized(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	cm := &ConsensusModule{}
-	cm.storage = NewMapStorage()
+	cm.storage = store.NewMapStorage()
 	cm.shutdownCh = make(chan struct{})
 	cm.commitCh = make(chan int, 1)
 	cm.stepDown = make(chan struct{}, 1)
@@ -1160,7 +1187,7 @@ func TestReplicationBackoff_SkipsTransportAndDoesNotRecordAttempt(t *testing.T) 
 			matchIndex:             map[int]int{1: 0},
 			inflightAE:             map[int]*atomic.Bool{1: new(atomic.Bool)},
 			nextVerifyRedispatchAt: map[int]time.Time{},
-			// Одна транспортная ошибка при HeartbeatTimeoutMs = 33 даёт
+			// Одна транспортная ошибка при DefaultHeartbeatTimeout = 33 даёт
 			// задержку 66 мс, поэтому только что зафиксированная попытка
 			// гарантирует активную задержку.
 			replFailures: map[int]int{1: 1},
@@ -1248,7 +1275,7 @@ func TestLeaderSendAEsToPeer_HigherTermStepsDown(t *testing.T) {
 		},
 		id:         0,
 		transport:  mock,
-		storage:    NewMapStorage(),
+		storage:    store.NewMapStorage(),
 		stepDown:   make(chan struct{}, 1),
 		shutdownCh: make(chan struct{}),
 	}
