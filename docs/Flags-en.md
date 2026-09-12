@@ -21,8 +21,8 @@ Invariants"); values are expressed as a whole number of milliseconds.
 | Flag | Default | Unit | Bounds |
 |---|---|---|---|
 | `-apply-batch-interval` | 50 ms | duration | [1 ms; 5000 ms], whole ms, ≤ reelection-timeout |
-| `-heartbeat-timeout` | 33 ms | duration | [5 ms; 82 ms], whole ms; 82 = ⌊330/4⌋ |
-| `-reelection-timeout` | 340 ms | duration | [200 ms; 30 000 ms], whole ms, ≥ 10·heartbeat-timeout |
+| `-heartbeat-timeout` | 33 ms | duration | [5 ms; 100 ms], whole ms; 100 = ⌊400/4⌋ |
+| `-reelection-timeout` | 430 ms | duration | [200 ms; 30 000 ms], whole ms, ≥ 10·heartbeat-timeout, > 2 × raft.TCPRPCTimeout = 400 ms (INV-T3; the quorum check window is fixed and is not scaled by `-tcp-rpc-timeout`) |
 | `-ticker-timeout` | 20 ms | duration | [1 ms; 1000 ms], whole ms, ≤ reelection-timeout/10 |
 
 - `-apply-batch-interval` — the interval at which the leader loop
@@ -30,14 +30,17 @@ Invariants"); values are expressed as a whole number of milliseconds.
   machine; commit-channel notifications accumulated over the interval
   are merged into a single batch.
 - `-heartbeat-timeout` — the leader heartbeat period. The upper bound
-  of 82 ms is derived from the fixed 330 ms check-quorum timeout:
+  of 100 ms is derived from the fixed 400 ms check-quorum timeout:
   within the checking window the leader must contact its peers at
   least four times; rounding down to whole milliseconds gives
-  ⌊330/4⌋ = 82 ms (`raft.go`, `MaxHeartbeatTimeout`).
+  ⌊400/4⌋ = 100 ms (`raft.go`, `MaxHeartbeatTimeout`).
 - `-reelection-timeout` — the base of the election timeout: the actual
   timeout is drawn at random from [reelection-timeout;
   2·reelection-timeout); the same window bounds the pre-vote
-  suppression on the receiving side.
+  suppression on the receiving side. The base must be strictly greater
+  than the fixed quorum check window 2 × raft.TCPRPCTimeout = 400 ms
+  (INV-T3); the window is a compile-time constant and is not scaled by
+  `-tcp-rpc-timeout`.
 - `-ticker-timeout` — the election timer polling tick; it determines
   the quantization error of the election timeout.
 
@@ -45,11 +48,31 @@ Invariants"); values are expressed as a whole number of milliseconds.
 
 | Flag | Default | Unit | Bounds |
 |---|---|---|---|
-| `-tcp-rpc-timeout` | 165 ms (raft.TCPRPCTimeout) | duration | > 0 |
+| `-tcp-connect-timeout` | 165 ms (raft.ConnectionTCPRPCTimeout) | duration | > 0, whole ms; ≤ `-tcp-rpc-timeout` (INV-T1); together with it ≤ 400 ms (INV-T4) |
+| `-tcp-rpc-timeout` | 200 ms (raft.TCPRPCTimeout) | duration | > 0, whole ms; with INV-T4: ≤ 400 ms − `-tcp-connect-timeout` (with the default `-tcp-connect-timeout` of 165 ms — rpc ≤ 235 ms) |
+| `-install-snapshot-timeout` | 310 ms (raft.InstallSnapshotTimeout) | duration | > 0, whole ms; ≥ `-tcp-rpc-timeout` (INV-T2) |
 
-`-tcp-rpc-timeout` — the timeout of a single RPC call to a peer in the
-TCP transport. The leader check-quorum timeout is fixed at 330 ms
-(2 × 165 ms) and does NOT scale with this flag.
+`-tcp-rpc-timeout` — the timeout of a single request/reply RPC exchange
+with a peer in the TCP transport. The leader check-quorum timeout is
+fixed at 400 ms (2 × raft.TCPRPCTimeout — a compile-time constant) and
+does NOT scale with this flag. The consumer response window (response)
+is constructively equal to the flag value: there is no separate flag
+for it.
+
+`-tcp-connect-timeout` — the timeout of establishing a TCP connection
+only (DialTimeout). The effective window of one RPC on a new connection
+is the sum of the connection establishment and the exchange deadline:
+connect + rpc. The INV-T1 invariant requires connect ≤ rpc; the
+summative ban INV-T4 — connect + rpc together must not exceed the fixed
+quorum check window 2 × raft.TCPRPCTimeout = 400 ms. Consequence for
+bounds: rpc ≤ 400 − connect (the default `-tcp-connect-timeout` 165 ms — rpc ≤ 235 ms).
+
+`-install-snapshot-timeout` — the base of the snapshot transfer
+deadline: the final deadline scales with the data volume (blocks of
+256 KiB) on the sender. The flag controls both sides of the transfer:
+the sender deadline and the receiver response window (max with
+responseTimeout), including small snapshots below 256 KiB. The INV-T2
+invariant requires the base to be at least `-tcp-rpc-timeout`.
 
 ### Snapshots
 
@@ -135,13 +158,13 @@ milliseconds, and cross-parameter requirements. All violations are
 collected into a single error (`errors.Join`) and reported as one
 message of the form `invalid Raft timing flags: …`; each violation
 names the flag, the actual value, and the requirement (for example:
-`heartbeat-timeout must be between 5ms and 82ms, got 90ms`).
+`heartbeat-timeout must be between 5ms and 100ms, got 110ms`).
 
 | Parameter | Range | Cross-parameter requirement |
 |---|---|---|
-| `heartbeat-timeout` | [5 ms; 82 ms], whole ms | upper bound 82 ms = ⌊330/4⌋ — from the fixed 330 ms quorum check |
+| `heartbeat-timeout` | [5 ms; 100 ms], whole ms | upper bound 100 ms = ⌊400/4⌋ — from the fixed 400 ms quorum check |
 | `ticker-timeout` | [1 ms; 1000 ms], whole ms | ≤ reelection-timeout/10 |
-| `reelection-timeout` | [200 ms; 30 000 ms], whole ms | ≥ 10·heartbeat-timeout |
+| `reelection-timeout` | [200 ms; 30 000 ms], whole ms | ≥ 10·heartbeat-timeout, > 2 × raft.TCPRPCTimeout = 400 ms (INV-T3) |
 | `apply-batch-interval` | [1 ms; 5000 ms], whole ms | ≤ reelection-timeout |
 
 Cross-parameter invariants:
@@ -153,20 +176,38 @@ Cross-parameter invariants:
 - `apply-batch-interval` ≤ reelection-timeout — the apply batch must
   not delay the node's reaction longer than the reelection base.
 
+### TCP Transport Timeout Invariants
+
+The three TCP transport timeout flags are validated at startup by pure
+functions in `internal/config`: individual bounds (a positive value, a
+whole number of milliseconds) and hard cross-parameter invariants. All
+violations are collected into a single error (`errors.Join`) and
+reported as `invalid TCP timeout flags: …`; the INV-T3 invariant (the
+reelection base) is reported as `invalid election/quorum timing: …`.
+
+| Invariant | Requirement | Example violation |
+|---|---|---|
+| INV-T1 | `-tcp-connect-timeout` ≤ `-tcp-rpc-timeout` | `-tcp-connect-timeout=230ms` with `-tcp-rpc-timeout=170ms` (230 > 170; the sum 400 ≤ 400 — the only violation) |
+| INV-T2 | `-install-snapshot-timeout` ≥ `-tcp-rpc-timeout` | `-install-snapshot-timeout=100ms` with `-tcp-rpc-timeout=200ms` |
+| INV-T4 | `-tcp-connect-timeout` + `-tcp-rpc-timeout` ≤ 2 × raft.TCPRPCTimeout = 400 ms | `-tcp-connect-timeout=165ms` with `-tcp-rpc-timeout=300ms` (the sum 465 > 400; INV-T1 holds — the only violation) |
+| INV-T3 | `-reelection-timeout` > 2 × raft.TCPRPCTimeout = 400 ms (from the constant) | `-reelection-timeout=400ms` (400 > 400 is false; the only violation) |
+
 Examples:
 
 - A valid combination: `-heartbeat-timeout=40ms
-  -reelection-timeout=450ms` — 450 ≥ 10·40 = 400 and 40 ≤ 82 hold;
-  with the default ticker of 20 ms and batch of 50 ms, 20 ≤ 450/10 =
-  45 and 50 ≤ 450 also hold.
-- An invalid value: `-heartbeat-timeout=90ms` — above the upper range
-  bound of 82 ms.
-- An invalid pairing: `-heartbeat-timeout=40ms` with the default
-  `-reelection-timeout=340ms` — violates 340 ≥ 10·40 = 400.
+  -reelection-timeout=430ms` — 430 ≥ 10·40 = 400 and 40 ≤ 100 hold;
+  with the default ticker of 20 ms and batch of 50 ms, 20 ≤ 430/10 =
+  43 and 50 ≤ 430 also hold.
+- An invalid value: `-heartbeat-timeout=110ms` — above the upper range
+  bound of 100 ms.
+- An invalid pairing: `-heartbeat-timeout=45ms
+  -reelection-timeout=440ms` — violates 440 ≥ 10·45 = 450.
 
-Besides the timing flags, startup rejects immediately: a
-non-positive `-tcp-rpc-timeout`, a negative `-max-pool`, a
-non-positive `-snapshot-interval`, and a `-snapshot-threshold` below 1
+Besides the timing flags, startup rejects immediately: invalid values
+of the three TCP transport timeout flags (individual bounds and the
+INV-T1/INV-T2/INV-T4 invariants), a violation of the INV-T3 reelection
+base invariant, a negative `-max-pool`, a non-positive
+`-snapshot-interval`, and a `-snapshot-threshold` below 1
 (`internal/config/config.go`).
 
 ## Node Profile vs Stand Profile
@@ -179,13 +220,14 @@ default.
 | Parameter | Node flag default | Stand value (Makefile) |
 |---|---|---|
 | Heartbeat period (`-heartbeat-timeout` / `HEARTBEAT_TIMEOUT`) | 33 ms | 45 ms |
-| Election timeout base (`-reelection-timeout` / `REELECTION_TIMEOUT`) | 340 ms | 500 ms |
+| Election timeout base (`-reelection-timeout` / `REELECTION_TIMEOUT`) | 430 ms | 500 ms |
 | Election ticker tick (`-ticker-timeout` / `TICKER_TIMEOUT`) | 20 ms | 20 ms |
 | Apply batch interval (`-apply-batch-interval` / `APPLY_BATCH_INTERVAL`) | 50 ms | 50 ms |
 | Trace level (`-trace-log-level` / `TRACE_LOG_LEVEL`) | 1 | 0 |
 
-The stand profile is valid: 500 ≥ 10·45 = 450, 45 ≤ 82, 20 ≤ 500/10 =
-50, 50 ≤ 500.
+The stand profile is valid: 500 ≥ 10·45 = 450, 45 ≤ 100, 20 ≤ 500/10 =
+50, 50 ≤ 500, 500 > 2 · raft.TCPRPCTimeout = 400 — INV-T3 from the
+constant.
 
 Running the stand with the node defaults (the full set of variables —
 so that the recipe does not depend on the current values of the
@@ -193,15 +235,15 @@ so that the recipe does not depend on the current values of the
 
 ```bash
 make start-raft APPLY_BATCH_INTERVAL=50 HEARTBEAT_TIMEOUT=33 \
-  REELECTION_TIMEOUT=340 TICKER_TIMEOUT=20
+  REELECTION_TIMEOUT=430 TICKER_TIMEOUT=20
 ```
 
 Raising the heartbeat is bounded from above by the invariant
 `reelection-timeout ≥ 10·heartbeat-timeout`: for a given reelection
 base the heartbeat ceiling equals reelection-timeout/10. With the node
-default of 340 ms the ceiling is 34 ms; with the stand value of
+default of 430 ms the ceiling is 43 ms; with the stand value of
 500 ms it is 50 ms (the stand heartbeat of 45 ms keeps a 5 ms margin).
-The range's own upper bound of 82 ms applies independently of this.
+The range's own upper bound of 100 ms applies independently of this.
 
 ## loadkv Load Generator Flags
 

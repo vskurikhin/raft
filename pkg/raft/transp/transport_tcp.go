@@ -81,7 +81,11 @@ type TCPTransport struct {
 	consumerCh chan contract.RPC
 	localAddr  contract.ServerAddress
 	listener   net.Listener
-	timeout    time.Duration
+
+	connectionTimeout      time.Duration
+	genericRPCTimeout      time.Duration
+	installSnapshotTimeout time.Duration
+	responseTimeout        time.Duration
 
 	mu    sync.Mutex
 	peers map[contract.ServerID]string
@@ -102,10 +106,19 @@ type TCPTransport struct {
 
 var _ contract.Transport = (*TCPTransport)(nil)
 
+type TCPTimeouts struct {
+	ConnectionTimeout      time.Duration
+	GenericRPCTimeout      time.Duration
+	InstallSnapshotTimeout time.Duration
+	ResponseTimeout        time.Duration
+}
+
 // NewTCPTransport создаёт новый TCPTransport, слушающий на указанном адресе.
-// Принимает адрес для прослушивания, таймаут и максимальный размер пула
-// соединений (0 = _defaultMaxPool). Запускает acceptLoop в отдельной горутине.
-func NewTCPTransport(addr string, timeout time.Duration, maxPool int) (*TCPTransport, error) {
+// Принимает адрес для прослушивания, тайм-ауты TCPTimeouts и максимальный
+// размер пула соединений (0 = _defaultMaxPool). Нулевое поле каждого
+// тайм-аута заменяется константой: 165/200/310/200 мс (установка соединения,
+// обычный RPC, снимок, ответ). Запускает acceptLoop в отдельной горутине.
+func NewTCPTransport(addr string, timeouts TCPTimeouts, maxPool int) (*TCPTransport, error) {
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("raft: failed to listen on %s: %w", addr, err)
@@ -113,24 +126,40 @@ func NewTCPTransport(addr string, timeout time.Duration, maxPool int) (*TCPTrans
 	if maxPool <= 0 {
 		maxPool = _defaultMaxPool
 	}
+	genRPCTimeout := timeouts.GenericRPCTimeout
 	// Защитная проверка: нулевой тайм-аут (например, из нулевой конфигурации
 	// или неявного нуля в литерале) заменяется дефолтом, чтобы транспорт всегда
 	// имел действующие дедлайны соединения, отправки и чтения. Это защитная
 	// проверка, а не молчаливое исправление: недокументированная возможность
 	// «0 = без дедлайнов» изымается из контракта конструктора.
-	if timeout <= 0 {
-		timeout = contract.TCPRPCTimeout
+	if genRPCTimeout <= 0 {
+		genRPCTimeout = contract.TCPRPCTimeout
+	}
+	connRPCTimeout := timeouts.ConnectionTimeout
+	if connRPCTimeout <= 0 {
+		connRPCTimeout = contract.ConnectionTCPRPCTimeout
+	}
+	isTimeout := timeouts.InstallSnapshotTimeout
+	if isTimeout <= 0 {
+		isTimeout = contract.InstallSnapshotTimeout
+	}
+	respTimeout := timeouts.ResponseTimeout
+	if respTimeout <= 0 {
+		respTimeout = contract.TCPRPCTimeout
 	}
 	t := &TCPTransport{
-		consumerCh:  make(chan contract.RPC),
-		localAddr:   contract.ServerAddress(listener.Addr().String()),
-		listener:    listener,
-		timeout:     timeout,
-		peers:       make(map[contract.ServerID]string),
-		connPool:    make(map[contract.ServerAddress][]*tcpConn),
-		maxPool:     maxPool,
-		activeConns: make(map[net.Conn]struct{}),
-		shutdownCh:  make(chan struct{}),
+		consumerCh:             make(chan contract.RPC),
+		localAddr:              contract.ServerAddress(listener.Addr().String()),
+		listener:               listener,
+		connectionTimeout:      connRPCTimeout,
+		genericRPCTimeout:      genRPCTimeout,
+		installSnapshotTimeout: isTimeout,
+		responseTimeout:        respTimeout,
+		peers:                  make(map[contract.ServerID]string),
+		connPool:               make(map[contract.ServerAddress][]*tcpConn),
+		maxPool:                maxPool,
+		activeConns:            make(map[net.Conn]struct{}),
+		shutdownCh:             make(chan struct{}),
 	}
 	t.wg.Add(1)
 	go t.acceptLoop()
@@ -215,13 +244,11 @@ func (t *TCPTransport) InstallSnapshot(
 	}
 	defer func() { _ = conn.Release() }()
 
-	if t.timeout > 0 {
-		timeout := t.timeout * time.Duration(args.DataSize/int64(_connSendBufferSize))
-		if timeout < t.timeout {
-			timeout = t.timeout
-		}
-		_ = conn.conn.SetDeadline(time.Now().Add(timeout))
+	timeout := t.installSnapshotTimeout * time.Duration(args.DataSize/int64(_connSendBufferSize))
+	if timeout < t.installSnapshotTimeout {
+		timeout = t.installSnapshotTimeout
 	}
+	_ = conn.conn.SetDeadline(time.Now().Add(timeout))
 
 	if err := t.sendRPC(conn, _rpcInstallSnapshot, &args); err != nil {
 		return reply, err
@@ -331,9 +358,7 @@ func (t *TCPTransport) genericRPC(peerID contract.ServerID, rpcType byte, args, 
 	if err != nil {
 		return err
 	}
-	if t.timeout > 0 {
-		_ = conn.conn.SetDeadline(time.Now().Add(t.timeout))
-	}
+	_ = conn.conn.SetDeadline(time.Now().Add(t.genericRPCTimeout))
 	if err := t.sendRPC(conn, rpcType, args); err != nil {
 		return err
 	}
@@ -360,7 +385,7 @@ func (t *TCPTransport) getConn(target contract.ServerAddress) (*tcpConn, error) 
 	if conn := t.getPooledConn(target); conn != nil {
 		return conn, nil
 	}
-	c, err := net.DialTimeout("tcp", string(target), t.timeout)
+	c, err := net.DialTimeout("tcp", string(target), t.connectionTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -589,9 +614,9 @@ func (t *TCPTransport) handleCommand(r *bufio.Reader, _ net.Conn, dec *gob.Decod
 RESP:
 	var respErr string
 	var respReply any
-	respTimeout := t.timeout
+	respTimeout := t.responseTimeout
 	if hasSnapshotData {
-		scaled := t.timeout * time.Duration(snapReq.DataSize/int64(_connSendBufferSize))
+		scaled := t.responseTimeout * time.Duration(snapReq.DataSize/int64(_connSendBufferSize))
 		if scaled > respTimeout {
 			respTimeout = scaled
 		}

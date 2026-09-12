@@ -221,17 +221,19 @@ Default values of the node timing parameters:
 | Parameter | Node (flag default) | Stand (Makefile) |
 |---|---|---|
 | Heartbeat period (`-heartbeat-timeout`) | 33 ms | 45 ms |
-| Election timeout base (`-reelection-timeout`) | 340 ms | 500 ms |
+| Election timeout base (`-reelection-timeout`) | 430 ms | 500 ms |
 | Election ticker tick (`-ticker-timeout`) | 20 ms | 20 ms |
 | Apply batch interval (`-apply-batch-interval`) | 50 ms | 50 ms |
 | Trace level (`-trace-log-level`) | 1 | 0 |
 
 The parameters are tied by the invariant
 `reelection-timeout ≥ 10·heartbeat-timeout` (as well as
-`ticker-timeout ≤ reelection-timeout/10` and
-`apply-batch-interval ≤ reelection-timeout`). The check runs at startup
-with a fail-fast strategy: an invalid combination terminates the
-process before any work starts, and the message lists every violation.
+`ticker-timeout ≤ reelection-timeout/10`,
+`apply-batch-interval ≤ reelection-timeout`, and
+`reelection-timeout > 2 × raft.TCPRPCTimeout = 400 ms` — INV-T3).
+The check runs at startup with a fail-fast strategy: an invalid
+combination terminates the process before any work starts, and the
+message lists every violation.
 
 The full reference of raftkv and loadkv flags with defaults and value
 bounds is [docs/Flags.md](docs/Flags.md); the RPC transport timeout

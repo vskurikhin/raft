@@ -13,10 +13,12 @@ writing to the log. The package is used by the KV service
 | Name | Value | Purpose |
 |---|---|---|
 | `ProtocolVersion` | 3 | Raft protocol version. Compatibility with versions 0–2 is not supported. |
-| `TCPRPCTimeout` | 165 ms | TCP RPC timeout in the production transport; 330/2, kept as a separate constant so that test-time timer acceleration does not affect the production transport. |
+| `TCPRPCTimeout` | 200 ms | TCP RPC timeout in the production transport: the window of one request/reply RPC exchange; derivatives — the quorum check window = 2 × 200 = 400 ms, the heartbeat ceiling = ⌊400/4⌋ = 100 ms. |
+| `ConnectionTCPRPCTimeout` | 165 ms | Deadline for establishing a TCP connection (net.DialTimeout); the historical RPC timeout value. |
+| `InstallSnapshotTimeout` | 310 ms | Base of the snapshot transfer deadline: the final deadline scales with the data volume (base × ⌊DataSize/256KiB⌋) on the sender. |
 | `DefaultApplyBatchInterval` | 50 ms | Interval at which the leader loop checks whether entries must be applied to the state machine; accumulated commits are merged into a single batch. |
 | `DefaultHeartbeatTimeout` | 33 ms | Default leader heartbeat period. |
-| `DefaultReelectionTimeout` | 340 ms | Default election timeout base: the actual timeout is derived from it by a random value. |
+| `DefaultReelectionTimeout` | 430 ms | Default election timeout base: the actual timeout is derived from it by a random value; the election window is [430; 860). |
 | `DefaultTickerTimeout` | 20 ms | Default election ticker tick. |
 | `LeaktestBudget` | 600 ms | Unified goroutine leak-check budget: max(in-memory RPC timeout, TCPRPCTimeout) + 100 ms. |
 | `DefaultSnapshotInterval` | 3 s | Interval of snapshot necessity checks. |
