@@ -3,6 +3,7 @@ package transp
 import (
 	"bufio"
 	"encoding/gob"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -539,6 +540,17 @@ func (t *TCPTransport) handleConn(conn net.Conn) {
 		}
 
 		if err := t.handleCommand(r, conn, dec, enc); err != nil {
+			if errors.Is(err, errSnapshotStreamStale) {
+				// Маркер ErrEnqueueTimeout уже закодирован в w; Flush
+				// доставляет его клиенту (best effort — при неудачном
+				// Flush клиент получит обрыв соединения, оба исхода без
+				// гонки). Поток соединения невыровнен: потребитель мог
+				// не дочитать данные снимка из общего bufio.Reader,
+				// единственное безопасное действие — закрытие соединения.
+				_ = w.Flush()
+				log.Printf("raft: closing connection: snapshot response window expired with unread snapshot data")
+				return
+			}
 			if err != io.EOF {
 				log.Printf("raft: handle conn error: %v", err)
 			}
@@ -550,6 +562,14 @@ func (t *TCPTransport) handleConn(conn net.Conn) {
 		}
 	}
 }
+
+// errSnapshotStreamStale — внутренний маркер истечения окна ожидания ответа
+// для RPC со снимком при незакрытом rpc.Reader. После истечения окна поток
+// соединения невыровнен: потребитель мог не дочитать данные снимка из общего
+// bufio.Reader, поэтому продолжение декодирования из того же буфера недопустимо.
+// handleConn распознаёт маркер, выполняет Flush (доставка ответа-ошибки) и
+// закрывает соединение.
+var errSnapshotStreamStale = errors.New("snapshot response window expired with unread snapshot data")
 
 // handleCommand декодирует и отправляет один RPC-запрос из входящего потока.
 // Возвращает ошибку, если декодирование не удалось — вызывающий закрывает соединение.
@@ -616,11 +636,9 @@ RESP:
 	var respReply any
 	respTimeout := t.responseTimeout
 	if hasSnapshotData {
-		scaled := t.responseTimeout * time.Duration(snapReq.DataSize/int64(_connSendBufferSize))
-		if scaled > respTimeout {
-			respTimeout = scaled
-		}
+		respTimeout = t.snapshotResponseTimeout(snapReq.DataSize)
 	}
+	stale := false
 	select {
 	case resp := <-respCh:
 		if resp.Error != nil {
@@ -631,6 +649,14 @@ RESP:
 		return contract.ErrRaftShutdown
 	case <-time.After(respTimeout):
 		respErr = contract.ErrEnqueueTimeout.Error()
+		if hasSnapshotData {
+			// Поток соединения невыровнен: потребитель мог не дочитать
+			// данные снимка из общего bufio.Reader. Ответ-маркер
+			// кодируется ниже, затем возвращается сентинел, по которому
+			// handleConn выполнит Flush и закроет соединение — продолжение
+			// декодирования из того же буфера исключено.
+			stale = true
+		}
 	}
 
 	if err := enc.Encode(respErr); err != nil {
@@ -642,5 +668,26 @@ RESP:
 	if err := enc.Encode(respReply); err != nil {
 		return err
 	}
+	if stale {
+		return errSnapshotStreamStale
+	}
 	return nil
+}
+
+// snapshotResponseTimeout возвращает окно ожидания ответа для RPC со снимком:
+// max(responseTimeout, installSnapshotTimeout) × ⌊DataSize/256 КиБ⌋, но не
+// меньше самой max-базы — зеркально отправителю, который клэмпит вниз до
+// своей базы installSnapshotTimeout. Малые снимки (< 256 КиБ) держат окно
+// получателя на уровне базы отправителя, поэтому флаг управляет обеими
+// сторонами передачи снимка.
+func (t *TCPTransport) snapshotResponseTimeout(dataSize int64) time.Duration {
+	base := t.responseTimeout
+	if t.installSnapshotTimeout > base {
+		base = t.installSnapshotTimeout
+	}
+	timeout := base * time.Duration(dataSize/int64(_connSendBufferSize))
+	if timeout < base {
+		timeout = base
+	}
+	return timeout
 }

@@ -1,6 +1,7 @@
 package transp
 
 import (
+	"bytes"
 	"sync"
 	"testing"
 	"time"
@@ -315,6 +316,99 @@ func TestTCPAppendEntriesTimeout(t *testing.T) {
 	if err != contract.ErrEnqueueTimeout {
 		t.Fatalf("want ErrEnqueueTimeout, got %v", err)
 	}
+}
+
+// TestTCPInstallSnapshotSlowConsumer проверяет устранение гонки bufio.Reader
+// при истечении окна ожидания ответа для RPC со снимком.
+//
+// Механика: сервер отдаёт потребителю rpc.Reader = LimitReader(r, DataSize)
+// поверх общего bufio.Reader соединения и ждёт ответа в течение окна
+// max(responseTimeout, installSnapshotTimeout) × ⌊DataSize/256 КиБ⌋
+// (на умолчаниях TCPTimeouts{} — max(200, 310) × 1 = 310 мс). Медленный
+// потребитель (чтение по 16 КиБ с паузой 20 мс: 300 КиБ / 16 КиБ × 20 мс
+// ≈ 380 мс) не успевает дочитать данные снимка за окно; сервер кодирует
+// маркер ErrEnqueueTimeout, выполняет Flush и закрывает соединение —
+// продолжение декодирования из того же bufio.Reader исключено, гонки нет.
+//
+// Клиенту задаётся uniformTCPTimeouts(time.Second): дедлайн клиента (1 с)
+// взводится позже серверного окна (310 мс), поэтому истекает именно окно
+// СЕРВЕРА, а не собственный i/o timeout клиента. Проверка elapsed ≥ 300 мс
+// доказывает, что путь истечения серверного окна пройден.
+//
+// Ошибка потребителя не проверяется: потребитель может успеть дочитать
+// буфер до закрытия соединения (недетерминизм), поэтому требование ошибки
+// чтения было бы флейком.
+func TestTCPInstallSnapshotSlowConsumer(t *testing.T) {
+	defer leaktest.CheckTimeout(t, raft.LeaktestBudget)()
+
+	// Сервер — умолчания вехи (165/200/310/200): окно снимка 310 мс.
+	server, err := NewTCPTransport("127.0.0.1:0", TCPTimeouts{}, 2)
+	if err != nil {
+		t.Fatalf("NewTCPTransport(server): %v", err)
+	}
+	// Клиент — равномерно 1 с: дедлайн клиента позже серверного окна.
+	client, err := NewTCPTransport("127.0.0.1:0", uniformTCPTimeouts(time.Second), 2)
+	if err != nil {
+		server.Close()
+		t.Fatalf("NewTCPTransport(client): %v", err)
+	}
+	client.Connect(1, string(server.LocalAddr()))
+	server.Connect(0, string(client.LocalAddr()))
+	defer client.Close()
+	defer server.Close()
+
+	// Медленный потребитель: читает rpc.Reader порциями 16 КиБ с паузой
+	// 20 мс — не успевает за окно 310 мс. Ответ не отправляет: серверное
+	// окно истекает само, после закрытия соединения чтение завершается
+	// ошибкой.
+	consumerDone := make(chan struct{})
+	go func() {
+		defer close(consumerDone)
+		rpc, ok := <-server.Consumer()
+		if !ok {
+			return
+		}
+		buf := make([]byte, 16*1024)
+		for {
+			if _, err := rpc.Reader.Read(buf); err != nil {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}()
+	// Защитная проверка: если тест завершился раньше потребителя (например,
+	// из-за ошибки ожидания), дожидаемся его завершения после закрытия
+	// транспортов — соединение уже закрыто, чтение разблокировано.
+	t.Cleanup(func() {
+		select {
+		case <-consumerDone:
+		case <-time.After(3 * time.Second):
+			t.Error("медленный потребитель не завершился после закрытия соединения")
+		}
+	})
+
+	const dataSize = 300 * 1024
+	args := contract.InstallSnapshotRequest{
+		Term:         1,
+		LeaderID:     0,
+		LastLogIndex: 100,
+		LastLogTerm:  1,
+		DataSize:     dataSize,
+	}
+	data := make([]byte, dataSize)
+	start := time.Now()
+	_, err = client.InstallSnapshot(1, args, bytes.NewReader(data))
+	elapsed := time.Since(start)
+
+	if err != contract.ErrEnqueueTimeout {
+		t.Fatalf("want ErrEnqueueTimeout, got %v", err)
+	}
+	// Путь истечения серверного окна: elapsed ≥ 300 мс (окно 310 мс
+	// с допуском на планирование).
+	if elapsed < 300*time.Millisecond {
+		t.Fatalf("elapsed = %v, want >= 300ms (server snapshot window)", elapsed)
+	}
+	<-consumerDone
 }
 
 // TestTCPRequestVoteSuccess проверяет успешную отправку RequestVote.

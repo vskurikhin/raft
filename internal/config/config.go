@@ -218,13 +218,17 @@ func validateTransportTimingFlags(connect, rpc, snapshot time.Duration) error {
 	check(snapshot > 0, "-install-snapshot-timeout must be greater than 0, got %v", snapshot)
 	check(snapshot%time.Millisecond == 0, "-install-snapshot-timeout must be a whole number of milliseconds, got %v", snapshot)
 	check(connect <= rpc,
-		"-tcp-connect-timeout must not exceed -tcp-rpc-timeout (connection establishment plus the RPC must fit within 2x -tcp-rpc-timeout): got %v vs -tcp-rpc-timeout %v",
+		"-tcp-connect-timeout must not exceed -tcp-rpc-timeout"+
+			" (connection establishment plus the RPC must fit within 2x -tcp-rpc-timeout):"+
+			" got %v vs -tcp-rpc-timeout %v",
 		connect, rpc)
 	check(snapshot >= rpc,
 		"-install-snapshot-timeout must be at least -tcp-rpc-timeout: got %v vs -tcp-rpc-timeout %v",
 		snapshot, rpc)
 	check(connect+rpc <= 2*raft.TCPRPCTimeout,
-		"-tcp-connect-timeout plus -tcp-rpc-timeout must not exceed 2x raft.TCPRPCTimeout (the quorum check window is fixed by the compile-time constant and is not scaled by -tcp-rpc-timeout): got %v + %v",
+		"-tcp-connect-timeout plus -tcp-rpc-timeout must not exceed 2x raft.TCPRPCTimeout"+
+			" (the quorum check window is fixed by the compile-time constant and is not scaled by -tcp-rpc-timeout):"+
+			" got %v + %v",
 		connect, rpc)
 	if len(errs) == 0 {
 		return nil
@@ -242,7 +246,9 @@ func validateElectionQuorumInvariant(reelection time.Duration) error {
 	if reelection > 2*raft.TCPRPCTimeout {
 		return nil
 	}
-	return fmt.Errorf("-reelection-timeout must be greater than 2x raft.TCPRPCTimeout (the quorum check window is fixed by the compile-time constant and is not scaled by -tcp-rpc-timeout): got %v vs %v",
+	return fmt.Errorf("-reelection-timeout must be greater than 2x raft.TCPRPCTimeout"+
+		" (the quorum check window is fixed by the compile-time constant and is not scaled by -tcp-rpc-timeout):"+
+		" got %v vs %v",
 		reelection, 2*raft.TCPRPCTimeout)
 }
 
