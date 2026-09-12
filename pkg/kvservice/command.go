@@ -35,6 +35,13 @@ package kvservice
 //	  * Value — новое значение, записываемое при успешном сравнении.
 //	  * ResultFound равно true, если Key существовал в хранилище.
 //	  * ResultValue содержит прежнее значение Key, если ключ существовал.
+//
+// CommandDelete — удаление значения по ключу.
+//
+//   - Key — ключ, значение которого требуется удалить; поле Value игнорируется.
+//   - CompareValue игнорируется.
+//   - ResultFound равно true, если Key существовал в хранилище.
+//   - ResultValue содержит прежнее значение Key, если ключ существовал.
 type Command struct {
 	Kind CommandKind
 
@@ -56,15 +63,22 @@ const (
 	CommandGet
 	CommandPut
 	CommandCAS
+	CommandDelete
 )
 
-var commandName = map[CommandKind]string{
-	CommandInvalid: "invalid",
-	CommandGet:     "get",
-	CommandPut:     "put",
-	CommandCAS:     "cas",
-}
-
 func (ck CommandKind) String() string {
-	return commandName[ck]
+	switch ck {
+	case CommandInvalid:
+		return "invalid"
+	case CommandGet:
+		return "get"
+	case CommandPut:
+		return "put"
+	case CommandCAS:
+		return "cas"
+	case CommandDelete:
+		return "delete"
+	default:
+		return ""
+	}
 }

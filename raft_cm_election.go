@@ -4,10 +4,30 @@ import (
 	"context"
 	"log/slog"
 	"math/rand"
-	"os"
 	"sync/atomic"
 	"time"
+
+	"github.com/vskurikhin/raft/pkg/raft/contract"
 )
+
+// _preVoteJitterMs — верхняя граница случайной паузы (миллисекунды)
+// перед выборами после выигранного предварительного голосования.
+// Пауза разводит по времени узлы, одновременно победившие в pre-vote,
+// предотвращая одновременный переход в кандидаты с одинаковым
+// термом (split vote).
+const _preVoteJitterMs = 50
+
+// forcedReelectionEnv — имя переменной окружения стресс-хука форсирования
+// выборов. Значение читается один раз при старте узла и кэшируется в
+// _forcedReelectionHook (ADR-CONF-011); тестовое смещение, в промышленных
+// запусках не задаётся.
+const forcedReelectionEnv = "RAFT_FORCE_MORE_REELECTION"
+
+// _forcedReelectionHook — кэш переменной окружения forcedReelectionEnv:
+// при значении true electionTimeoutLocked в трети вызовов возвращает ровно
+// базу, отключая рандомизацию тайм-аута выборов (стресс-смещение).
+// Записывается один раз при создании CM, читается атомарно.
+var _forcedReelectionHook atomic.Bool
 
 // becomeFollowerLocked делает cm последователем и сбрасывает его состояние.
 // Если cm был лидером, отправляет сигнал в stepDown, чтобы leaderLoop
@@ -15,7 +35,7 @@ import (
 // Требует удержания cm.mu.
 func (cm *ConsensusModule) becomeFollowerLocked(term int) {
 	wasLeader := cm.cmState.state == Leader
-	cm.traceLockedLogf(0, "becomes Follower with term=%d; len(log)=%v", term, len(cm.cmState.log))
+	cm.traceLockedLogf(_traceLevelKeyEvents, "becomes Follower with term=%d; len(log)=%v", term, len(cm.cmState.log))
 
 	// Сбрасываем inflightAE для всех соседей при потере лидерства.
 	// Это гарантирует, что новый лидер начнёт с «чистого листа».
@@ -80,7 +100,8 @@ func (cm *ConsensusModule) startElectionLocked() {
 	cm.cmState.votedFor = cm.id
 	cm.persistToStorage()
 	cm.traceLockedLogf(
-		0, "becomes Candidate (currentTerm=%d); len(log)=%v",
+		_traceLevelKeyEvents,
+		"becomes Candidate (currentTerm=%d); len(log)=%v",
 		savedCurrentTerm, len(cm.cmState.log),
 	)
 
@@ -113,59 +134,74 @@ func (cm *ConsensusModule) startElectionLocked() {
 			continue
 		}
 		cm.goSpawnLocked(func() {
-			cm.mu.Lock()
-			savedLastLogIndex, savedLastLogTerm := cm.lastLogIndexAndTerm()
-			cm.mu.Unlock()
-
-			args := RequestVoteArgs{
-				RPCHeader: RPCHeader{
-					ProtocolVersion: ProtocolVersion,
-					ServerID:        cm.id,
-				},
-				Term:               savedCurrentTerm,
-				CandidateID:        cm.id,
-				LastLogIndex:       savedLastLogIndex,
-				LastLogTerm:        savedLastLogTerm,
-				LeadershipTransfer: isLeadershipTransfer,
-			}
-
-			cm.traceLogf(0, "sending RequestVote to %d: %+v", peerID, args)
-			reply, err := cm.transport.RequestVote(ServerID(peerID), args)
-			if err == nil {
-				cm.mu.Lock()
-				cm.traceLockedLogf(0, "received RequestVoteReply %+v", reply)
-
-				if cm.cmState.state != Candidate {
-					cm.traceLockedLogf(0, "while waiting for reply, state = %v", cm.cmState.state)
-					cm.mu.Unlock()
-					return
-				}
-
-				if reply.Term > cm.cmState.currentTerm {
-					cm.traceLockedLogf(0, "term out of date in RequestVoteReply")
-					cm.becomeFollowerLocked(reply.Term)
-					cm.mu.Unlock()
-					return
-				} else if reply.Term == cm.cmState.currentTerm {
-					if reply.VoteGranted {
-						votesReceived.Add(1)
-						if int(votesReceived.Load()) >= quorumSize(voterCount) {
-							// Выиграл выборы!
-							cm.traceLockedLogf(2, "wins election with %d votes", votesReceived.Load())
-							cm.startLeaderLocked()
-							cm.mu.Unlock()
-							slog.Info("wins election", slog.Int("votes", int(votesReceived.Load())))
-							return
-						}
-					}
-				}
-				cm.mu.Unlock()
-			}
+			cm.requestVoteFromPeer(peerID, savedCurrentTerm, voterCount, isLeadershipTransfer, &votesReceived)
 		})
 	}
 
 	// Запустить новый таймер выборов на случай, если текущие выборы не завершатся успешно.
 	cm.goSpawnLocked(cm.runElectionTimer)
+}
+
+// requestVoteFromPeer отправляет RequestVote одному соседу и учитывает ответ;
+// голос засчитывается, пока узел остаётся кандидатом того же терма.
+//
+// Самостоятельно захватывает и освобождает cm.mu: две короткие критические
+// секции — снимок lastLogIndexAndTermLocked() и разбор ответа; вызов транспорта
+// происходит между ними, без блокировки. votesReceived передаётся указателем,
+// чтобы общий счётчик голосов выборов разделялся между горутинами соседей.
+func (cm *ConsensusModule) requestVoteFromPeer(
+	peerID, savedCurrentTerm, voterCount int,
+	isLeadershipTransfer bool,
+	votesReceived *atomic.Int32,
+) {
+	cm.mu.Lock()
+	savedLastLogIndex, savedLastLogTerm := cm.lastLogIndexAndTermLocked()
+	cm.mu.Unlock()
+
+	args := RequestVoteArgs{
+		RPCHeader: RPCHeader{
+			ProtocolVersion: ProtocolVersion,
+			ServerID:        cm.id,
+		},
+		Term:               savedCurrentTerm,
+		CandidateID:        cm.id,
+		LastLogIndex:       savedLastLogIndex,
+		LastLogTerm:        savedLastLogTerm,
+		LeadershipTransfer: isLeadershipTransfer,
+	}
+
+	cm.traceLogf(_traceLevelKeyEvents, "sending RequestVote to %d: %+v", peerID, args)
+	reply, err := cm.transport.RequestVote(ServerID(peerID), args)
+	if err == nil {
+		cm.mu.Lock()
+		cm.traceLockedLogf(_traceLevelKeyEvents, "received RequestVoteReply %+v", reply)
+
+		if cm.cmState.state != Candidate {
+			cm.traceLockedLogf(_traceLevelKeyEvents, "while waiting for reply, state = %v", cm.cmState.state)
+			cm.mu.Unlock()
+			return
+		}
+
+		if reply.Term > cm.cmState.currentTerm {
+			cm.traceLockedLogf(_traceLevelKeyEvents, "term out of date in RequestVoteReply")
+			cm.becomeFollowerLocked(reply.Term)
+			cm.mu.Unlock()
+			return
+		} else if reply.Term == cm.cmState.currentTerm {
+			if reply.VoteGranted {
+				votesReceived.Add(1)
+				if int(votesReceived.Load()) >= quorumSize(voterCount) {
+					// Выиграл выборы!
+					cm.traceLockedLogf(_traceLevelProgress, "wins election with %d votes", votesReceived.Load())
+					cm.startLeaderLocked()
+					cm.mu.Unlock()
+					slog.Info("wins election", slog.Int("votes", int(votesReceived.Load())))
+					return
+				}
+			}
+		}
+		cm.mu.Unlock()
+	}
 }
 
 // runElectionTimer — фоновый таймер выборов.
@@ -178,6 +214,12 @@ func (cm *ConsensusModule) runElectionTimer() {
 	cm.mu.Lock()
 	termStarted := cm.cmState.currentTerm
 	electionTimerDone := cm.cmState.electionTimerDone
+	// Такт тикера читается под cm.mu и нормализуется: нулевое или
+	// отрицательное значение (литеральный тестовый CM) заменяется умолчанием.
+	tickerTimeout := cm.tickerTimeout
+	if tickerTimeout <= 0 {
+		tickerTimeout = DefaultTickerTimeout
+	}
 
 	// Nonvoter не участвует в выборах — не запускаем таймер.
 	if !hasVote(cm.cmState.configurations.latest, cm.id) {
@@ -186,7 +228,7 @@ func (cm *ConsensusModule) runElectionTimer() {
 	}
 
 	cm.mu.Unlock()
-	cm.traceLogf(1, "election timer started (%v), term=%d", timeoutDuration, termStarted)
+	cm.traceLogf(_traceLevelLoops, "election timer started (%v), term=%d", timeoutDuration, termStarted)
 
 	// Цикл таймера работает, пока не наступит одно из условий:
 	//   - Истекло время ожидания без получения сообщений от лидера — тогда
@@ -195,21 +237,22 @@ func (cm *ConsensusModule) runElectionTimer() {
 	//   - Узел вышел из состояний Follower/Candidate (например, стал лидером).
 	//   - Получен сигнал остановки таймера (electionTimerDone) или общий сигнал
 	//     завершения работы модуля (shutdownCh).
-	ticker := time.NewTicker(TickerTimeoutMs * time.Millisecond)
+	ticker := time.NewTicker(tickerTimeout)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
 			cm.mu.Lock()
 			if cm.cmState.state != Candidate && cm.cmState.state != Follower {
-				cm.traceLockedLogf(1, "in election timer state=%s, bailing out", cm.cmState.state)
+				cm.traceLockedLogf(_traceLevelLoops, "in election timer state=%s, bailing out", cm.cmState.state)
 				cm.mu.Unlock()
 				return
 			}
 
 			if termStarted != cm.cmState.currentTerm {
 				cm.traceLockedLogf(
-					1, "in election timer term changed from %d to %d, bailing out",
+					_traceLevelLoops,
+					"in election timer term changed from %d to %d, bailing out",
 					termStarted, cm.cmState.currentTerm,
 				)
 				cm.mu.Unlock()
@@ -261,8 +304,6 @@ func (cm *ConsensusModule) runElectionTimer() {
 //   - обнаружении более высокого терма от другого узла → becomeFollowerLocked()
 //
 // Вызывается из runElectionTimer(), когда preVoteDisabled == false.
-//
-//nolint:gocognit,funlen
 func (cm *ConsensusModule) runPreCandidate() {
 	cm.mu.Lock()
 	if cm.cmState.state != Follower && cm.cmState.state != PreCandidate && cm.cmState.state != Candidate {
@@ -271,7 +312,8 @@ func (cm *ConsensusModule) runPreCandidate() {
 	}
 	cm.cmState.state = PreCandidate
 	cm.traceLockedLogf(
-		0, "becomes PreCandidate; term=%d, len(log)=%d",
+		_traceLevelKeyEvents,
+		"becomes PreCandidate; term=%d, len(log)=%d",
 		cm.cmState.currentTerm, len(cm.cmState.log),
 	)
 
@@ -304,67 +346,106 @@ func (cm *ConsensusModule) runPreCandidate() {
 			continue
 		}
 		cm.goSpawn(func() {
-			cm.mu.Lock()
-			lastLogIndex, lastLogTerm := cm.lastLogIndexAndTerm()
-			savedTerm := cm.cmState.currentTerm
-			cm.mu.Unlock()
-
-			if cm.transport == nil {
-				cm.traceLogf(0, "runPreCandidate: transport is nil, cannot send to %d", peerID)
-				select {
-				case preVoteRespCh <- &RequestPreVoteReply{
-					RPCHeader:   RPCHeader{ProtocolVersion: ProtocolVersion, ServerID: cm.id},
-					Term:        savedTerm,
-					VoteGranted: false,
-				}:
-				case <-ctx.Done():
-				}
-				return
-			}
-
-			args := RequestPreVoteArgs{
-				RPCHeader: RPCHeader{
-					ProtocolVersion: ProtocolVersion,
-					ServerID:        cm.id,
-				},
-				Term:         proposedTerm,
-				LastLogIndex: lastLogIndex,
-				LastLogTerm:  lastLogTerm,
-			}
-
-			cm.traceLogf(4, "sending RequestPreVote to %d: %+v", peerID, args)
-			reply, err := cm.transport.RequestPreVote(ServerID(peerID), args)
-			if err != nil {
-				cm.traceLogf(4, "RequestPreVote to %d failed: %v", peerID, err)
-				var resp *RequestPreVoteReply
-				if err == ErrNotImplemented {
-					// Если транспорт не поддерживает PreVote, считаем голос
-					// предоставленным.
-					resp = &RequestPreVoteReply{
-						RPCHeader:   RPCHeader{ProtocolVersion: ProtocolVersion, ServerID: cm.id},
-						Term:        savedTerm,
-						VoteGranted: true,
-					}
-				} else {
-					resp = &RequestPreVoteReply{
-						RPCHeader:   RPCHeader{ProtocolVersion: ProtocolVersion, ServerID: cm.id},
-						Term:        savedTerm,
-						VoteGranted: false,
-					}
-				}
-				select {
-				case preVoteRespCh <- resp:
-				case <-ctx.Done():
-				}
-				return
-			}
-			select {
-			case preVoteRespCh <- &reply:
-			case <-ctx.Done():
-			}
+			cm.sendPreVoteToPeer(ctx, peerID, proposedTerm, preVoteRespCh)
 		})
 	}
 
+	cm.collectPreVoteReplies(voterCount, preVoteRespCh)
+}
+
+// sendPreVoteToPeer отправляет RequestPreVote одному соседу и помещает его
+// ответ в канал ответов. В запросе идёт предлагаемый терм выборов;
+// собственный терм узла при этом не меняется. Если транспорт отсутствует или
+// вызов завершился ошибкой, в канал помещается синтетический ответ: отказ, а
+// при отсутствии поддержки предварительного голосования у транспорта — грант,
+// ради совместимости с соседями. Каждая отправка уступает отмене контекста,
+// поэтому горутина не зависает, когда сбор ответов уже завершён.
+//
+// Самостоятельно захватывает и освобождает cm.mu: под блокировкой снимаются
+// только последний индекс и терм журнала вместе с текущим термом; вызов
+// транспорта происходит без блокировки. Канал в сигнатуре — только для
+// отправки.
+func (cm *ConsensusModule) sendPreVoteToPeer(
+	ctx context.Context,
+	peerID, proposedTerm int,
+	respCh chan<- *RequestPreVoteReply,
+) {
+	cm.mu.Lock()
+	lastLogIndex, lastLogTerm := cm.lastLogIndexAndTermLocked()
+	savedTerm := cm.cmState.currentTerm
+	cm.mu.Unlock()
+
+	if cm.transport == nil {
+		cm.traceLogf(_traceLevelKeyEvents, "runPreCandidate: transport is nil, cannot send to %d", peerID)
+		select {
+		case respCh <- &RequestPreVoteReply{
+			RPCHeader:   RPCHeader{ProtocolVersion: ProtocolVersion, ServerID: cm.id},
+			Term:        savedTerm,
+			VoteGranted: false,
+		}:
+		case <-ctx.Done():
+		}
+		return
+	}
+
+	args := RequestPreVoteArgs{
+		RPCHeader: RPCHeader{
+			ProtocolVersion: ProtocolVersion,
+			ServerID:        cm.id,
+		},
+		Term:         proposedTerm,
+		LastLogIndex: lastLogIndex,
+		LastLogTerm:  lastLogTerm,
+	}
+
+	cm.traceLogf(_traceLevelPreVote, "sending RequestPreVote to %d: %+v", peerID, args)
+	reply, err := cm.transport.RequestPreVote(ServerID(peerID), args)
+	if err != nil {
+		cm.traceLogf(_traceLevelPreVote, "RequestPreVote to %d failed: %v", peerID, err)
+		var resp *RequestPreVoteReply
+		if err == contract.ErrNotImplemented {
+			// Если транспорт не поддерживает PreVote, считаем голос
+			// предоставленным.
+			resp = &RequestPreVoteReply{
+				RPCHeader:   RPCHeader{ProtocolVersion: ProtocolVersion, ServerID: cm.id},
+				Term:        savedTerm,
+				VoteGranted: true,
+			}
+		} else {
+			resp = &RequestPreVoteReply{
+				RPCHeader:   RPCHeader{ProtocolVersion: ProtocolVersion, ServerID: cm.id},
+				Term:        savedTerm,
+				VoteGranted: false,
+			}
+		}
+		select {
+		case respCh <- resp:
+		case <-ctx.Done():
+		}
+		return
+	}
+	select {
+	case respCh <- &reply:
+	case <-ctx.Done():
+	}
+}
+
+// collectPreVoteReplies собирает ответы соседей на предварительное голосование
+// и решает его исход. Голос за себя учтён заранее, каждый пришедший ответ
+// засчитывается до проверок роли и терма. Ответ с более высоким термом, как и
+// потеря роли, прекращает сбор. При наборе кворума узел выжидает случайную
+// паузу — чтобы несколько узлов не начали выборы лидера одновременно с
+// одинаковым термом — и, если он всё ещё кандидат предварительного
+// голосования, запускает выборы лидера. Истечение тайм-аута выборов и
+// исчерпание ответов без кворума возвращают узел в ведомые; остановка узла
+// прекращает сбор, не трогая состояния.
+//
+// Самостоятельно захватывает и освобождает cm.mu. Канал в сигнатуре — только
+// для приёма.
+func (cm *ConsensusModule) collectPreVoteReplies(
+	voterCount int,
+	respCh <-chan *RequestPreVoteReply,
+) {
 	grantedVotes := 1 // голос за себя
 	neededVotes := quorumSize(voterCount)
 	votersResponded := 0
@@ -375,16 +456,16 @@ func (cm *ConsensusModule) runPreCandidate() {
 	// Собирать ответы от соседей.
 	for votersResponded < totalVoters {
 		select {
-		case reply := <-preVoteRespCh:
+		case reply := <-respCh:
 			votersResponded++
 			cm.mu.Lock()
 			if cm.cmState.state != PreCandidate {
-				cm.traceLockedLogf(4, "runPreCandidate: state changed to %s, bailing out", cm.cmState.state)
+				cm.traceLockedLogf(_traceLevelPreVote, "runPreCandidate: state changed to %s, bailing out", cm.cmState.state)
 				cm.mu.Unlock()
 				return
 			}
 			if reply.Term > cm.cmState.currentTerm {
-				cm.traceLockedLogf(4, "runPreCandidate: found higher term %d", reply.Term)
+				cm.traceLockedLogf(_traceLevelPreVote, "runPreCandidate: found higher term %d", reply.Term)
 				cm.becomeFollowerLocked(reply.Term)
 				cm.mu.Unlock()
 				return
@@ -393,29 +474,18 @@ func (cm *ConsensusModule) runPreCandidate() {
 			if reply.VoteGranted {
 				grantedVotes++
 				cm.traceLogf(
-					4, "runPreCandidate: granted vote from peer, total=%d, needed=%d",
+					_traceLevelPreVote, "runPreCandidate: granted vote from peer, total=%d, needed=%d",
 					grantedVotes, neededVotes,
 				)
 				if grantedVotes >= neededVotes {
-					// Jitter перед выборами, чтобы одновременно несколько узлов
-					// не перешли в Candidate с одинаковым term (split vote).
-					time.Sleep(time.Duration(rand.Intn(50)) * time.Millisecond)
-					cm.mu.Lock()
-					if cm.cmState.state == PreCandidate {
-						cm.traceLockedLogf(
-							4, "runPreCandidate: won pre-vote with %d votes, starting election",
-							grantedVotes,
-						)
-						cm.startElectionLocked()
-					}
-					cm.mu.Unlock()
+					cm.startElectionAfterPreVote(grantedVotes)
 					return
 				}
 			}
 		case <-timeout:
 			cm.mu.Lock()
 			if cm.cmState.state == PreCandidate {
-				cm.traceLockedLogf(4, "runPreCandidate: pre-vote timeout, returning to follower")
+				cm.traceLockedLogf(_traceLevelPreVote, "runPreCandidate: pre-vote timeout, returning to follower")
 				cm.becomeFollowerLocked(cm.cmState.currentTerm)
 			}
 			cm.mu.Unlock()
@@ -429,7 +499,7 @@ func (cm *ConsensusModule) runPreCandidate() {
 			cm.mu.Lock()
 			if cm.cmState.state == PreCandidate {
 				cm.traceLockedLogf(
-					4, "runPreCandidate: pre-vote lost (%d/%d), returning to follower",
+					_traceLevelPreVote, "runPreCandidate: pre-vote lost (%d/%d), returning to follower",
 					grantedVotes, neededVotes,
 				)
 				cm.becomeFollowerLocked(cm.cmState.currentTerm)
@@ -440,15 +510,64 @@ func (cm *ConsensusModule) runPreCandidate() {
 	}
 }
 
-// electionTimeout генерирует псевдослучайную длительность тайм-аута выборов.
-func (cm *ConsensusModule) electionTimeout() time.Duration {
-	// Если установлен параметр RAFT_FORCE_MORE_REELECTION, проведите стресс-тест, намеренно
-	// генерируя жестко заданное число очень часто. Это вызовет коллизии
-	// между различными серверами и приведет к увеличению количества перевыборов.
-	if os.Getenv("RAFT_FORCE_MORE_REELECTION") != "" && rand.Intn(3) == 0 {
-		return time.Duration(ReelectionTimeoutMs) * time.Millisecond
+// startElectionAfterPreVote запускает выборы лидера после победы в
+// предварительном голосовании. Перед переходом узел выжидает случайную паузу,
+// чтобы несколько узлов не начали выборы одновременно с одинаковым термом, и
+// начинает выборы, только если за время паузы он остался кандидатом
+// предварительного голосования.
+//
+// Самостоятельно захватывает и освобождает cm.mu: пауза выдерживается без
+// блокировки, под блокировкой выполняются перепроверка роли и запуск выборов.
+func (cm *ConsensusModule) startElectionAfterPreVote(grantedVotes int) {
+	// Jitter перед выборами, чтобы одновременно несколько узлов
+	// не перешли в Candidate с одинаковым term (split vote).
+	time.Sleep(time.Duration(rand.Intn(_preVoteJitterMs)) * time.Millisecond)
+	cm.mu.Lock()
+	if cm.cmState.state == PreCandidate {
+		cm.traceLockedLogf(
+			_traceLevelPreVote,
+			"runPreCandidate: won pre-vote with %d votes, starting election",
+			grantedVotes,
+		)
+		cm.startElectionLocked()
 	}
-	return time.Duration(ReelectionTimeoutMs+rand.Intn(ReelectionTimeoutMs)) * time.Millisecond
+	cm.mu.Unlock()
+}
+
+// electionTimeoutLocked генерирует псевдослучайную длительность тайм-аута
+// выборов от базы cm.reelectionTimeout с сохранением миллисекундной
+// дискретности: результат лежит в диапазоне [база; 2·база) с шагом 1 мс.
+// База нормализуется условием d < time.Millisecond → умолчание:
+// гарантирует, что аргумент rand.Intn(int(base/time.Millisecond)) ≥ 1,
+// и закрывает положительные субмиллисекундные значения.
+//
+// Стресс-хук: при включённом _forcedReelectionHook в трети вызовов
+// возвращается ровно база (рандомизация отключена — провоцирует
+// коллизии выборов).
+//
+// Требует удержания cm.mu.
+func (cm *ConsensusModule) electionTimeoutLocked() time.Duration {
+	d := cm.reelectionTimeout
+	if d < time.Millisecond {
+		d = DefaultReelectionTimeout
+	}
+	base := d
+	// Если установлен хук форсирования выборов, в трети случаев вернуть
+	// ровно базу: намеренно частое совпадение тайм-аутов разных узлов
+	// вызывает коллизии и рост числа перевыборов.
+	if _forcedReelectionHook.Load() && rand.Intn(3) == 0 {
+		return base
+	}
+	return base + time.Duration(rand.Intn(int(base/time.Millisecond)))*time.Millisecond
+}
+
+// electionTimeout — обёртка над electionTimeoutLocked для вызывающих без
+// удержания cm.mu. Самостоятельно захватывает cm.mu и снимает её через
+// defer; никогда не вызывается из-под cm.mu (sync.Mutex не реентерентен).
+func (cm *ConsensusModule) electionTimeout() time.Duration {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	return cm.electionTimeoutLocked()
 }
 
 // timeoutNow обрабатывает входящий TimeoutNowRequest.
@@ -457,7 +576,7 @@ func (cm *ConsensusModule) electionTimeout() time.Duration {
 func (cm *ConsensusModule) timeoutNow(rpc RPC, req *TimeoutNowRequest) {
 	startTimeNow := time.Now()
 	defer func() { cm.latency.timeoutNowRequest.observe(time.Since(startTimeNow)) }()
-	cm.traceLogf(0, "received TimeoutNow from %d", req.ServerID)
+	cm.traceLogf(_traceLevelKeyEvents, "received TimeoutNow from %d", req.ServerID)
 
 	// Уже лидер — no-op.
 	cm.mu.Lock()
@@ -495,14 +614,15 @@ func (cm *ConsensusModule) timeoutNow(rpc RPC, req *TimeoutNowRequest) {
 	}
 	cm.cmState.electionTimerDone = make(chan struct{})
 	cm.cmState.candidateFromLeadershipTransfer.Store(true)
-	cm.traceLockedLogf(1, "candidateFromLeadershipTransfer set to true (cm.id=%d)", cm.id)
+	cm.traceLockedLogf(_traceLevelLoops, "candidateFromLeadershipTransfer set to true (cm.id=%d)", cm.id)
 
 	// Запускаем форсированные выборы немедленно, без ожидания election timeout.
 	// cm.mu удерживается, что гарантирует атомарность.
 	cm.startElectionLocked()
 	newTerm := cm.cmState.currentTerm
 	cm.traceLockedLogf(
-		1, "started immediate election after TimeoutNow, term=%d (cm.id=%d)",
+		_traceLevelLoops,
+		"started immediate election after TimeoutNow, term=%d (cm.id=%d)",
 		newTerm, cm.id,
 	)
 	cm.mu.Unlock()

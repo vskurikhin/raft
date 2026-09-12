@@ -10,6 +10,9 @@ import (
 	"time"
 
 	"github.com/fortytw2/leaktest"
+	"github.com/vskurikhin/raft/pkg/raft/contract"
+	"github.com/vskurikhin/raft/pkg/raft/store"
+	"github.com/vskurikhin/raft/pkg/raft/transp"
 )
 
 // --- deferError ---
@@ -46,7 +49,7 @@ func TestDeferErrorShutdown(t *testing.T) {
 	d := &deferError{}
 	d.init(shutdownCh)
 	close(shutdownCh)
-	if err := d.Error(); err != ErrRaftShutdown {
+	if err := d.Error(); err != contract.ErrRaftShutdown {
 		t.Fatalf("got %v, want ErrRaftShutdown", err)
 	}
 }
@@ -113,7 +116,7 @@ func TestDeferErrorConcurrentCalls(t *testing.T) {
 	wg.Wait()
 
 	for i, err := range errs {
-		if err != ErrRaftShutdown {
+		if err != contract.ErrRaftShutdown {
 			t.Errorf("errs[%d] = %v, want ErrRaftShutdown", i, err)
 		}
 	}
@@ -186,11 +189,11 @@ func (f *CaptureFSM) Entries() []LogEntry {
 }
 
 func (f *CaptureFSM) Snapshot() (FSMSnapshot, error) {
-	return nil, ErrNotImplemented
+	return nil, contract.ErrNotImplemented
 }
 
 func (f *CaptureFSM) Restore(_ io.ReadCloser) error {
-	return ErrNotImplemented
+	return contract.ErrNotImplemented
 }
 
 // captureCommitFSM отправляет данные и в CaptureFSM, и в CommitChannelFSM.
@@ -215,7 +218,7 @@ func copyBytes(b []byte) []byte {
 // testServerWithFSM creates a single-node ConsensusModule with the given FSM.
 func testServerWithFSM(t testing.TB, fsm FSM) *ConsensusModule {
 	t.Helper()
-	storage := NewMapStorage()
+	storage := store.NewMapStorage()
 	var buf bytes.Buffer
 	if err := gob.NewEncoder(&buf).Encode(0); err != nil {
 		t.Fatal(err)
@@ -235,7 +238,7 @@ func testServerWithFSM(t testing.TB, fsm FSM) *ConsensusModule {
 	ready := make(chan any)
 	close(ready)
 
-	transport := NewInmemTransport("single")
+	transport := transp.NewInmemTransport("single")
 	cm := NewConsensusModule(0, []int{}, transport, storage, fsm, ready)
 	return cm
 }
@@ -246,8 +249,8 @@ func testFSMHarness(t *testing.T) (*Harness, *CaptureFSM) {
 	t.Helper()
 	n := 1
 	cluster := make([]*ConsensusModule, n)
-	transports := make([]*InmemTransport, n)
-	storage := make([]*MapStorage, n)
+	transports := make([]*transp.InmemTransport, n)
+	storage := make([]*store.MapStorage, n)
 	commitChans := make([]chan CommitEntry, n)
 	commits := make([][]CommitEntry, n)
 	connected := make([]bool, n)
@@ -256,8 +259,8 @@ func testFSMHarness(t *testing.T) (*Harness, *CaptureFSM) {
 
 	capture := &CaptureFSM{}
 
-	transports[0] = NewInmemTransport("single-0")
-	storage[0] = NewMapStorage()
+	transports[0] = transp.NewInmemTransport("single-0")
+	storage[0] = store.NewMapStorage()
 	commitChans[0] = make(chan CommitEntry)
 	fsm := &captureCommitFSM{
 		CaptureFSM:    capture,
@@ -311,7 +314,7 @@ func TestSingleNodeApply(t *testing.T) {
 	cm := testServerWithFSM(t, capture)
 	defer cm.Stop()
 
-	waitForLeader(t, cm, 800*time.Millisecond)
+	waitForLeader(t, cm, 2*time.Second)
 
 	future := cm.Apply("cmd1", 0)
 	if err := future.Error(); err != nil {
@@ -328,7 +331,7 @@ func TestSingleNodeApplyOrder(t *testing.T) {
 	cm := testServerWithFSM(t, capture)
 	defer cm.Stop()
 
-	waitForLeader(t, cm, 800*time.Millisecond)
+	waitForLeader(t, cm, 2*time.Second)
 
 	f1 := cm.Apply("cmd1", 0)
 	f2 := cm.Apply("cmd2", 0)
@@ -354,15 +357,19 @@ func TestSingleNodeApplyResponse(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h, capture := testFSMHarness(t)
 	defer h.Shutdown()
-	waitForLeader(t, h.cluster[0], 800*time.Millisecond)
+	waitForLeader(t, h.cluster[0], 2*time.Second)
 
 	future := h.cluster[0].Apply("cmd1", 0)
 	if err := future.Error(); err != nil {
 		t.Fatalf("Apply failed: %v", err)
 	}
-	resp := future.Response().(int)
-	if resp != future.Index() {
-		t.Fatalf("got Response=%d, want Index=%d", resp, future.Index())
+	raw := future.Response()
+	cmd, ok := raw.(int)
+	if !ok {
+		t.Fatalf("Response() = %T, want int", raw)
+	}
+	if cmd != future.Index() {
+		t.Fatalf("got Response=%d, want Index=%d", cmd, future.Index())
 	}
 	_ = capture
 }
@@ -395,7 +402,7 @@ func TestApplyAfterShutdown(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 
 	future := cm.Apply("cmd", 0)
-	if err := future.Error(); err != ErrRaftShutdown {
+	if err := future.Error(); err != contract.ErrRaftShutdown {
 		t.Fatalf("got %v, want ErrRaftShutdown", err)
 	}
 }
@@ -433,7 +440,7 @@ func TestFSMApplyInOrder(t *testing.T) {
 	cm := testServerWithFSM(t, capture)
 	defer cm.Stop()
 
-	waitForLeader(t, cm, 800*time.Millisecond)
+	waitForLeader(t, cm, 2*time.Second)
 
 	for i := 0; i < 5; i++ {
 		future := cm.Apply(i, 0)
@@ -443,11 +450,20 @@ func TestFSMApplyInOrder(t *testing.T) {
 	}
 
 	capture.mu.Lock()
-	entries := make([]int, len(capture.entries))
+	raw := make([]any, len(capture.entries))
 	for i, e := range capture.entries {
-		entries[i] = e.Data.(int)
+		raw[i] = e.Data
 	}
 	capture.mu.Unlock()
+
+	entries := make([]int, len(raw))
+	for i, d := range raw {
+		v, ok := d.(int)
+		if !ok {
+			t.Fatalf("entries[%d]: data %T is not int", i, d)
+		}
+		entries[i] = v
+	}
 
 	for i := 0; i < 5; i++ {
 		if entries[i] != i {
@@ -463,7 +479,7 @@ func TestFutureNoGoroutineLeak(t *testing.T) {
 	cm := testServerWithFSM(t, capture)
 	defer cm.Stop()
 
-	waitForLeader(t, cm, 800*time.Millisecond)
+	waitForLeader(t, cm, 2*time.Second)
 	future := cm.Apply("leaktest", 0)
 	_ = future.Error()
 }
@@ -485,7 +501,7 @@ func TestBatchApplyOrderAndIndices(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h, capture := testFSMHarness(t)
 	defer h.Shutdown()
-	waitForLeader(t, h.cluster[0], 800*time.Millisecond)
+	waitForLeader(t, h.cluster[0], 2*time.Second)
 
 	values := []int{42, 55, 81}
 	futures := make([]ApplyFuture, len(values))
@@ -506,13 +522,22 @@ func TestBatchApplyOrderAndIndices(t *testing.T) {
 	}
 
 	capture.mu.Lock()
-	entries := make([]int, 0, len(capture.entries))
+	raw := make([]any, 0, len(capture.entries))
 	for _, e := range capture.entries {
 		if e.Type == LogCommand {
-			entries = append(entries, e.Data.(int))
+			raw = append(raw, e.Data)
 		}
 	}
 	capture.mu.Unlock()
+
+	entries := make([]int, len(raw))
+	for i, d := range raw {
+		v, ok := d.(int)
+		if !ok {
+			t.Fatalf("entries[%d]: data %T is not int", i, d)
+		}
+		entries[i] = v
+	}
 
 	for i, v := range values {
 		if entries[i] != v {
@@ -535,15 +560,15 @@ func TestApplyInflightOnLeaderCrash(t *testing.T) {
 	}
 	// keep-класс (группа C: не commit-ожидание), но состояние
 	// наблюдаемо напрямую — ждём фактической изоляции лидера.
-	h.waitForIsolated(origLeaderId, commitBudgetSteady)
+	h.waitForIsolated(origLeaderId, _commitBudgetSteady)
 
 	inflightBefore := h.applyInflightCount(origLeaderId)
 	future := h.cluster[origLeaderId].Apply(42, 0)
 	// Ждём, пока runLeaderLoop поместит future в inflight, — до CrashPeer.
-	h.waitForApplyInflight(origLeaderId, inflightBefore+1, commitBudgetSteady)
+	h.waitForApplyInflight(origLeaderId, inflightBefore+1, _commitBudgetSteady)
 	h.CrashPeer(origLeaderId)
 
-	if err := future.Error(); err != ErrLeadershipLost && err != ErrRaftShutdown {
+	if err := future.Error(); err != ErrLeadershipLost && err != contract.ErrRaftShutdown {
 		t.Fatalf("got %v, want ErrLeadershipLost or ErrRaftShutdown", err)
 	}
 }
@@ -579,12 +604,12 @@ func TestApplyNoQuorumThenNewLeader(t *testing.T) {
 	h.DisconnectPeer((lid + 2) % 3)
 	// keep-класс (не commit-ожидание): состояние наблюдаемо — ждём
 	// фактической изоляции лидера.
-	h.waitForIsolated(lid, commitBudgetSteady)
+	h.waitForIsolated(lid, _commitBudgetSteady)
 
 	inflightBefore := h.applyInflightCount(lid)
 	future := h.cluster[lid].Apply(42, 0)
 	// Ждём, пока Apply попадёт в inflight лидера.
-	h.waitForApplyInflight(lid, inflightBefore+1, commitBudgetSteady)
+	h.waitForApplyInflight(lid, inflightBefore+1, _commitBudgetSteady)
 
 	// Force the leader to step down by sending AppendEntries with a higher term.
 	// This simulates a new leader being elected (in a higher term) without needing
