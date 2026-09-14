@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"math/rand"
 	"os"
 	"os/signal"
@@ -89,6 +90,10 @@ var (
 	_weakGetLatency = newLatencyRecorder(_latencyPrealloc, 0)
 	_deleteLatency  = newLatencyRecorder(_latencyPrealloc, 0)
 
+	// _rps накапливает посекундные значения скорости операций, печатаемые
+	// горутиной stats: ряд обязан совпадать со строками RPS= прогона.
+	_rps = newRpsSeries()
+
 	_values config.Values
 )
 
@@ -154,37 +159,60 @@ func tickInterval(rate int) (time.Duration, error) {
 	return time.Second / time.Duration(rate), nil
 }
 
-// generate порождает операции по тикам тикера. Тик задаёт момент старта
-// запроса, сам запрос выполняется в отдельной горутине; одновременность
-// ограничена ёмкостью семафора. Тик при занятом семафоре учитывается
-// счётчиком _dropped. Возврат происходит после завершения всех начатых
-// запросов.
+// ticksDue возвращает число тиков, подлежащих выпуску к моменту elapsed
+// от старта: целую часть elapsed/interval. Тик с номером k (k ≥ 1) подлежит
+// выпуску при elapsed ≥ k·interval. Ноль возвращается при elapsed < 0 и при
+// interval ≤ 0; функция не паникует ни при каких аргументах.
+func ticksDue(elapsed, interval time.Duration) int {
+	if elapsed < 0 || interval <= 0 {
+		return 0
+	}
+	return int(elapsed / interval)
+}
+
+// generate порождает операции по тикам тикера. Расписание абсолютное: от
+// момента старта ведётся число подлежащих выпуску тиков, и на каждом
+// пробуждении тикера выпускаются все тики, чей срок наступил, — опоздание
+// пробуждения не теряет тики. Тик задаёт момент старта запроса, сам запрос
+// выполняется в отдельной горутине; одновременность ограничена ёмкостью
+// семафора. Тик при занятом семафоре учитывается счётчиком _dropped.
+// Возврат происходит после завершения всех начатых запросов.
 func generate(ctx context.Context, client *kvclient.KVClient, interval time.Duration, concurrency int) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	semaphore := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
 	defer wg.Wait()
+	start := time.Now()
+	fired := 0
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			select {
-			case semaphore <- struct{}{}:
-				wg.Add(1)
-				// Запрос выполняется с собственным сроком: начатая операция
-				// доводится до конца и после остановки генерации.
-				//nolint:contextcheck
-				go func() {
-					defer wg.Done()
-					defer func() { <-semaphore }()
-					reqCtx, cancel := context.WithTimeout(context.Background(), RequestTimeout)
-					defer cancel()
-					run(reqCtx, client)
-				}()
-			default:
-				_dropped.Add(1)
+			due := ticksDue(time.Since(start), interval)
+			for ; fired < due; fired++ {
+				// Отмена не ждёт окончания дозагона: контекст проверяется
+				// между тиками.
+				if ctx.Err() != nil {
+					return
+				}
+				select {
+				case semaphore <- struct{}{}:
+					wg.Add(1)
+					// Запрос выполняется с собственным сроком: начатая операция
+					// доводится до конца и после остановки генерации.
+					//nolint:contextcheck
+					go func() {
+						defer wg.Done()
+						defer func() { <-semaphore }()
+						reqCtx, cancel := context.WithTimeout(context.Background(), RequestTimeout)
+						defer cancel()
+						run(reqCtx, client)
+					}()
+				default:
+					_dropped.Add(1)
+				}
 			}
 		}
 	}
@@ -373,6 +401,7 @@ func stats(ctx context.Context) {
 			done := doneTotal()
 			rps := done - prevDone
 			prevDone = done
+			_rps.record(rps)
 			getSamples, getTotal := _getLatency.from(getOffset)
 			putSamples, putTotal := _putLatency.from(putOffset)
 			weakGetSamples, weakGetTotal := _weakGetLatency.from(weakGetOffset)
@@ -471,6 +500,90 @@ func summary() {
 	slog.Info(latencyLine("PUT", putSamples))
 	slog.Info(latencyLine("WEAK GET", weakGetSamples))
 	slog.Info(latencyLine("DELETE", deleteSamples))
+	// Первая секунда ряда исключается из статистики: стартовое окно
+	// установления соединений и несинхронного старта тикеров систематически
+	// занижает скорость, поэтому все шесть величин считаются по ряду
+	// без первого элемента.
+	series := _rps.snapshot()
+	if len(series) > 0 {
+		series = series[1:]
+	}
+	stats := computeRpsStats(series)
+	slog.Info(fmt.Sprintf(
+		"rps: seconds=%d mean=%.1f median=%.1f stddev=%.1f min=%d max=%d total=%d",
+		stats.seconds, stats.mean, stats.median, stats.stddev,
+		stats.min, stats.max, stats.total,
+	))
+	total := doneTotal()
+	var getShare, putShare, verifyShare, weakGetShare, deleteShare, deleteVerifyShare float64
+	if total > 0 {
+		getShare = 100 * float64(_getDone.Load()) / float64(total)
+		putShare = 100 * float64(_putDone.Load()) / float64(total)
+		verifyShare = 100 * float64(_verifyDone.Load()) / float64(total)
+		weakGetShare = 100 * float64(_weakGetDone.Load()) / float64(total)
+		deleteShare = 100 * float64(_deleteDone.Load()) / float64(total)
+		deleteVerifyShare = 100 * float64(_deleteVerifyDone.Load()) / float64(total)
+	}
+	slog.Info(fmt.Sprintf(
+		"ops: done=%d (get=%.1f%% put=%.1f%% verify=%.1f%% weak-get=%.1f%% delete=%.1f%% delete-verify=%.1f%%)",
+		total, getShare, putShare, verifyShare, weakGetShare, deleteShare, deleteVerifyShare,
+	))
+}
+
+// rpsStats — статистика посекундного ряда скорости операций: число секунд
+// ряда, среднее, медиана, выборочное стандартное отклонение, минимум,
+// максимум и сумма ряда.
+type rpsStats struct {
+	seconds int
+	mean    float64
+	median  float64
+	stddev  float64
+	min     uint64
+	max     uint64
+	total   uint64
+}
+
+// computeRpsStats вычисляет статистику посекундного ряда скорости операций.
+// Среднее — арифметическое; медиана — центральный элемент упорядоченного
+// ряда при нечётной длине и полусумма двух центральных при чётной;
+// стандартное отклонение — выборочное (делитель n−1), при n ≤ 1 равно нулю.
+// Пустой ряд даёт все нули.
+func computeRpsStats(values []uint64) rpsStats {
+	n := len(values)
+	if n == 0 {
+		return rpsStats{}
+	}
+	sorted := slices.Clone(values)
+	slices.Sort(sorted)
+	var total uint64
+	for _, value := range sorted {
+		total += value
+	}
+	mean := float64(total) / float64(n)
+	var median float64
+	if n%2 == 1 {
+		median = float64(sorted[n/2])
+	} else {
+		median = (float64(sorted[n/2-1]) + float64(sorted[n/2])) / 2
+	}
+	var stddev float64
+	if n > 1 {
+		var sumSquares float64
+		for _, value := range sorted {
+			diff := float64(value) - mean
+			sumSquares += diff * diff
+		}
+		stddev = math.Sqrt(sumSquares / float64(n-1))
+	}
+	return rpsStats{
+		seconds: n,
+		mean:    mean,
+		median:  median,
+		stddev:  stddev,
+		min:     sorted[0],
+		max:     sorted[n-1],
+		total:   total,
+	}
 }
 
 // latencyLine форматирует распределение времени ответа одного вида операций.
@@ -559,4 +672,35 @@ func (r *latencyRecorder) from(offset int) ([]time.Duration, int) {
 	tail := make([]time.Duration, total-offset)
 	copy(tail, r.samples[offset:])
 	return tail, total
+}
+
+// rpsSeries накапливает посекундные значения скорости операций за прогон.
+// Срез защищён мьютексом: единственный пишущий — горутина stats, единственный
+// читающий — summary после завершения прогона; мьютекс сохраняет единообразие
+// с накопителями времени ответа и защищает тесты, пишущие из нескольких
+// горутин.
+type rpsSeries struct {
+	mu     sync.Mutex
+	values []uint64
+}
+
+// newRpsSeries создаёт накопитель посекундного ряда скорости операций.
+func newRpsSeries() *rpsSeries {
+	return &rpsSeries{}
+}
+
+// record сохраняет очередное посекундное значение скорости операций.
+func (r *rpsSeries) record(value uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.values = append(r.values, value)
+}
+
+// snapshot возвращает копию накопленного ряда.
+func (r *rpsSeries) snapshot() []uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	values := make([]uint64, len(r.values))
+	copy(values, r.values)
+	return values
 }
