@@ -35,7 +35,7 @@ type Values struct {
 	// ApplyBatchInterval — интервал батча применения записей к FSM.
 	// Ноль — защитное значение: применяется raft.DefaultApplyBatchInterval.
 	ApplyBatchInterval time.Duration
-	// DataDir — директория для persistent-хранилища узла;
+	// DataDir — директория для постоянного хранилища узла,
 	// пустая строка — вычисляется путь по умолчанию в cmd/main.go.
 	DataDir string
 	// HeartbeatTimeout — период пульса лидера. Ноль — защитное значение:
@@ -175,10 +175,8 @@ func ParseFlags() Values {
 	}
 }
 
-// validateTimingFlags — тонкая тестируемая обёртка над
-// raft.ValidateTiming: собирает временные параметры в TimerConfig и
-// делегирует проверку пакету raft (владельцу инвариантов). Возвращает
-// ошибку со всеми нарушениями сразу.
+// validateTimingFlags — валидирует временные флаги, собирая их в TimerConfig
+// и делегируя проверку пакету raft. Возвращает ошибку со всеми нарушениями сразу.
 func validateTimingFlags(heartbeat, ticker, reelection, applyBatch time.Duration) error {
 	return raft.ValidateTiming(raft.TimerConfig{
 		ApplyBatch: applyBatch,
@@ -188,22 +186,16 @@ func validateTimingFlags(heartbeat, ticker, reelection, applyBatch time.Duration
 	})
 }
 
-// checkTimingFlags выполняет раннюю отказку для недопустимых значений
-// временных флагов узла: индивидуальные границы и межпараметрические
-// соотношения проверяются выделенной тестируемой функцией, сообщение
-// содержит имя параметра, фактическое значение и требование.
+// checkTimingFlags — валидирует временные флаги узла через тестируемую функцию.
+// Возвращает ошибку со всеми нарушениями: параметр, значение, требование.
 func checkTimingFlags(heartbeat, ticker, reelection, applyBatch *time.Duration) {
 	if err := validateTimingFlags(*heartbeat, *ticker, *reelection, *applyBatch); err != nil {
 		log.Fatalf("invalid Raft timing flags: %v", err)
 	}
 }
 
-// validateTransportTimingFlags проверяет три флага тайм-аутов
-// TCP-транспорта: индивидуальные границы (положительное значение,
-// целое число миллисекунд) и жёсткие межпараметрические инварианты
-// (connect + rpc ≤ 2 × raft.TCPRPCTimeout). Функция чистая, без
-// побочных эффектов; все нарушения собираются в одну ошибку
-// (errors.Join).
+// validateTransportTimingFlags — проверка тайм‑аутов TCP: границы и инвариант
+// (connect + rpc ≤ 2 × raft.TCPRPCTimeout). Возвращает errors.Join всех ошибок.
 func validateTransportTimingFlags(connect, rpc, snapshot time.Duration) error {
 	var errs []error
 	check := func(ok bool, format string, args ...any) {
@@ -236,12 +228,9 @@ func validateTransportTimingFlags(connect, rpc, snapshot time.Duration) error {
 	return errors.Join(errs...)
 }
 
-// validateElectionQuorumInvariant проверяет инвариант: база
-// тайм-аута выборов строго больше фиксированного окна проверки
-// кворума 2 × raft.TCPRPCTimeout. Окно — константа компиляции и
-// флагом -tcp-rpc-timeout не масштабируется, поэтому инвариант
-// сравнивается с константой, а не с удвоенным флагом. Функция
-// чистая, без побочных эффектов.
+// validateElectionQuorumInvariant — инвариант: база тайм‑аута выборов > 2 × raft.TCPRPCTimeout.
+// Окно — константа, не масштабируется флагом -tcp-rpc-timeout.
+// Функция чистая, без побочных эффектов.
 func validateElectionQuorumInvariant(reelection time.Duration) error {
 	if reelection > 2*raft.TCPRPCTimeout {
 		return nil
