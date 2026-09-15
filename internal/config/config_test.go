@@ -168,11 +168,7 @@ func TestParseFlagsTraceLogDefaults(t *testing.T) {
 	}
 }
 
-// TestParseFlagsNodeDefaults — сводная сверка контракта дефолтов четырёх
-// параметров узла. Таблица «флаг → ожидаемое значение» против единого
-// источника — raft.TCPRPCTimeout / DefaultMaxPool /
-// raft.DefaultSnapshotInterval / raft.DefaultSnapshotThreshold. Защита
-// от рассинхрона дефолтов между internal/config и пакетом raft (RISK-023).
+// TestParseFlagsNodeDefaults — проверка значений по умолчанию для четырёх флагов узла.
 func TestParseFlagsNodeDefaults(t *testing.T) {
 	origArgs := os.Args
 	t.Cleanup(func() { os.Args = origArgs })
@@ -578,11 +574,8 @@ func TestValidateElectionQuorumInvariant(t *testing.T) {
 	}
 }
 
-// TestParseFlagsSnapshotDefaults проверяет дефолты флагов снимков: без флага
-// поля Values.SnapshotInterval/SnapshotThreshold равны экспортированным
-// дефолтам пакета raft. Это защита от рассинхрона дефолтов между
-// internal/config и пакетом raft (RISK-023): единый источник —
-// raft.DefaultSnapshotInterval/raft.DefaultSnapshotThreshold.
+// TestParseFlagsSnapshotDefaults — проверка значений по умолчанию для флагов снимков:
+// без явного флага используется ожидаемое умолчание.
 func TestParseFlagsSnapshotDefaults(t *testing.T) {
 	origArgs := os.Args
 	t.Cleanup(func() { os.Args = origArgs })
