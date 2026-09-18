@@ -219,8 +219,8 @@ func (cm *ConsensusModule) uncommittedLogLenLocked() int {
 // statsSnapshot — согласованный снимок состояния CM для одного выпуска
 // периодического отчёта. Все значения скопированы; ссылок на карты, журнал
 // и другие изменяемые коллекции CM нет: даже пары соседей лежат в counters.peers
-// собственной копией среза, а матрица сохранений — собственной копией набора
-// счётчиков.
+// собственной копией среза, а матрица сохранений и грязные периоды —
+// собственными копиями наборов счётчиков.
 type statsSnapshot struct {
 	at       time.Time     // момент снятия; несёт монотонные часы
 	age      time.Duration // монотонный возраст CM от создания
@@ -231,19 +231,21 @@ type statsSnapshot struct {
 	latency  latencyReport
 	counters statsCountersSnapshot
 	persist  persistenceSnapshot
+	dirty    dirtySnapshot
 }
 
 // takeStatsSnapshot снимает состояние отчёта за один захват cm.mu: роль,
 // терм и ID, защищённые счётчики с суммами карт, пары соседей, размер
-// незафиксированного хвоста, матрицу сохранений и момент снятия. Здесь же
-// ровно один раз выполняется сброс агрегатов латентности — как при
-// включённом, так и при выключенном выводе. Атомарные поля читаются через
-// Load. Блокировка берётся и снимается в этой функции.
+// незафиксированного хвоста, матрицу сохранений, грязные периоды и момент
+// снятия. Здесь же ровно один раз выполняется сброс агрегатов латентности —
+// как при включённом, так и при выключенном выводе. Атомарные поля читаются
+// через Load. Блокировка берётся и снимается в этой функции.
 func (cm *ConsensusModule) takeStatsSnapshot() statsSnapshot {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
+	at := time.Now()
 	return statsSnapshot{
-		at:       time.Now(),
+		at:       at,
 		age:      time.Since(cm.statsStartedAt),
 		instance: cm.statsInstance,
 		role:     cm.cmState.state,
@@ -252,6 +254,7 @@ func (cm *ConsensusModule) takeStatsSnapshot() statsSnapshot {
 		latency:  cm.latency.snapshotAndReset(),
 		counters: cm.countersSnapshotLocked(),
 		persist:  cm.persistence.snapshot(),
+		dirty:    cm.dirty.snapshot(at),
 	}
 }
 

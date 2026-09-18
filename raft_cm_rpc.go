@@ -239,6 +239,10 @@ func (cm *ConsensusModule) appendMatchingEntriesLocked(
 		cm.rebuildLastLogLocked()
 		cm.rebuildTermIndexMapLocked()
 		cm.cmState.logNeedsPersist = true
+		// Добавления — длина действительно приписанного остатка записей:
+		// совпавший префикс не считается, заменённые записи считаются,
+		// даже если последний индекс журнала уменьшился.
+		cm.dirty.mark(dirtyCauseFollowerAppend, int64(len(args.Entries)-newEntriesIndex))
 		// Если перезапись затронула конфигурацию, откатываем latest.
 		cm.processLogConflict(logInsertIndex)
 	}

@@ -264,8 +264,8 @@ func TestPublishStats_PersistenceAndStorageDocuments(t *testing.T) {
 	if *doc.StorageSnapshotNs < doc.CmSnapshotNs {
 		t.Fatalf("момент Storage = %d раньше момента CM = %d", *doc.StorageSnapshotNs, doc.CmSnapshotNs)
 	}
-	if doc.Dirty != _statsGroupUnavailable {
-		t.Fatalf("Dirty = %q, want %q", doc.Dirty, _statsGroupUnavailable)
+	if doc.Dirty != _statsGroupAvailable || doc.DirtyPeriods == nil {
+		t.Fatalf("Dirty = %q, DirtyPeriods = %v, want ok и документ", doc.Dirty, doc.DirtyPeriods)
 	}
 
 	// Хранилище без диагностических возможностей: признак unavailable,

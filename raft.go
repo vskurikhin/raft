@@ -420,7 +420,11 @@ func newConsensusModule(
 	cm.cmState.leaderLastContact = time.Time{}
 	cm.cmState.leaderID = -1
 	cm.leaderState.leadershipTransferCh = make(chan *leadershipTransferFuture, 1)
+	// Служебный начальный период нового узла: первая отметка до первого
+	// полного сохранения. При восстановлении готового хранилища период
+	// отменяется в restoreData — это не завершённое наблюдение.
 	cm.cmState.logNeedsPersist = true
+	cm.dirty.mark(dirtyCauseInitial, 0)
 	// Инициализация полей для снимков.
 	cm.initSnapshotConfig(snapshotFrom(snapshots))
 
@@ -454,6 +458,11 @@ func newConsensusModule(
 func restoreData(cm *ConsensusModule) {
 	cm.restoreFromStorage()
 	cm.cmState.logNeedsPersist = false
+	// Служебный начальный период отменяется: постоянное состояние уже
+	// восстановлено из хранилища и долговечно. Это не завершение периода
+	// и не наблюдение «сохранено» — иначе нулевой возраст был бы
+	// подменён мнимым персистом.
+	cm.dirty.cancelInitial()
 	// Однопоточное восстановление FSM из снимка до запуска горутин.
 	// Стратегия немедленного отказа: при невосстановимом состоянии узел
 	// аварийно завершается с явной ошибкой, чтобы избежать молчаливой
