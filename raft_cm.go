@@ -71,6 +71,33 @@ type ConsensusModule struct {
 	// в том числе одновременно с удержанной блокировкой cm.mu.
 	latency cmLatency
 
+	// disableStatsOutput — неизменяемый выбор вывода периодической
+	// статистики: зафиксирован конструктором до запуска первой горутины.
+	// При true снимок и сброс латентности выполняются на каждом тике,
+	// но сортировка, форматирование и запись трёх строк пропускаются.
+	disableStatsOutput bool
+
+	// statsStartedAt — момент создания CM; служит началом монотонного
+	// возраста в периодическом отчёте. После конструктора не изменяется.
+	statsStartedAt time.Time
+
+	// statsInstance — идентификатор экземпляра CM в ряду PersistV1:
+	// различает экземпляры в процессе и не повторяется после перезапуска
+	// процесса. После конструктора не изменяется.
+	statsInstance uint64
+
+	// statsSeq — номер попытки выпуска периодического отчёта. Растёт
+	// на каждую попытку при разрешённом выводе; при выключенном выводе
+	// попыток нет. Поле принадлежит горутине stats: отдельной
+	// синхронизации нет, в производстве его читает и пишет только stats,
+	// в тестах — прямой вызов публикации на CM без запущенной stats.
+	statsSeq uint64
+
+	// statsOutputErr — первая («липкая») ошибка вывода периодического
+	// отчёта. Принадлежит горутине stats; публикуется в следующей
+	// успешной строке PersistV1 и не очищается.
+	statsOutputErr error
+
 	// leaderLoopsAlive — число живых горутин цикла лидера на этом узле.
 	// Инвариант: значение не превышает 1. Увеличивается на входе в цикл
 	// и уменьшается при выходе, оба раза под cm.mu; читается тестами пакета.
@@ -418,24 +445,6 @@ func (cm *ConsensusModule) setTimerConfig(tc TimerConfig) {
 	cm.reelectionTimeout = tc.Reelection
 	cm.tickerTimeout = tc.Ticker
 	cm.verifyRedispatchMinInterval = tc.Heartbeat * 8 / 11
-}
-
-// stdoutTracePrintln выводит строку статистики в стандартный поток вывода:
-// форматирование и вывод синхронны и выполняются под cm.mu, взятой и
-// снятой здесь же через defer. Ошибка вывода передаётся сборщику ошибок
-// писателя трассировки; при выключенной трассировке писателя нет.
-func (cm *ConsensusModule) stdoutTracePrintln(msg string) {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-	prefix := tracelog.FormatPrefix(tracelog.Prefix{
-		Letter: stateLetter(cm.cmState.state),
-		ID:     cm.id,
-		Term:   cm.cmState.currentTerm,
-	})
-	_, err := fmt.Printf("%s%s\n", prefix, msg)
-	if _traceWriter != nil {
-		_traceWriter.RecordError(err)
-	}
 }
 
 // traceLogfLocked ставит отладочное сообщение в очередь писателя.

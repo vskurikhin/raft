@@ -115,6 +115,7 @@ func runWith(values *config.Values) (func(), error) {
 		HTTPAddress: values.HTTPAddress.String(),
 		Config: raft.Config{
 			ApplyBatchInterval: values.ApplyBatchInterval,
+			DisableStatsOutput: !values.StatsOutput,
 			HeartbeatTimeout:   values.HeartbeatTimeout,
 			PeerAddresses:      values.Peers,
 			PeerIds:            nums,

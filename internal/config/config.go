@@ -55,6 +55,11 @@ type Values struct {
 	// снимка, при котором создаётся новый снимок.
 	// Ноль — защитное значение: применяется дефолт конструктора.
 	SnapshotThreshold int
+	// StatsOutput — вывод периодической статистики узла. false отключает
+	// только публикацию (латентность, счётчики Raft, PersistV1), не прекращая
+	// секундный сбор метрик. Умолчание — true; настройка не связана
+	// с TraceLogLevel.
+	StatsOutput bool
 	// TCPConnectTimeout — тайм-аут установки TCP-соединения к соседям.
 	// Ноль — защитное значение: применяется дефолт транспорта
 	// (raft.ConnectionTCPRPCTimeout, 165 мс). Связь значения с окном
@@ -104,6 +109,7 @@ func ParseFlags() Values {
 	pprofAddressFlag := fs.String("pprof-addr", "", "Profiling HTTP server listen address (empty = disabled)")
 	rpcAddressFlag := fs.String("rpc-addr", ":9990", "RPC server listen address")
 	snapshotIntervalFlag, snapshotThresholdFlag := addSnapshotFlags(fs)
+	statsOutputFlag := addStatsOutputFlag(fs)
 	tcpConnectTimeoutFlag, tcpRPCTimeoutFlag, installSnapshotTimeoutFlag := addTransportFlags(fs)
 	traceCMLogFileFlag, traceKVLogFileFlag, traceLogLevelFlag := addTraceFlags(fs)
 
@@ -161,6 +167,7 @@ func ParseFlags() Values {
 		ReelectionTimeout:      *reelectionTimeoutFlag,
 		SnapshotInterval:       *snapshotIntervalFlag,
 		SnapshotThreshold:      *snapshotThresholdFlag,
+		StatsOutput:            *statsOutputFlag,
 		TCPConnectTimeout:      *tcpConnectTimeoutFlag,
 		TCPRPCTimeout:          *tcpRPCTimeoutFlag,
 		InstallSnapshotTimeout: *installSnapshotTimeoutFlag,
@@ -249,6 +256,18 @@ func addSnapshotFlags(fs *flag.FlagSet) (snapshotIntervalFlag *time.Duration, sn
 			"snapshot-threshold", raft.DefaultSnapshotThreshold,
 			"Log entries since last snapshot to trigger a new one (default 1024)",
 		)
+}
+
+// addStatsOutputFlag регистрирует флаг вывода периодической статистики:
+// три строки в секунду (латентность, счётчики Raft, PersistV1). Отсутствие
+// флага эквивалентно true; настройка не связана с -trace-log-level.
+func addStatsOutputFlag(fs *flag.FlagSet) *bool {
+	return fs.Bool(
+		"stats-output", true,
+		"Periodic stats output: latency, raft counters and PersistV1 "+
+			"(default true); false keeps collecting but suppresses all three "+
+			"lines; independent of -trace-log-level",
+	)
 }
 
 // addTimingFlags регистрирует четыре временных флага узла и возвращает
