@@ -272,8 +272,13 @@ type statsPersistV1 struct {
 	// синхронизаций файла и каталога; null при недоступности возможности.
 	StorageFileSyncNs *int64 `json:"StorageFileSyncNs"`
 	StorageDirSyncNs  *int64 `json:"StorageDirSyncNs"`
-	// Dirty — доступность группы грязных периодов журнала.
+	// Dirty — готовность группы грязных периодов журнала: набор
+	// формируется всегда и публикуется как ok.
 	Dirty string `json:"Dirty"`
+	// DirtyPeriods — агрегаты завершённых и незавершённого грязных
+	// периодов, гистограммы добавлений и возраста, число необъяснённых
+	// полных сохранений и признак переполнения.
+	DirtyPeriods *statsDirtyV1 `json:"DirtyPeriods"`
 	// OutputError — липкая ошибка общего вывода отчёта; пустая строка
 	// означает отсутствие ошибок.
 	OutputError string `json:"OutputError"`
@@ -327,7 +332,8 @@ func (s *statsSnapshot) persistDocument(
 		Persistence:  _statsGroupAvailable,
 		Persist:      s.persist.document(),
 		Storage:      storage.group(),
-		Dirty:        _statsGroupUnavailable,
+		Dirty:        _statsGroupAvailable,
+		DirtyPeriods: s.dirty.document(),
 		OutputError:  outputError,
 	}
 	if storage.available {

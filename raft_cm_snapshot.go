@@ -236,6 +236,9 @@ func (cm *ConsensusModule) installSnapshotStateLocked(meta *SnapshotMeta) {
 		}
 	}
 	cm.cmState.logNeedsPersist = true
+	// Установка снимка переписывает журнал, но не добавляет записей:
+	// период отмечается с нулём добавлений.
+	cm.dirty.mark(dirtyCauseInstallSnapshot, 0)
 	cm.persistToStorageLocked(persistSourceInstallSnapshot)
 }
 
