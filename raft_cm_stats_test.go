@@ -159,11 +159,21 @@ func TestStatsPublishThreeLines(t *testing.T) {
 	if doc.Term != 7 {
 		t.Errorf("Term = %d, want 7", doc.Term)
 	}
-	if doc.Persistence != _statsGroupUnavailable || doc.Dirty != _statsGroupUnavailable {
-		t.Errorf("группы = (%q, %q), want обе %q", doc.Persistence, doc.Dirty, _statsGroupUnavailable)
+	if doc.Persistence != _statsGroupAvailable {
+		t.Errorf("Persistence = %q, want %q (матрица сохранений доступна)", doc.Persistence, _statsGroupAvailable)
+	}
+	if doc.Persist == nil {
+		t.Error("Persist = null, want матрицу сохранений")
+	}
+	if doc.Dirty != _statsGroupUnavailable || doc.Storage != _statsGroupUnavailable {
+		t.Errorf("Dirty/Storage = (%q, %q), want обе %q", doc.Dirty, doc.Storage, _statsGroupUnavailable)
 	}
 	if doc.StorageSnapshotNs != nil {
-		t.Errorf("StorageSnapshotNs = %v, want null (возможность ещё не реализована)", *doc.StorageSnapshotNs)
+		t.Errorf("StorageSnapshotNs = %v, want null (возможность хранилища недоступна)", *doc.StorageSnapshotNs)
+	}
+	if doc.StorageWrites != nil || doc.StorageFileSyncNs != nil || doc.StorageDirSyncNs != nil {
+		t.Errorf("диагностика недоступного хранилища = (%v, %v, %v), want null",
+			doc.StorageWrites, doc.StorageFileSyncNs, doc.StorageDirSyncNs)
 	}
 	if doc.OutputError != "" {
 		t.Errorf("OutputError = %q, want пустую строку", doc.OutputError)

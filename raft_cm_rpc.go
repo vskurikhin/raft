@@ -144,7 +144,7 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 	// записи, не продвигая LeaderCommit: ветка продвижения индекса фиксации
 	// сохраняет состояние сама, а ветка добавления записей — нет. Повторное
 	// сохранение неизменившегося состояния записей на диск не выполняет.
-	cm.persistToStorage()
+	cm.persistToStorageLocked(persistSourceAEFinish)
 
 	reply.RPCHeader = RPCHeader{
 		ProtocolVersion: ProtocolVersion,
@@ -185,7 +185,7 @@ func (cm *ConsensusModule) appendEntriesDuringLeadershipTransferLocked(
 		}
 		reply.Term = cm.cmState.currentTerm
 		reply.Success = false
-		cm.persistToStorage()
+		cm.persistToStorageLocked(persistSourceAETransfer)
 		return true
 	}
 	return false
@@ -255,7 +255,7 @@ func (cm *ConsensusModule) appendMatchingEntriesLocked(
 		if traceEnabled(_traceLevelReplication) {
 			cm.traceLogfLocked("... setting commitIndex=%d", cm.cmState.commitIndex)
 		}
-		cm.persistToStorage()
+		cm.persistToStorageLocked(persistSourceAECommit)
 		return cm.cmState.commitIndex, true
 	}
 	return 0, false
@@ -384,7 +384,7 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 		ServerID:        cm.id,
 	}
 	reply.Term = cm.cmState.currentTerm
-	cm.persistToStorage()
+	cm.persistToStorageLocked(persistSourceVote)
 	if traceEnabled(_traceLevelPreVote) {
 		cm.traceSprintfLocked("... RequestVote reply: %+v", reply)
 	}

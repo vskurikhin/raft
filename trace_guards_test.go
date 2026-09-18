@@ -273,7 +273,7 @@ var guardBaselinePlaces = []guardBaselinePlace{
 	{"raft_cm_snapshot.go", "(*ConsensusModule).runSnapshots", "traceLogf", "_traceLevelKeyEvents", "runSnapshots: takeSnapshot failed: %v"},
 
 	// raft_cm_storage.go
-	{"raft_cm_storage.go", "(*ConsensusModule).persistToStorage", "traceLogfLocked", "_traceLevelProgress", "persistToStorage elapsed %s"},
+	{"raft_cm_storage.go", "(*ConsensusModule).persistToStorageLocked", "traceLogfLocked", "_traceLevelProgress", "persistToStorage elapsed %s"},
 }
 
 // kvGuardFormats — пять KV-мест elapsed, единственные подлежащие обёртке

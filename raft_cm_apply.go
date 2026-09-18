@@ -91,7 +91,7 @@ func (cm *ConsensusModule) processLogs(commitIndex int) {
 	}
 	lastApplied := cm.cmState.lastApplied
 	cm.cmState.lastApplied = commitIndex
-	cm.persistToStorage()
+	cm.persistToStorageLocked(persistSourceApply)
 	cm.mu.Unlock()
 
 	start := lastApplied + 1

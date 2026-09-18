@@ -21,7 +21,7 @@ const (
 	_storageKeyLastSnapshotTerm  = "lastSnapshotTerm"
 )
 
-// persistToStorage сохраняет постоянное состояние CM в cm.storage.
+// persistToStorageLocked сохраняет постоянное состояние CM в cm.storage.
 // Кодирование журнала выполняется только при cm.cmState.logNeedsPersist == true
 // (т.е. когда лог действительно изменился), что позволяет избежать
 // дорогого gob.Encode(cm.cmState.log) на каждом heartbeat или RPC.
@@ -34,15 +34,18 @@ const (
 // консервативнее, а startup-restore самовосстанавливает рассинхрон
 // (restoreFromSnapshotStore).
 //
-//nolint:gocritic
-func (cm *ConsensusModule) persistToStorage() {
+// На входе фиксируются источник, режим и начальный момент. Успешное
+// завершение всех прежних Set регистрирует одно наблюдение: источник,
+// режим и длительность от входа до последнего необходимого Set (до
+// обновления агрегатов и постановки прежней trace-строки). В полном режиме
+// вместе с наблюдением используются размер журнала и уже закодированные
+// байты: повторного кодирования ради статистики нет. Метрики не влияют на
+// решение о сохранении и не создают записей Storage.
+//
+// Требует удержания cm.mu — мьютекса владельца сохраняемого состояния.
+func (cm *ConsensusModule) persistToStorageLocked(source persistSource) {
 	start := time.Now()
-	defer func() {
-		elapsed := time.Since(start)
-		if traceEnabled(_traceLevelProgress) {
-			cm.traceLogfLocked("persistToStorage elapsed %s", elapsed)
-		}
-	}()
+	full := cm.cmState.logNeedsPersist
 	var termData bytes.Buffer
 	if err := gob.NewEncoder(&termData).Encode(cm.cmState.currentTerm); err != nil {
 		log.Fatal(err)
@@ -67,13 +70,24 @@ func (cm *ConsensusModule) persistToStorage() {
 	}
 	cm.storage.Set(_storageKeyLastSnapshotTerm, snapTermData.Bytes())
 
-	if cm.cmState.logNeedsPersist {
+	var logLen, logBytes int
+	if full {
 		var logData bytes.Buffer
 		if err := gob.NewEncoder(&logData).Encode(cm.cmState.log); err != nil {
 			log.Fatal(err)
 		}
+		// Размер журнала и готовые байты кодирования снимаются до Set;
+		// буфер не копируется и повторно не кодируется.
+		logLen = len(cm.cmState.log)
+		logBytes = logData.Len()
 		cm.storage.Set(_storageKeyLog, logData.Bytes())
 		cm.cmState.logNeedsPersist = false
+	}
+
+	elapsed := time.Since(start)
+	cm.persistence.observe(source, full, elapsed, logLen, logBytes)
+	if traceEnabled(_traceLevelProgress) {
+		cm.traceLogfLocked("persistToStorage elapsed %s", elapsed)
 	}
 }
 
@@ -246,7 +260,12 @@ func (cm *ConsensusModule) restoreFromSnapshotStore() error {
 	if snapshotChanged {
 		// logNeedsPersist уже false (сброшен после restoreFromStorage),
 		// поэтому log-ключ не переписывается — только дешёвые ключи.
-		cm.persistToStorage()
+		// Локальная блокировка охватывает только сохранение и
+		// заканчивается в этой же функции: snapshotStore.List/Open и
+		// fsm.Restore выше выполнялись без cm.mu (однопоточный старт).
+		cm.mu.Lock()
+		defer cm.mu.Unlock()
+		cm.persistToStorageLocked(persistSourceStartupRestore)
 	}
 	return nil
 }

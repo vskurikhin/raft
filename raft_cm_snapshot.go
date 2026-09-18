@@ -236,7 +236,7 @@ func (cm *ConsensusModule) installSnapshotStateLocked(meta *SnapshotMeta) {
 		}
 	}
 	cm.cmState.logNeedsPersist = true
-	cm.persistToStorage()
+	cm.persistToStorageLocked(persistSourceInstallSnapshot)
 }
 
 // receiveAndSealSnapshot принимает тело снимка от лидера в приёмник
@@ -381,7 +381,7 @@ func (cm *ConsensusModule) takeSnapshot() error {
 	cm.cmState.lastSnapshotIndex = snapReq.index
 	cm.cmState.lastSnapshotTerm = snapReq.term
 	cm.compactLogsLocked(snapReq.index - cm.trailingLogs)
-	cm.persistToStorage()
+	cm.persistToStorageLocked(persistSourceTakeSnapshot)
 	cm.mu.Unlock()
 
 	return nil

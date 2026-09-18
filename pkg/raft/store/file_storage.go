@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/vskurikhin/raft/pkg/raft/contract"
 )
@@ -25,6 +26,13 @@ type FileStorage struct {
 	data    map[string][]byte
 	hasData bool
 	writes  int
+
+	// fileSyncNS и dirSyncNS — суммы длительностей успешно завершённых
+	// синхронизаций файла и каталога в наносекундах. Обе величины
+	// защищены fs.mu и прибавляются вместе с writes только после полного
+	// успешного цикла ключа.
+	fileSyncNS int64
+	dirSyncNS  int64
 }
 
 var _ contract.Storage = (*FileStorage)(nil)
@@ -57,20 +65,27 @@ func NewFileStorage(dir string) *FileStorage {
 }
 
 // Set атомарно сохраняет value для key на диск и обновляет in-memory кэш.
-// При ошибке ФС процесс завершается через log.Fatalf, поэтому блокировка здесь
-// не снимается на путях ошибки — это не имеет значения,
-// так как процесс всё равно завершается.
+// При ошибке ФС процесс завершается через log.Fatalf, поэтому наблюдения
+// прибавляются только на полностью успешном пути: неизменный Set и
+// прерванная операция не увеличивают ни счётчик записей, ни суммы
+// длительностей синхронизации.
 //
 // Инвариант: после возврата Set на диске долговечно лежит value, а кэш хранит
 // собственную копию, побайтово равную value, независимо от последующих мутаций
 // среза вызывающим. Ввод-вывод пропускается ровно тогда, когда на диске уже
 // лежит это значение: ключ есть в кэше и закэшированная копия побайтово равна
 // value. Пропуск долговечности не ослабляет — требуемое значение уже на диске.
+//
+// Длительности замеряются монотонными часами непосредственно вокруг f.Sync
+// и syncDir; сумма syncDir включает открытие и закрытие каталога внутри
+// помощника, то есть это длительность вызова, а не чистого системного вызова.
+//
+//nolint:gocritic // log.Fatalf завершает процесс: отложенное снятие на пути ошибки не наблюдаемо
 func (fs *FileStorage) Set(key string, value []byte) {
 	fs.mu.Lock()
+	defer fs.mu.Unlock()
 
 	if cached, found := fs.data[key]; found && bytes.Equal(cached, value) {
-		fs.mu.Unlock()
 		return
 	}
 
@@ -85,10 +100,12 @@ func (fs *FileStorage) Set(key string, value []byte) {
 		_ = f.Close()
 		log.Fatalf("FileStorage.Set: gob encode %s: %v", key, err)
 	}
+	fileSyncStart := time.Now()
 	if err := f.Sync(); err != nil {
 		_ = f.Close()
 		log.Fatalf("FileStorage.Set: sync %s: %v", tmpPath, err)
 	}
+	fileSyncNS := time.Since(fileSyncStart).Nanoseconds()
 	if err := f.Close(); err != nil {
 		log.Fatalf("FileStorage.Set: close %s: %v", tmpPath, err)
 	}
@@ -97,14 +114,19 @@ func (fs *FileStorage) Set(key string, value []byte) {
 	}
 
 	// fsync родительской директории, чтобы rename пережил аварийный сбой ОС.
+	dirSyncStart := time.Now()
 	if err := syncDir(fs.dir); err != nil {
 		log.Fatalf("FileStorage.Set: sync dir %s: %v", fs.dir, err)
 	}
+	dirSyncNS := time.Since(dirSyncStart).Nanoseconds()
 
 	fs.data[key] = slices.Clone(value)
 	fs.hasData = true
 	fs.writes++
-	fs.mu.Unlock()
+	// Наблюдения прибавляются вместе с writes++: только успешный цикл ключа
+	// даёт завершённые f.Sync и syncDir.
+	fs.fileSyncNS += fileSyncNS
+	fs.dirSyncNS += dirSyncNS
 }
 
 // Get возвращает значение key из in-memory кэша.
@@ -136,6 +158,18 @@ func (fs *FileStorage) WriteCount() int {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	return fs.writes
+}
+
+// PersistenceStats возвращает согласованный диагностический снимок под одним
+// захватом fs.mu: существующее число фактически завершённых записей ключей и
+// суммы длительностей успешно завершённых синхронизаций файла и каталога в
+// наносекундах. Это дополнительная диагностическая возможность конкретной
+// реализации: интерфейс Storage метода не требует, а WriteCount сохраняет
+// прежнюю семантику и служит источником значения writes.
+func (fs *FileStorage) PersistenceStats() (writes int, fileSyncNS, dirSyncNS int64) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	return fs.writes, fs.fileSyncNS, fs.dirSyncNS
 }
 
 // loadAll читает все .dat-файлы из директории в in-memory кэш. Вызывается

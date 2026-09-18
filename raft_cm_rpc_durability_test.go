@@ -26,7 +26,9 @@ func newAEDurabilityCM(dir string) (*ConsensusModule, *store.FileStorage) {
 	cm.cmState.fsmAppliedIndex = -1
 	cm.cmState.termIndexMap = make(map[int]int)
 	cm.cmState.logNeedsPersist = true
-	cm.persistToStorage()
+	cm.mu.Lock()
+	cm.persistToStorageLocked(persistSourceTest)
+	cm.mu.Unlock()
 	return cm, storage
 }
 
