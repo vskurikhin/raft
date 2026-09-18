@@ -78,6 +78,23 @@ func TestRunWithNonDefaultNodeFlags(t *testing.T) {
 	t.Cleanup(stop)
 }
 
+// TestRunWithStatsOutputDisabled — маршрут Values.StatsOutput=false до узла:
+// узел стартует и останавливается штатно (leaktest чист), то есть настройка
+// вывода периодической статистики не мешает жизненному циклу.
+func TestRunWithStatsOutputDisabled(t *testing.T) {
+	t.Cleanup(leaktest.CheckTimeout(t, raft.LeaktestBudget))
+
+	values := newTestValues(t)
+	values.Peers = map[int]net.Addr{}
+	values.StatsOutput = false
+
+	stop, err := runWith(&values)
+	if err != nil {
+		t.Fatalf("runWith with stats output disabled returned unexpectedly: %v", err)
+	}
+	t.Cleanup(stop)
+}
+
 // TestRunWithPeerConnect запускает узел, подключённый к серверу-соседу.
 func TestRunWithPeerConnect(t *testing.T) {
 	t.Cleanup(leaktest.CheckTimeout(t, raft.LeaktestBudget))

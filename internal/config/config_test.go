@@ -3,6 +3,7 @@ package config
 import (
 	"bytes"
 	"flag"
+	"io"
 	"net"
 	"os"
 	"strings"
@@ -150,6 +151,56 @@ func TestParseFlagsDefaultAddr(t *testing.T) {
 	}
 }
 
+// TestParseFlagsStatsOutputDefaultsTrue — отсутствие флага -stats-output
+// включает вывод периодической статистики: умолчание равно true.
+func TestParseFlagsStatsOutputDefaultsTrue(t *testing.T) {
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
+
+	os.Args = []string{"raft", "-number", "1"}
+
+	v := ParseFlags()
+	if !v.StatsOutput {
+		t.Errorf("StatsOutput = false, want true (умолчание)")
+	}
+}
+
+// TestParseFlagsStatsOutputFalse — явное -stats-output=false доезжает
+// до Values.StatsOutput и не связано с уровнем трассировки.
+func TestParseFlagsStatsOutputFalse(t *testing.T) {
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
+
+	os.Args = []string{"raft", "-number", "1", "-stats-output=false", "-trace-log-level=5"}
+
+	v := ParseFlags()
+	if v.StatsOutput {
+		t.Errorf("StatsOutput = true, want false (явное отключение)")
+	}
+	if v.TraceLogLevel != 5 {
+		t.Errorf("TraceLogLevel = %d, want 5 (настройки независимы)", v.TraceLogLevel)
+	}
+}
+
+// TestAddStatsOutputFlagRejectsInvalidValue — небулево значение обязано
+// отклоняться штатной ошибкой парсера флагов, без log.Fatal: проверяется
+// регистрация флага на отдельном наборе.
+func TestAddStatsOutputFlagRejectsInvalidValue(t *testing.T) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	_ = addStatsOutputFlag(fs)
+
+	err := fs.Parse([]string{"-stats-output=maybe"})
+	if err == nil {
+		t.Fatal("ожидалась ошибка парсера для небулева значения")
+	}
+	if !strings.Contains(err.Error(), "invalid boolean value") {
+		t.Errorf("ошибка парсера = %q, want стандартное сообщение о небулевом значении", err)
+	}
+}
+
+// TestParseFlagsTraceLogDefaults — проверка значений по умолчанию для
+// флагов трассировки.
 func TestParseFlagsTraceLogDefaults(t *testing.T) {
 	origArgs := os.Args
 	t.Cleanup(func() { os.Args = origArgs })

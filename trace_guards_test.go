@@ -1348,7 +1348,7 @@ func guardProbeSprintfDemoted(_ *guardPackage, places []*guardPlace) (func(), bo
 // enqueueTraceLocked в тело производственной функции вне трёх обёрток:
 // правило запрета прямых enqueue обязано отвергнуть мутацию.
 func guardProbeDirectEnqueue(pkg *guardPackage, _ []*guardPlace) (func(), bool) {
-	fn := guardFindMethodDecl(pkg, "stdoutTracePrintln")
+	fn := guardFindMethodDecl(pkg, "stats")
 	if fn == nil {
 		return nil, false
 	}
