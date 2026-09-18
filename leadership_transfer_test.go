@@ -186,19 +186,19 @@ func TestLeadershipTransfer_ToUnknown_Fails(t *testing.T) {
 // и удерживает флаг до закрытия окна.
 //
 // Нижняя граница окна: ветка догоняющей репликации завершается только
-// по таймауту electionTimeout() >= ReelectionTimeoutMs = 381 мс, всё это
+// по таймауту electionTimeout() >= DefaultReelectionTimeout = 340 мс, всё это
 // время флаг leadershipTransferInProgress удерживается — запас относительно
-// _pollInterval не ниже 38x.
+// _pollInterval не ниже 34x.
 //
 // Верхняя граница окна: догоняющая репликация выполняется синхронно в цикле
 // лидера и блокирует его, поэтому рассылка пульсов единственному оставшемуся
 // ведомому прекращается на всё время окна. Ведомый стартует выборы не раньше
-// чем через ReelectionTimeoutMs - HeartbeatTimeoutMs = 381 - 33 = 348 мс от
+// чем через DefaultReelectionTimeout - DefaultHeartbeatTimeout = 340 - 33 = 307 мс от
 // начала окна (его таймер выборов отсчитывается от последнего пульса, который
 // мог прийти не позднее чем за период пульса до начала окна). Следовательно
-// окно гарантированно живёт не меньше 348 мс при любом розыгрыше таймеров,
+// окно гарантированно живёт не меньше 307 мс при любом розыгрыше таймеров,
 // а флаг наблюдается не позднее чем через _pollInterval = 10 мс после
-// установки — запас до гарантированного закрытия окна не меньше 338 мс.
+// установки — запас до гарантированного закрытия окна не меньше 297 мс.
 //
 // Восстановление связности цели в конце теста не требуется: Shutdown
 // останавливает все живые узлы независимо от логической связности.
@@ -487,10 +487,10 @@ func TestLeadershipTransfer_VoteBypass(t *testing.T) {
 	// leadership transfer increment term). follower должен проголосовать,
 	// несмотря на знание о лидере: в новом term votedFor = -1, а bypass
 	// пропускает проверку leaderID.
-	// lastLogIndexAndTerm требует удержания cm.mu — читаем под блокировкой.
+	// lastLogIndexAndTermLocked требует удержания cm.mu — читаем под блокировкой.
 	cm := h.cluster[followerID]
 	cm.mu.Lock()
-	lastLogIndex, _ := cm.lastLogIndexAndTerm()
+	lastLogIndex, _ := cm.lastLogIndexAndTermLocked()
 	cm.mu.Unlock()
 	candidateID := (origLeaderID + 2) % 3
 	args := RequestVoteArgs{
@@ -650,7 +650,7 @@ func waitForTermAbove(h *Harness, id, want int, budget time.Duration) {
 }
 
 // TestLeadershipTransfer_AfterShutdown проверяет, что LeadershipTransfer
-// после остановки модуля возвращает ошибку (ErrNotLeader или ErrRaftShutdown).
+// после остановки модуля возвращает ошибку (ErrNotLeader или contract.ErrRaftShutdown).
 func TestLeadershipTransfer_AfterShutdown(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
