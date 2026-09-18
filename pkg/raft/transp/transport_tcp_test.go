@@ -1,23 +1,39 @@
-package raft
+package transp
 
 import (
+	"bytes"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/fortytw2/leaktest"
+	"github.com/vskurikhin/raft"
+	"github.com/vskurikhin/raft/pkg/raft/contract"
 )
+
+// uniformTCPTimeouts возвращает TCPTimeouts, у которого все четыре поля
+// равны d. Используется в тестах, где прежний единый тайм-аут (установка
+// соединения, дедлайн RPC, снимок, ответ) заменяется равномерным
+// заполнением структуры — семантически эквивалентно прежнему значению.
+func uniformTCPTimeouts(d time.Duration) TCPTimeouts {
+	return TCPTimeouts{
+		ConnectionTimeout:      d,
+		GenericRPCTimeout:      d,
+		InstallSnapshotTimeout: d,
+		ResponseTimeout:        d,
+	}
+}
 
 // newTCPPair создаёт два соединённых TCPTransport на localhost:0.
 // Возвращает (client, server, cleanup). client может отправлять RPC серверу
 // и наоборот. cleanup закрывает оба транспорта. maxPool для тестов = 2.
-func newTCPPair(t *testing.T, timeout time.Duration) (*TCPTransport, *TCPTransport, func()) {
+func newTCPPair(t *testing.T, timeouts TCPTimeouts) (*TCPTransport, *TCPTransport, func()) {
 	t.Helper()
-	server, err := NewTCPTransport("127.0.0.1:0", timeout, 2)
+	server, err := NewTCPTransport("127.0.0.1:0", timeouts, 2)
 	if err != nil {
 		t.Fatalf("NewTCPTransport(server): %v", err)
 	}
-	client, err := NewTCPTransport("127.0.0.1:0", timeout, 2)
+	client, err := NewTCPTransport("127.0.0.1:0", timeouts, 2)
 	if err != nil {
 		server.Close()
 		t.Fatalf("NewTCPTransport(client): %v", err)
@@ -43,13 +59,13 @@ func startTCPHandler(t *testing.T, trans *TCPTransport) func() {
 					return
 				}
 				switch cmd := rpc.Command.(type) {
-				case *AppendEntriesArgs:
-					rpc.RespChan <- RPCResponse{
-						Reply: &AppendEntriesReply{Success: true, Term: cmd.Term},
+				case *contract.AppendEntriesArgs:
+					rpc.RespChan <- contract.RPCResponse{
+						Reply: &contract.AppendEntriesReply{Success: true, Term: cmd.Term},
 					}
-				case *RequestVoteArgs:
-					rpc.RespChan <- RPCResponse{
-						Reply: &RequestVoteReply{VoteGranted: true, Term: cmd.Term},
+				case *contract.RequestVoteArgs:
+					rpc.RespChan <- contract.RPCResponse{
+						Reply: &contract.RequestVoteReply{VoteGranted: true, Term: cmd.Term},
 					}
 				}
 			case <-done:
@@ -83,8 +99,8 @@ func startTCPHandlerNoReply(t *testing.T, trans *TCPTransport) func() {
 
 // TestTCPNewTransport проверяет успешное создание TCPTransport.
 func TestTCPNewTransport(t *testing.T) {
-	defer leaktest.CheckTimeout(t, LeaktestBudget)()
-	trans, err := NewTCPTransport("127.0.0.1:0", 500*time.Millisecond, 2)
+	defer leaktest.CheckTimeout(t, raft.LeaktestBudget)()
+	trans, err := NewTCPTransport("127.0.0.1:0", uniformTCPTimeouts(500*time.Millisecond), 2)
 	if err != nil {
 		t.Fatalf("NewTCPTransport failed: %v", err)
 	}
@@ -95,31 +111,69 @@ func TestTCPNewTransport(t *testing.T) {
 	if trans.LocalAddr() == "" {
 		t.Fatal("LocalAddr() returned empty")
 	}
+	if trans.connectionTimeout != 500*time.Millisecond {
+		t.Fatalf("timeout = %v, want 500ms", trans.connectionTimeout)
+	}
 }
 
-// TestTCPNewTransportZeroTimeout проверяет защитную проверку конструктора
-// (AC-2): нулевой тайм-аут заменяется дефолтом _defaultTCPRPCTimeout, чтобы
-// транспорт всегда имел действующие дедлайны. Без этой проверки нулевая
-// конфигурация дала бы транспорт без дедлайнов (RISK-021).
+// TestTCPNewTransportMaxPool проверяет, что явное значение maxPool
+// сохраняется, а ноль заменяется дефолтом транспорта _defaultMaxPool.
+func TestTCPNewTransportMaxPool(t *testing.T) {
+	tests := []struct {
+		name    string
+		maxPool int
+		want    int
+	}{
+		{name: "explicit", maxPool: 7, want: 7},
+		{name: "zero uses transport default", maxPool: 0, want: _defaultMaxPool},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			defer leaktest.CheckTimeout(t, raft.LeaktestBudget)()
+			trans, err := NewTCPTransport("127.0.0.1:0", uniformTCPTimeouts(500*time.Millisecond), test.maxPool)
+			if err != nil {
+				t.Fatalf("NewTCPTransport: %v", err)
+			}
+			defer trans.Close()
+			if trans.maxPool != test.want {
+				t.Fatalf("transport.maxPool = %d, want %d", trans.maxPool, test.want)
+			}
+		})
+	}
+}
+
+// TestTCPNewTransportZeroTimeout проверяет контракт нулевой структуры
+// TCPTimeouts{} (подтверждён владельцем): каждое нулевое
+// поле заменяется константой, поэтому нулевая структура даёт все дефолты
+// 165/200/310/200 мс (установка соединения, обычный RPC, снимок, ответ).
+// Без этой защитной проверки нулевая конфигурация дала бы транспорт
+// без действующих дедлайнов.
 func TestTCPNewTransportZeroTimeout(t *testing.T) {
-	defer leaktest.CheckTimeout(t, LeaktestBudget)()
-	trans, err := NewTCPTransport("127.0.0.1:0", 0, 2)
+	defer leaktest.CheckTimeout(t, raft.LeaktestBudget)()
+	trans, err := NewTCPTransport("127.0.0.1:0", TCPTimeouts{}, 2)
 	if err != nil {
 		t.Fatalf("NewTCPTransport: %v", err)
 	}
 	defer trans.Close()
-	if trans.timeout != _defaultTCPRPCTimeout {
-		t.Fatalf("timeout = %v, want default %v", trans.timeout, _defaultTCPRPCTimeout)
+	if trans.connectionTimeout != contract.ConnectionTCPRPCTimeout {
+		t.Fatalf("connectionTimeout = %v, want default %v", trans.connectionTimeout, contract.ConnectionTCPRPCTimeout)
 	}
-	if trans.timeout != TCPRPCTimeout {
-		t.Fatalf("timeout = %v, want alias TCPRPCTimeout = %v", trans.timeout, TCPRPCTimeout)
+	if trans.genericRPCTimeout != contract.TCPRPCTimeout {
+		t.Fatalf("genericRPCTimeout = %v, want default %v", trans.genericRPCTimeout, contract.TCPRPCTimeout)
+	}
+	if trans.installSnapshotTimeout != contract.InstallSnapshotTimeout {
+		t.Fatalf("installSnapshotTimeout = %v, want default %v", trans.installSnapshotTimeout, contract.InstallSnapshotTimeout)
+	}
+	if trans.responseTimeout != contract.TCPRPCTimeout {
+		t.Fatalf("responseTimeout = %v, want default %v", trans.responseTimeout, contract.TCPRPCTimeout)
 	}
 }
 
 // TestTCPNewTransportInvalidAddr проверяет ошибку при неверном адресе.
 func TestTCPNewTransportInvalidAddr(t *testing.T) {
-	defer leaktest.CheckTimeout(t, LeaktestBudget)()
-	_, err := NewTCPTransport("invalid", 500*time.Millisecond, 2)
+	defer leaktest.CheckTimeout(t, raft.LeaktestBudget)()
+	_, err := NewTCPTransport("invalid", uniformTCPTimeouts(500*time.Millisecond), 2)
 	if err == nil {
 		t.Fatal("expected error for invalid address")
 	}
@@ -127,15 +181,15 @@ func TestTCPNewTransportInvalidAddr(t *testing.T) {
 
 // TestTCPNewTransportPortInUse проверяет ошибку при занятом порте.
 func TestTCPNewTransportPortInUse(t *testing.T) {
-	defer leaktest.CheckTimeout(t, LeaktestBudget)()
-	first, err := NewTCPTransport("127.0.0.1:0", 500*time.Millisecond, 2)
+	defer leaktest.CheckTimeout(t, raft.LeaktestBudget)()
+	first, err := NewTCPTransport("127.0.0.1:0", uniformTCPTimeouts(500*time.Millisecond), 2)
 	if err != nil {
 		t.Fatalf("first transport: %v", err)
 	}
 	defer first.Close()
 
 	// Второй транспорт на тот же порт
-	second, err := NewTCPTransport(string(first.LocalAddr()), 500*time.Millisecond, 2)
+	second, err := NewTCPTransport(string(first.LocalAddr()), uniformTCPTimeouts(500*time.Millisecond), 2)
 	if err == nil {
 		second.Close()
 		t.Fatal("expected error for port in use")
@@ -144,12 +198,12 @@ func TestTCPNewTransportPortInUse(t *testing.T) {
 
 // TestTCPAppendEntriesSuccess проверяет успешную отправку и получение ответа.
 func TestTCPAppendEntriesSuccess(t *testing.T) {
-	defer leaktest.CheckTimeout(t, LeaktestBudget)()
-	client, server, cleanup := newTCPPair(t, 500*time.Millisecond)
+	defer leaktest.CheckTimeout(t, raft.LeaktestBudget)()
+	client, server, cleanup := newTCPPair(t, uniformTCPTimeouts(500*time.Millisecond))
 	defer cleanup()
 	defer startTCPHandler(t, server)()
 
-	args := AppendEntriesArgs{
+	args := contract.AppendEntriesArgs{
 		Term:         1,
 		LeaderID:     0,
 		PrevLogIndex: -1,
@@ -170,15 +224,15 @@ func TestTCPAppendEntriesSuccess(t *testing.T) {
 
 // TestTCPAppendEntriesUnknownPeer проверяет отправку неизвестному peer.
 func TestTCPAppendEntriesUnknownPeer(t *testing.T) {
-	defer leaktest.CheckTimeout(t, LeaktestBudget)()
-	client, err := NewTCPTransport("127.0.0.1:0", 100*time.Millisecond, 2)
+	defer leaktest.CheckTimeout(t, raft.LeaktestBudget)()
+	client, err := NewTCPTransport("127.0.0.1:0", uniformTCPTimeouts(100*time.Millisecond), 2)
 	if err != nil {
 		t.Fatalf("NewTCPTransport: %v", err)
 	}
 	defer client.Close()
 
 	// Не вызываем Connect для peer 1
-	args := AppendEntriesArgs{Term: 1}
+	args := contract.AppendEntriesArgs{Term: 1}
 	_, err = client.AppendEntries(1, args)
 	if err == nil {
 		t.Fatal("expected error for unknown peer")
@@ -187,14 +241,14 @@ func TestTCPAppendEntriesUnknownPeer(t *testing.T) {
 
 // TestTCPAppendEntriesAfterClose проверяет отправку после закрытия.
 func TestTCPAppendEntriesAfterClose(t *testing.T) {
-	defer leaktest.CheckTimeout(t, LeaktestBudget)()
-	client, server, cleanup := newTCPPair(t, 500*time.Millisecond)
+	defer leaktest.CheckTimeout(t, raft.LeaktestBudget)()
+	client, server, cleanup := newTCPPair(t, uniformTCPTimeouts(500*time.Millisecond))
 	defer cleanup()
 	defer startTCPHandler(t, server)()
 
 	client.Close()
 
-	args := AppendEntriesArgs{Term: 1}
+	args := contract.AppendEntriesArgs{Term: 1}
 	_, err := client.AppendEntries(1, args)
 	if err == nil {
 		t.Fatal("expected error after Close")
@@ -203,13 +257,13 @@ func TestTCPAppendEntriesAfterClose(t *testing.T) {
 
 // TestTCPAppendEntriesDisconnect проверяет отправку после Disconnect.
 func TestTCPAppendEntriesDisconnect(t *testing.T) {
-	defer leaktest.CheckTimeout(t, LeaktestBudget)()
-	client, server, cleanup := newTCPPair(t, 500*time.Millisecond)
+	defer leaktest.CheckTimeout(t, raft.LeaktestBudget)()
+	client, server, cleanup := newTCPPair(t, uniformTCPTimeouts(500*time.Millisecond))
 	defer cleanup()
 	defer startTCPHandler(t, server)()
 
 	// Сначала успешная отправка
-	args := AppendEntriesArgs{Term: 1, LeaderID: 0}
+	args := contract.AppendEntriesArgs{Term: 1, LeaderID: 0}
 	reply, err := client.AppendEntries(1, args)
 	if err != nil {
 		t.Fatalf("first AppendEntries failed: %v", err)
@@ -229,14 +283,24 @@ func TestTCPAppendEntriesDisconnect(t *testing.T) {
 }
 
 // TestTCPAppendEntriesTimeout проверяет таймаут ответа.
+// «Коротким» делается ResponseTimeout СЕРВЕРА: ошибку ErrEnqueueTimeout
+// формирует сервер в handleCommand по time.After(respTimeout), ожидая
+// ответа потребителя; строка ошибки передаётся по проводу и
+// восстанавливается клиентом в маркерную ошибку ErrEnqueueTimeout
+// (decodeResponse). Остальные поля сервера и все поля клиента —
+// равномерно по 1 с, чтобы сработал именно серверный дедлайн ответа.
 func TestTCPAppendEntriesTimeout(t *testing.T) {
-	defer leaktest.CheckTimeout(t, LeaktestBudget)()
-	// Сервер с коротким таймаутом — 50ms
-	server, err := NewTCPTransport("127.0.0.1:0", 50*time.Millisecond, 2)
+	defer leaktest.CheckTimeout(t, raft.LeaktestBudget)()
+	server, err := NewTCPTransport("127.0.0.1:0", TCPTimeouts{
+		ConnectionTimeout:      time.Second,
+		GenericRPCTimeout:      time.Second,
+		InstallSnapshotTimeout: time.Second,
+		ResponseTimeout:        50 * time.Millisecond,
+	}, 2)
 	if err != nil {
 		t.Fatalf("NewTCPTransport(server): %v", err)
 	}
-	client, err := NewTCPTransport("127.0.0.1:0", time.Second, 2)
+	client, err := NewTCPTransport("127.0.0.1:0", uniformTCPTimeouts(time.Second), 2)
 	if err != nil {
 		server.Close()
 		t.Fatalf("NewTCPTransport(client): %v", err)
@@ -247,21 +311,114 @@ func TestTCPAppendEntriesTimeout(t *testing.T) {
 	defer server.Close()
 	defer startTCPHandlerNoReply(t, server)()
 
-	args := AppendEntriesArgs{Term: 1}
+	args := contract.AppendEntriesArgs{Term: 1}
 	_, err = client.AppendEntries(1, args)
-	if err != ErrEnqueueTimeout {
+	if err != contract.ErrEnqueueTimeout {
 		t.Fatalf("want ErrEnqueueTimeout, got %v", err)
 	}
 }
 
+// TestTCPInstallSnapshotSlowConsumer проверяет устранение гонки bufio.Reader
+// при истечении окна ожидания ответа для RPC со снимком.
+//
+// Механика: сервер отдаёт потребителю rpc.Reader = LimitReader(r, DataSize)
+// поверх общего bufio.Reader соединения и ждёт ответа в течение окна
+// max(responseTimeout, installSnapshotTimeout) × ⌊DataSize/256 КиБ⌋
+// (на умолчаниях TCPTimeouts{} — max(200, 310) × 1 = 310 мс). Медленный
+// потребитель (чтение по 16 КиБ с паузой 20 мс: 300 КиБ / 16 КиБ × 20 мс
+// ≈ 380 мс) не успевает дочитать данные снимка за окно; сервер кодирует
+// маркер ErrEnqueueTimeout, выполняет Flush и закрывает соединение —
+// продолжение декодирования из того же bufio.Reader исключено, гонки нет.
+//
+// Клиенту задаётся uniformTCPTimeouts(time.Second): дедлайн клиента (1 с)
+// взводится позже серверного окна (310 мс), поэтому истекает именно окно
+// СЕРВЕРА, а не собственный i/o timeout клиента. Проверка elapsed ≥ 300 мс
+// доказывает, что путь истечения серверного окна пройден.
+//
+// Ошибка потребителя не проверяется: потребитель может успеть дочитать
+// буфер до закрытия соединения (недетерминизм), поэтому требование ошибки
+// чтения было бы флейком.
+func TestTCPInstallSnapshotSlowConsumer(t *testing.T) {
+	defer leaktest.CheckTimeout(t, raft.LeaktestBudget)()
+
+	// Сервер — умолчания вехи (165/200/310/200): окно снимка 310 мс.
+	server, err := NewTCPTransport("127.0.0.1:0", TCPTimeouts{}, 2)
+	if err != nil {
+		t.Fatalf("NewTCPTransport(server): %v", err)
+	}
+	// Клиент — равномерно 1 с: дедлайн клиента позже серверного окна.
+	client, err := NewTCPTransport("127.0.0.1:0", uniformTCPTimeouts(time.Second), 2)
+	if err != nil {
+		server.Close()
+		t.Fatalf("NewTCPTransport(client): %v", err)
+	}
+	client.Connect(1, string(server.LocalAddr()))
+	server.Connect(0, string(client.LocalAddr()))
+	defer client.Close()
+	defer server.Close()
+
+	// Медленный потребитель: читает rpc.Reader порциями 16 КиБ с паузой
+	// 20 мс — не успевает за окно 310 мс. Ответ не отправляет: серверное
+	// окно истекает само, после закрытия соединения чтение завершается
+	// ошибкой.
+	consumerDone := make(chan struct{})
+	go func() {
+		defer close(consumerDone)
+		rpc, ok := <-server.Consumer()
+		if !ok {
+			return
+		}
+		buf := make([]byte, 16*1024)
+		for {
+			if _, err := rpc.Reader.Read(buf); err != nil {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}()
+	// Защитная проверка: если тест завершился раньше потребителя (например,
+	// из-за ошибки ожидания), дожидаемся его завершения после закрытия
+	// транспортов — соединение уже закрыто, чтение разблокировано.
+	t.Cleanup(func() {
+		select {
+		case <-consumerDone:
+		case <-time.After(3 * time.Second):
+			t.Error("медленный потребитель не завершился после закрытия соединения")
+		}
+	})
+
+	const dataSize = 300 * 1024
+	args := contract.InstallSnapshotRequest{
+		Term:         1,
+		LeaderID:     0,
+		LastLogIndex: 100,
+		LastLogTerm:  1,
+		DataSize:     dataSize,
+	}
+	data := make([]byte, dataSize)
+	start := time.Now()
+	_, err = client.InstallSnapshot(1, args, bytes.NewReader(data))
+	elapsed := time.Since(start)
+
+	if err != contract.ErrEnqueueTimeout {
+		t.Fatalf("want ErrEnqueueTimeout, got %v", err)
+	}
+	// Путь истечения серверного окна: elapsed ≥ 300 мс (окно 310 мс
+	// с допуском на планирование).
+	if elapsed < 300*time.Millisecond {
+		t.Fatalf("elapsed = %v, want >= 300ms (server snapshot window)", elapsed)
+	}
+	<-consumerDone
+}
+
 // TestTCPRequestVoteSuccess проверяет успешную отправку RequestVote.
 func TestTCPRequestVoteSuccess(t *testing.T) {
-	defer leaktest.CheckTimeout(t, LeaktestBudget)()
-	client, server, cleanup := newTCPPair(t, 500*time.Millisecond)
+	defer leaktest.CheckTimeout(t, raft.LeaktestBudget)()
+	client, server, cleanup := newTCPPair(t, uniformTCPTimeouts(500*time.Millisecond))
 	defer cleanup()
 	defer startTCPHandler(t, server)()
 
-	args := RequestVoteArgs{
+	args := contract.RequestVoteArgs{
 		Term:         2,
 		CandidateID:  0,
 		LastLogIndex: -1,
@@ -281,14 +438,14 @@ func TestTCPRequestVoteSuccess(t *testing.T) {
 
 // TestTCPRequestVoteUnknownPeer проверяет отправку RequestVote неизвестному peer.
 func TestTCPRequestVoteUnknownPeer(t *testing.T) {
-	defer leaktest.CheckTimeout(t, LeaktestBudget)()
-	client, err := NewTCPTransport("127.0.0.1:0", 100*time.Millisecond, 2)
+	defer leaktest.CheckTimeout(t, raft.LeaktestBudget)()
+	client, err := NewTCPTransport("127.0.0.1:0", uniformTCPTimeouts(100*time.Millisecond), 2)
 	if err != nil {
 		t.Fatalf("NewTCPTransport: %v", err)
 	}
 	defer client.Close()
 
-	_, err = client.RequestVote(1, RequestVoteArgs{Term: 1})
+	_, err = client.RequestVote(1, contract.RequestVoteArgs{Term: 1})
 	if err == nil {
 		t.Fatal("expected error for unknown peer")
 	}
@@ -296,14 +453,14 @@ func TestTCPRequestVoteUnknownPeer(t *testing.T) {
 
 // TestTCPRequestVoteAfterClose проверяет отправку RequestVote после закрытия.
 func TestTCPRequestVoteAfterClose(t *testing.T) {
-	defer leaktest.CheckTimeout(t, LeaktestBudget)()
-	client, server, cleanup := newTCPPair(t, 500*time.Millisecond)
+	defer leaktest.CheckTimeout(t, raft.LeaktestBudget)()
+	client, server, cleanup := newTCPPair(t, uniformTCPTimeouts(500*time.Millisecond))
 	defer cleanup()
 	defer startTCPHandler(t, server)()
 
 	client.Close()
 
-	_, err := client.RequestVote(1, RequestVoteArgs{Term: 1})
+	_, err := client.RequestVote(1, contract.RequestVoteArgs{Term: 1})
 	if err == nil {
 		t.Fatal("expected error after Close")
 	}
@@ -312,13 +469,13 @@ func TestTCPRequestVoteAfterClose(t *testing.T) {
 // TestTCPConnectionReset проверяет, что после разрыва соединения
 // следующий вызов AppendEntries возвращает ошибку.
 func TestTCPConnectionReset(t *testing.T) {
-	defer leaktest.CheckTimeout(t, LeaktestBudget)()
-	client, server, cleanup := newTCPPair(t, 500*time.Millisecond)
+	defer leaktest.CheckTimeout(t, raft.LeaktestBudget)()
+	client, server, cleanup := newTCPPair(t, uniformTCPTimeouts(500*time.Millisecond))
 	defer cleanup()
 	defer startTCPHandler(t, server)()
 
 	// Успешная отправка
-	args := AppendEntriesArgs{Term: 1, LeaderID: 0}
+	args := contract.AppendEntriesArgs{Term: 1, LeaderID: 0}
 	reply, err := client.AppendEntries(1, args)
 	if err != nil {
 		t.Fatalf("first AppendEntries failed: %v", err)
@@ -340,12 +497,12 @@ func TestTCPConnectionReset(t *testing.T) {
 // TestTCPReconnectAfterDrop проверяет, что Disconnect + Connect
 // позволяет установить новое соединение и успешно отправить RPC.
 func TestTCPReconnectAfterDrop(t *testing.T) {
-	defer leaktest.CheckTimeout(t, LeaktestBudget)()
-	client, server, cleanup := newTCPPair(t, 500*time.Millisecond)
+	defer leaktest.CheckTimeout(t, raft.LeaktestBudget)()
+	client, server, cleanup := newTCPPair(t, uniformTCPTimeouts(500*time.Millisecond))
 	defer cleanup()
 	defer startTCPHandler(t, server)()
 
-	args := AppendEntriesArgs{Term: 1, LeaderID: 0}
+	args := contract.AppendEntriesArgs{Term: 1, LeaderID: 0}
 
 	// Первый вызов успешен
 	reply, err := client.AppendEntries(1, args)
@@ -374,8 +531,8 @@ func TestTCPReconnectAfterDrop(t *testing.T) {
 
 // TestTCPConcurrentSends проверяет множественные параллельные отправки.
 func TestTCPConcurrentSends(t *testing.T) {
-	defer leaktest.CheckTimeout(t, LeaktestBudget)()
-	client, server, cleanup := newTCPPair(t, time.Second)
+	defer leaktest.CheckTimeout(t, raft.LeaktestBudget)()
+	client, server, cleanup := newTCPPair(t, uniformTCPTimeouts(time.Second))
 	defer cleanup()
 	defer startTCPHandler(t, server)()
 
@@ -384,7 +541,7 @@ func TestTCPConcurrentSends(t *testing.T) {
 		wg.Add(1)
 		go func(term int) {
 			defer wg.Done()
-			args := AppendEntriesArgs{Term: term, LeaderID: 0}
+			args := contract.AppendEntriesArgs{Term: term, LeaderID: 0}
 			reply, err := client.AppendEntries(1, args)
 			if err != nil {
 				t.Errorf("AppendEntries failed: %v", err)
@@ -400,8 +557,8 @@ func TestTCPConcurrentSends(t *testing.T) {
 
 // TestTCPDoubleClose проверяет, что вызов Close дважды не вызывает panic.
 func TestTCPDoubleClose(t *testing.T) {
-	defer leaktest.CheckTimeout(t, LeaktestBudget)()
-	trans, err := NewTCPTransport("127.0.0.1:0", 500*time.Millisecond, 2)
+	defer leaktest.CheckTimeout(t, raft.LeaktestBudget)()
+	trans, err := NewTCPTransport("127.0.0.1:0", uniformTCPTimeouts(500*time.Millisecond), 2)
 	if err != nil {
 		t.Fatalf("NewTCPTransport: %v", err)
 	}
@@ -412,8 +569,8 @@ func TestTCPDoubleClose(t *testing.T) {
 // TestTCPCloseWaitsForGoroutines проверяет, что после Close
 // не остаётся работающих горутин.
 func TestTCPCloseWaitsForGoroutines(t *testing.T) {
-	defer leaktest.CheckTimeout(t, LeaktestBudget)()
-	trans, err := NewTCPTransport("127.0.0.1:0", 500*time.Millisecond, 2)
+	defer leaktest.CheckTimeout(t, raft.LeaktestBudget)()
+	trans, err := NewTCPTransport("127.0.0.1:0", uniformTCPTimeouts(500*time.Millisecond), 2)
 	if err != nil {
 		t.Fatalf("NewTCPTransport: %v", err)
 	}
@@ -423,21 +580,21 @@ func TestTCPCloseWaitsForGoroutines(t *testing.T) {
 // TestTCPCloseStopsConsumer проверяет, что после Close
 // AppendEntries и RequestVote возвращают ошибку.
 func TestTCPCloseStopsConsumer(t *testing.T) {
-	defer leaktest.CheckTimeout(t, LeaktestBudget)()
-	client, server, cleanup := newTCPPair(t, 500*time.Millisecond)
+	defer leaktest.CheckTimeout(t, raft.LeaktestBudget)()
+	client, server, cleanup := newTCPPair(t, uniformTCPTimeouts(500*time.Millisecond))
 	defer cleanup()
 	defer startTCPHandler(t, server)()
 
 	client.Close()
 
 	// AppendEntries после Close
-	_, err := client.AppendEntries(1, AppendEntriesArgs{Term: 1})
+	_, err := client.AppendEntries(1, contract.AppendEntriesArgs{Term: 1})
 	if err == nil {
 		t.Fatal("expected error after Close")
 	}
 
 	// RequestVote после Close
-	_, err = client.RequestVote(1, RequestVoteArgs{Term: 1})
+	_, err = client.RequestVote(1, contract.RequestVoteArgs{Term: 1})
 	if err == nil {
 		t.Fatal("expected error after Close")
 	}
@@ -445,22 +602,22 @@ func TestTCPCloseStopsConsumer(t *testing.T) {
 
 // TestTCPGobRegistration проверяет, что RPC-типы зарегистрированы в gob.
 func TestTCPGobRegistration(t *testing.T) {
-	defer leaktest.CheckTimeout(t, LeaktestBudget)()
+	defer leaktest.CheckTimeout(t, raft.LeaktestBudget)()
 
 	// Проверяем, что init() зарегистрировал типы — создаём транспорт,
 	// отправляем RPC с разными типами, убеждаемся что gob не паникует.
-	client, server, cleanup := newTCPPair(t, time.Second)
+	client, server, cleanup := newTCPPair(t, uniformTCPTimeouts(time.Second))
 	defer cleanup()
 	defer startTCPHandler(t, server)()
 
 	t.Run("AppendEntries", func(t *testing.T) {
-		args := AppendEntriesArgs{
+		args := contract.AppendEntriesArgs{
 			Term:         1,
 			LeaderID:     0,
 			PrevLogIndex: -1,
 			PrevLogTerm:  -1,
-			Entries: []LogEntry{
-				{Index: 0, Term: 1, Type: LogCommand, Data: "test"},
+			Entries: []raft.LogEntry{
+				{Index: 0, Term: 1, Type: raft.LogCommand, Data: "test"},
 			},
 			LeaderCommit: -1,
 		}
@@ -474,7 +631,7 @@ func TestTCPGobRegistration(t *testing.T) {
 	})
 
 	t.Run("RequestVote", func(t *testing.T) {
-		args := RequestVoteArgs{
+		args := contract.RequestVoteArgs{
 			Term:         5,
 			CandidateID:  0,
 			LastLogIndex: 10,
@@ -493,8 +650,8 @@ func TestTCPGobRegistration(t *testing.T) {
 // TestTCPAppendEntriesError проверяет, что если сервер отвечает с ошибкой,
 // клиент получает и распознаёт её.
 func TestTCPAppendEntriesError(t *testing.T) {
-	defer leaktest.CheckTimeout(t, LeaktestBudget)()
-	client, server, cleanup := newTCPPair(t, 500*time.Millisecond)
+	defer leaktest.CheckTimeout(t, raft.LeaktestBudget)()
+	client, server, cleanup := newTCPPair(t, uniformTCPTimeouts(500*time.Millisecond))
 	defer cleanup()
 
 	// Обработчик, возвращающий ошибку
@@ -502,27 +659,27 @@ func TestTCPAppendEntriesError(t *testing.T) {
 	go func() {
 		select {
 		case rpc := <-server.Consumer():
-			rpc.RespChan <- RPCResponse{Error: ErrRaftShutdown}
+			rpc.RespChan <- contract.RPCResponse{Error: contract.ErrRaftShutdown}
 		case <-done:
 		}
 	}()
 	defer close(done)
 
-	_, err := client.AppendEntries(1, AppendEntriesArgs{Term: 1})
-	if err != ErrRaftShutdown {
+	_, err := client.AppendEntries(1, contract.AppendEntriesArgs{Term: 1})
+	if err != contract.ErrRaftShutdown {
 		t.Fatalf("want ErrRaftShutdown, got %v", err)
 	}
 }
 
 // TestTCPAppendEntriesMultiple проверяет несколько последовательных вызовов.
 func TestTCPAppendEntriesMultiple(t *testing.T) {
-	defer leaktest.CheckTimeout(t, LeaktestBudget)()
-	client, server, cleanup := newTCPPair(t, time.Second)
+	defer leaktest.CheckTimeout(t, raft.LeaktestBudget)()
+	client, server, cleanup := newTCPPair(t, uniformTCPTimeouts(time.Second))
 	defer cleanup()
 	defer startTCPHandler(t, server)()
 
 	for i := 0; i < 10; i++ {
-		args := AppendEntriesArgs{Term: i + 1, LeaderID: 0}
+		args := contract.AppendEntriesArgs{Term: i + 1, LeaderID: 0}
 		reply, err := client.AppendEntries(1, args)
 		if err != nil {
 			t.Fatalf("AppendEntries %d failed: %v", i, err)
@@ -535,8 +692,8 @@ func TestTCPAppendEntriesMultiple(t *testing.T) {
 
 // TestTCPLocalAddr проверяет LocalAddr().
 func TestTCPLocalAddr(t *testing.T) {
-	defer leaktest.CheckTimeout(t, LeaktestBudget)()
-	trans, err := NewTCPTransport("127.0.0.1:0", 500*time.Millisecond, 2)
+	defer leaktest.CheckTimeout(t, raft.LeaktestBudget)()
+	trans, err := NewTCPTransport("127.0.0.1:0", uniformTCPTimeouts(500*time.Millisecond), 2)
 	if err != nil {
 		t.Fatalf("NewTCPTransport: %v", err)
 	}
@@ -548,36 +705,36 @@ func TestTCPLocalAddr(t *testing.T) {
 }
 
 // TestTCPStubsReturnNotImplemented проверяет, что нереализованные методы возвращают
-// ErrNotImplemented, а реализованные (RequestPreVote, TimeoutNow) — транспортную ошибку.
+// contract.ErrNotImplemented, а реализованные (RequestPreVote, TimeoutNow) — транспортную ошибку.
 func TestTCPStubsReturnNotImplemented(t *testing.T) {
-	defer leaktest.CheckTimeout(t, LeaktestBudget)()
-	trans, err := NewTCPTransport("127.0.0.1:0", 100*time.Millisecond, 2)
+	defer leaktest.CheckTimeout(t, raft.LeaktestBudget)()
+	trans, err := NewTCPTransport("127.0.0.1:0", uniformTCPTimeouts(100*time.Millisecond), 2)
 	if err != nil {
 		t.Fatalf("NewTCPTransport: %v", err)
 	}
 	defer trans.Close()
 
 	t.Run("RequestPreVote", func(t *testing.T) {
-		_, err := trans.RequestPreVote(1, RequestPreVoteArgs{})
-		if err == nil || err == ErrNotImplemented {
+		_, err := trans.RequestPreVote(1, contract.RequestPreVoteArgs{})
+		if err == nil || err == contract.ErrNotImplemented {
 			t.Fatalf("want transport error, got %v", err)
 		}
 	})
 	t.Run("TimeoutNow", func(t *testing.T) {
-		_, err := trans.TimeoutNow(1, TimeoutNowRequest{})
-		if err == nil || err == ErrNotImplemented {
+		_, err := trans.TimeoutNow(1, contract.TimeoutNowRequest{})
+		if err == nil || err == contract.ErrNotImplemented {
 			t.Fatalf("want transport error, got %v", err)
 		}
 	})
 	t.Run("InstallSnapshot", func(t *testing.T) {
-		_, err := trans.InstallSnapshot(1, InstallSnapshotRequest{}, nil)
+		_, err := trans.InstallSnapshot(1, contract.InstallSnapshotRequest{}, nil)
 		if err == nil {
 			t.Fatalf("InstallSnapshot: want error, got nil")
 		}
 	})
 	t.Run("AppendEntriesPipeline", func(t *testing.T) {
 		_, err := trans.AppendEntriesPipeline(1)
-		if err != ErrNotImplemented {
+		if err != contract.ErrNotImplemented {
 			t.Fatalf("want ErrNotImplemented, got %v", err)
 		}
 	})
@@ -585,21 +742,21 @@ func TestTCPStubsReturnNotImplemented(t *testing.T) {
 
 // TestTCPDisconnectAll проверяет DisconnectAll.
 func TestTCPDisconnectAll(t *testing.T) {
-	defer leaktest.CheckTimeout(t, LeaktestBudget)()
-	client, err := NewTCPTransport("127.0.0.1:0", 500*time.Millisecond, 2)
+	defer leaktest.CheckTimeout(t, raft.LeaktestBudget)()
+	client, err := NewTCPTransport("127.0.0.1:0", uniformTCPTimeouts(500*time.Millisecond), 2)
 	if err != nil {
 		t.Fatalf("NewTCPTransport: %v", err)
 	}
 	defer client.Close()
 
 	// Подключаем два соседа
-	server1, err := NewTCPTransport("127.0.0.1:0", 500*time.Millisecond, 2)
+	server1, err := NewTCPTransport("127.0.0.1:0", uniformTCPTimeouts(500*time.Millisecond), 2)
 	if err != nil {
 		t.Fatalf("NewTCPTransport server1: %v", err)
 	}
 	server1.Close()
 
-	server2, err := NewTCPTransport("127.0.0.1:0", 500*time.Millisecond, 2)
+	server2, err := NewTCPTransport("127.0.0.1:0", uniformTCPTimeouts(500*time.Millisecond), 2)
 	if err != nil {
 		t.Fatalf("NewTCPTransport server2: %v", err)
 	}
@@ -612,11 +769,11 @@ func TestTCPDisconnectAll(t *testing.T) {
 	client.DisconnectAll()
 
 	// Все соседи должны быть недоступны
-	_, err = client.AppendEntries(1, AppendEntriesArgs{Term: 1})
+	_, err = client.AppendEntries(1, contract.AppendEntriesArgs{Term: 1})
 	if err == nil {
 		t.Fatal("expected error after DisconnectAll for peer 1")
 	}
-	_, err = client.AppendEntries(2, AppendEntriesArgs{Term: 1})
+	_, err = client.AppendEntries(2, contract.AppendEntriesArgs{Term: 1})
 	if err == nil {
 		t.Fatal("expected error after DisconnectAll for peer 2")
 	}
@@ -625,9 +782,9 @@ func TestTCPDisconnectAll(t *testing.T) {
 // TestTCPTransportNoGoroutineLeak проверяет, что после Close
 // не остаётся goroutine.
 func TestTCPTransportNoGoroutineLeak(t *testing.T) {
-	defer leaktest.CheckTimeout(t, LeaktestBudget)()
+	defer leaktest.CheckTimeout(t, raft.LeaktestBudget)()
 	// Создаём транспорт с активным acceptLoop, используем
-	trans, err := NewTCPTransport("127.0.0.1:0", 500*time.Millisecond, 2)
+	trans, err := NewTCPTransport("127.0.0.1:0", uniformTCPTimeouts(500*time.Millisecond), 2)
 	if err != nil {
 		t.Fatalf("NewTCPTransport: %v", err)
 	}

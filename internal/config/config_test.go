@@ -1,8 +1,11 @@
 package config
 
 import (
+	"bytes"
+	"flag"
 	"net"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -343,7 +346,7 @@ func TestParseFlagsMaxPool(t *testing.T) {
 }
 
 // TestParseFlagsTCPRPCTimeoutDefaults проверяет дефолт флага -tcp-rpc-timeout:
-// без флага поле Values.TCPRPCTimeout равно raft.TCPRPCTimeout (191 мс).
+// без флага поле Values.TCPRPCTimeout равно raft.TCPRPCTimeout (200 мс).
 // Одновременно это защита от рассинхрона дефолта между internal/config
 // и пакетом raft (RISK-023): единый источник — алиас raft.TCPRPCTimeout.
 func TestParseFlagsTCPRPCTimeoutDefaults(t *testing.T) {
@@ -356,25 +359,222 @@ func TestParseFlagsTCPRPCTimeoutDefaults(t *testing.T) {
 	if v.TCPRPCTimeout != raft.TCPRPCTimeout {
 		t.Errorf("TCPRPCTimeout = %v, want default %v", v.TCPRPCTimeout, raft.TCPRPCTimeout)
 	}
-	if raft.TCPRPCTimeout != 191*time.Millisecond {
-		t.Errorf("raft.TCPRPCTimeout = %v, want 191ms", raft.TCPRPCTimeout)
+	if raft.TCPRPCTimeout != 200*time.Millisecond {
+		t.Errorf("raft.TCPRPCTimeout = %v, want 200ms", raft.TCPRPCTimeout)
 	}
 }
 
 // TestParseFlagsTCPRPCTimeout проверяет, что нестандартное значение
 // флага -tcp-rpc-timeout доезжает в поле Values.TCPRPCTimeout.
+// Значение 230 мс выбрано из инвариантов валидации: при умолчании
+// connect 165 мс допустимый диапазон rpc — [165; 235] мс
+// (connect ≤ rpc, сумма ≤ 400, база снимка 310 ≥ rpc),
+// и значение отлично от умолчания 200 мс.
 func TestParseFlagsTCPRPCTimeout(t *testing.T) {
 	origArgs := os.Args
 	t.Cleanup(func() { os.Args = origArgs })
 
 	os.Args = []string{
 		"raft", "-number", "1",
-		"--tcp-rpc-timeout", "500ms",
+		"--tcp-rpc-timeout", "230ms",
 	}
 
 	v := ParseFlags()
-	if v.TCPRPCTimeout != 500*time.Millisecond {
-		t.Errorf("TCPRPCTimeout = %v, want 500ms", v.TCPRPCTimeout)
+	if v.TCPRPCTimeout != 230*time.Millisecond {
+		t.Errorf("TCPRPCTimeout = %v, want 230ms", v.TCPRPCTimeout)
+	}
+}
+
+// TestParseFlagsTCPTimeoutsDefaults проверяет дефолты трёх флагов
+// тайм-аутов TCP-транспорта: без флагов поля Values равны константам
+// raft.*. Защита от рассинхрона дефолтов между internal/config и
+// пакетом raft (RISK-023). Дефолтный набор проходит инварианты:
+// 165 ≤ 200, 165 + 200 = 365 ≤ 400, 310 ≥ 200.
+func TestParseFlagsTCPTimeoutsDefaults(t *testing.T) {
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
+
+	os.Args = []string{"raft", "-number", "1"}
+
+	v := ParseFlags()
+	cases := []struct {
+		name string
+		got  time.Duration
+		want time.Duration
+	}{
+		{"tcp-connect-timeout", v.TCPConnectTimeout, raft.ConnectionTCPRPCTimeout},
+		{"tcp-rpc-timeout", v.TCPRPCTimeout, raft.TCPRPCTimeout},
+		{"install-snapshot-timeout", v.InstallSnapshotTimeout, raft.InstallSnapshotTimeout},
+	}
+	for _, tc := range cases {
+		if tc.got != tc.want {
+			t.Errorf("%s = %v, want default %v", tc.name, tc.got, tc.want)
+		}
+	}
+	if err := validateTransportTimingFlags(v.TCPConnectTimeout, v.TCPRPCTimeout, v.InstallSnapshotTimeout); err != nil {
+		t.Errorf("default transport timeouts invalid: %v", err)
+	}
+	if err := validateElectionQuorumInvariant(v.ReelectionTimeout); err != nil {
+		t.Errorf("default reelection timeout invalid: %v", err)
+	}
+}
+
+// TestParseFlagsTCPConnectTimeout проверяет, что нестандартное значение
+// флага -tcp-connect-timeout доезжает в поле Values.TCPConnectTimeout.
+func TestParseFlagsTCPConnectTimeout(t *testing.T) {
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
+
+	os.Args = []string{
+		"raft", "-number", "1",
+		"--tcp-connect-timeout", "180ms",
+	}
+
+	v := ParseFlags()
+	if v.TCPConnectTimeout != 180*time.Millisecond {
+		t.Errorf("TCPConnectTimeout = %v, want 180ms", v.TCPConnectTimeout)
+	}
+}
+
+// TestParseFlagsInstallSnapshotTimeout проверяет, что нестандартное
+// значение флага -install-snapshot-timeout доезжает в поле
+// Values.InstallSnapshotTimeout.
+func TestParseFlagsInstallSnapshotTimeout(t *testing.T) {
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
+
+	os.Args = []string{
+		"raft", "-number", "1",
+		"--install-snapshot-timeout", "500ms",
+	}
+
+	v := ParseFlags()
+	if v.InstallSnapshotTimeout != 500*time.Millisecond {
+		t.Errorf("InstallSnapshotTimeout = %v, want 500ms", v.InstallSnapshotTimeout)
+	}
+}
+
+// TestValidateTransportTimingFlags проверяет чистую функцию валидации
+// трёх флагов тайм-аутов TCP-транспорта: индивидуальные границы и
+// инварианты по фразам требований и значениям.
+// Негативные наборы «ровно одно нарушение» (230/170, 165/300)
+// подобраны так, что остальные инварианты выполнены; при rpc ≥ 200
+// нарушение сопровождается
+// (connect > rpc ≥ 200 ⇒ connect + rpc > 400)
+// — для таких наборов errors.Join несёт обе фразы.
+func TestValidateTransportTimingFlags(t *testing.T) {
+	tests := []struct {
+		name     string
+		connect  time.Duration
+		rpc      time.Duration
+		snapshot time.Duration
+		wantErr  []string // подстроки, которые обязаны присутствовать в ошибке
+	}{
+		{
+			name:     "defaults pass",
+			connect:  165 * time.Millisecond,
+			rpc:      200 * time.Millisecond,
+			snapshot: 310 * time.Millisecond,
+		},
+		{
+			name:     "connect exceeds rpc",
+			connect:  230 * time.Millisecond,
+			rpc:      170 * time.Millisecond,
+			snapshot: 310 * time.Millisecond,
+			wantErr:  []string{"must not exceed -tcp-rpc-timeout", "230ms", "170ms"},
+		},
+		{
+			name:     "snapshot below rpc",
+			connect:  165 * time.Millisecond,
+			rpc:      200 * time.Millisecond,
+			snapshot: 100 * time.Millisecond,
+			wantErr:  []string{"must be at least -tcp-rpc-timeout", "100ms", "200ms"},
+		},
+		{
+			name:     "sum exceeds quorum window",
+			connect:  165 * time.Millisecond,
+			rpc:      300 * time.Millisecond,
+			snapshot: 310 * time.Millisecond,
+			wantErr:  []string{"must not exceed 2x raft.TCPRPCTimeout", "quorum check window", "165ms", "300ms"},
+		},
+		{
+			name:     "both T-group violations joined",
+			connect:  230 * time.Millisecond,
+			rpc:      170 * time.Millisecond,
+			snapshot: 100 * time.Millisecond,
+			wantErr:  []string{"must not exceed -tcp-rpc-timeout", "must be at least -tcp-rpc-timeout"},
+		},
+		{
+			name:     "rpc zero double message",
+			connect:  165 * time.Millisecond,
+			rpc:      0,
+			snapshot: 310 * time.Millisecond,
+			wantErr:  []string{"must be greater than 0", "must not exceed -tcp-rpc-timeout"},
+		},
+		{
+			name:     "connect zero",
+			connect:  0,
+			rpc:      200 * time.Millisecond,
+			snapshot: 310 * time.Millisecond,
+			wantErr:  []string{"-tcp-connect-timeout must be greater than 0, got 0s"},
+		},
+		{
+			name:     "fractional snapshot",
+			connect:  165 * time.Millisecond,
+			rpc:      200 * time.Millisecond,
+			snapshot: 310*time.Millisecond + 500*time.Microsecond,
+			wantErr:  []string{"-install-snapshot-timeout must be a whole number of milliseconds"},
+		},
+		{
+			name:     "with rpc above 200 also fires",
+			connect:  300 * time.Millisecond,
+			rpc:      200 * time.Millisecond,
+			snapshot: 310 * time.Millisecond,
+			wantErr:  []string{"must not exceed -tcp-rpc-timeout", "must not exceed 2x raft.TCPRPCTimeout"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateTransportTimingFlags(tc.connect, tc.rpc, tc.snapshot)
+			if len(tc.wantErr) == 0 {
+				if err != nil {
+					t.Fatalf("validateTransportTimingFlags(%v, %v, %v) = %v, want nil", tc.connect, tc.rpc, tc.snapshot, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("validateTransportTimingFlags(%v, %v, %v) = nil, want error", tc.connect, tc.rpc, tc.snapshot)
+			}
+			for _, want := range tc.wantErr {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not contain %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+// TestValidateElectionQuorumInvariant проверяет инвариант: база
+// перевыборов строго больше фиксированного окна проверки кворума
+// 2 × raft.TCPRPCTimeout = 400 мс. Инвариант сравнивается с
+// константой, поэтому значение флага -tcp-rpc-timeout на него не
+// влияет (в сигнатуре функции параметра rpc нет).
+func TestValidateElectionQuorumInvariant(t *testing.T) {
+	err := validateElectionQuorumInvariant(400 * time.Millisecond)
+	if err == nil {
+		t.Fatal("validateElectionQuorumInvariant(400ms) = nil, want error")
+	}
+	for _, want := range []string{
+		"must be greater than 2x raft.TCPRPCTimeout",
+		"quorum check window",
+		"got 400ms vs 400ms",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not contain %q", err, want)
+		}
+	}
+	if err := validateElectionQuorumInvariant(430 * time.Millisecond); err != nil {
+		t.Errorf("validateElectionQuorumInvariant(430ms) = %v, want nil", err)
 	}
 }
 
@@ -422,5 +622,122 @@ func TestParseFlagsSnapshot(t *testing.T) {
 	}
 	if v.SnapshotThreshold != 2048 {
 		t.Errorf("SnapshotThreshold = %d, want 2048", v.SnapshotThreshold)
+	}
+}
+
+// TestParseFlagsTimingDefaults проверяет дефолты четырёх временных флагов:
+// без флага поля Values равны экспортированным дефолтам пакета raft.
+func TestParseFlagsTimingDefaults(t *testing.T) {
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
+
+	os.Args = []string{"raft", "-number", "1"}
+
+	v := ParseFlags()
+	cases := []struct {
+		name string
+		got  time.Duration
+		want time.Duration
+	}{
+		{"heartbeat-timeout", v.HeartbeatTimeout, raft.DefaultHeartbeatTimeout},
+		{"ticker-timeout", v.TickerTimeout, raft.DefaultTickerTimeout},
+		{"reelection-timeout", v.ReelectionTimeout, raft.DefaultReelectionTimeout},
+		{"apply-batch-interval", v.ApplyBatchInterval, raft.DefaultApplyBatchInterval},
+	}
+	for _, tc := range cases {
+		if tc.got != tc.want {
+			t.Errorf("%s = %v, want default %v", tc.name, tc.got, tc.want)
+		}
+	}
+}
+
+// TestParseFlagsTiming проверяет, что нестандартные значения временных
+// флагов доезжают в поля Values.
+func TestParseFlagsTiming(t *testing.T) {
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
+
+	os.Args = []string{
+		"raft", "-number", "1",
+		"--heartbeat-timeout", "40ms",
+		"--ticker-timeout", "30ms",
+		"--reelection-timeout", "500ms",
+		"--apply-batch-interval", "60ms",
+	}
+
+	v := ParseFlags()
+	if v.HeartbeatTimeout != 40*time.Millisecond {
+		t.Errorf("HeartbeatTimeout = %v, want 40ms", v.HeartbeatTimeout)
+	}
+	if v.TickerTimeout != 30*time.Millisecond {
+		t.Errorf("TickerTimeout = %v, want 30ms", v.TickerTimeout)
+	}
+	if v.ReelectionTimeout != 500*time.Millisecond {
+		t.Errorf("ReelectionTimeout = %v, want 500ms", v.ReelectionTimeout)
+	}
+	if v.ApplyBatchInterval != 60*time.Millisecond {
+		t.Errorf("ApplyBatchInterval = %v, want 60ms", v.ApplyBatchInterval)
+	}
+}
+
+// TestValidateTimingFlags_Delegation проверяет, что обёртка делегирует
+// проверку raft.ValidateTiming: валидная четвёрка даёт nil, нарушение
+// даёт ошибку с именем параметра.
+func TestValidateTimingFlags_Delegation(t *testing.T) {
+	if err := validateTimingFlags(33*time.Millisecond, 21*time.Millisecond, 381*time.Millisecond, 50*time.Millisecond); err != nil {
+		t.Errorf("validateTimingFlags(pre-change defaults) = %v, want nil", err)
+	}
+
+	err := validateTimingFlags(200*time.Millisecond, 21*time.Millisecond, 381*time.Millisecond, 50*time.Millisecond)
+	if err == nil {
+		t.Fatal("validateTimingFlags = nil, want error for heartbeat 200ms")
+	}
+	if !strings.Contains(err.Error(), "heartbeat-timeout") || !strings.Contains(err.Error(), "100") {
+		t.Errorf("error %q must mention heartbeat-timeout and 100", err)
+	}
+}
+
+// TestParseFlagsTimingFailFast проверяет, что невалидная комбинация
+// временных флагов отклоняется с сообщением о параметре, значении и
+// требовании (проверяется на уровне обёртки, т.к. log.Fatalf завершает
+// процесс).
+func TestParseFlagsTimingFailFast(t *testing.T) {
+	err := validateTimingFlags(33*time.Millisecond, 21*time.Millisecond, 300*time.Millisecond, 50*time.Millisecond)
+	if err == nil {
+		t.Fatal("validateTimingFlags = nil, want error for C1 violation")
+	}
+	for _, want := range []string{"reelection-timeout", "heartbeat-timeout"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+}
+
+// TestParseFlagsTimingHelp проверяет, что подсказки временных флагов
+// содержат предупреждения о межпараметрических связях и фиксированном
+// check-quorum. Флаги регистрируются реальными addTimingFlags и
+// addTransportFlags — тест проверяет подписи функций регистрации, а не
+// копии строк. Проверка по строкам подсказок, которые выводятся
+// в -help.
+func TestParseFlagsTimingHelp(t *testing.T) {
+	fs := flag.NewFlagSet("raft", flag.ContinueOnError)
+	var buf bytes.Buffer
+	fs.SetOutput(&buf)
+	addTimingFlags(fs)
+	addTransportFlags(fs)
+	_ = fs.Parse([]string{"-h"})
+
+	help := buf.String()
+	for _, want := range []string{
+		// Профиль умолчаний и производные потолка пульса.
+		"400ms", "100ms", "430ms", "43ms",
+		"must not exceed -tcp-rpc-timeout",
+		"must be at least -tcp-rpc-timeout",
+		// Межпараметрические связи временных флагов.
+		"reelection-timeout/10", "10x heartbeat-timeout", "reelection-timeout",
+	} {
+		if !strings.Contains(help, want) {
+			t.Errorf("help output does not contain %q", want)
+		}
 	}
 }
