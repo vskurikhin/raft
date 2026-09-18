@@ -79,7 +79,7 @@ func (cm *ConsensusModule) applySingle(batch []*commitTuple) {
 // processLogs собирает зафиксированные записи от lastApplied+1 до commitIndex
 // и отправляет их в FSM goroutine. Диапазон делится на под-батчи размером
 // не более _maxApplyBatchSize для снижения latency FSM.
-// Метод не требует удержания cm.mu при вызове, но сам захватывает её
+// Метод НЕ ТРЕБУЕТ удержания cm.mu при вызове, но сам захватывает её
 // внутри для чтения журнала и поиска future в карте inflight.
 func (cm *ConsensusModule) processLogs(commitIndex int) {
 	startTimeNow := time.Now()
@@ -185,11 +185,12 @@ func (cm *ConsensusModule) sendBatch(start, end int) {
 		}
 		pos := cm.logPositionLocked(idx)
 		if pos >= len(cm.cmState.log) {
-			cm.traceLockedLogf(
-				_traceLevelKeyEvents,
-				"sendBatch: logPositionLocked(%d) returned %d, len(log)=%d",
-				idx, pos, len(cm.cmState.log),
-			)
+			if traceEnabled(_traceLevelKeyEvents) {
+				cm.traceLogfLocked(
+					"sendBatch: logPositionLocked(%d) returned %d, len(log)=%d",
+					idx, pos, len(cm.cmState.log),
+				)
+			}
 			cm.counters.sendBatchEntrySkipped.Add(1)
 			continue
 		}
@@ -197,11 +198,12 @@ func (cm *ConsensusModule) sendBatch(start, end int) {
 		// журнала бинарный поиск возвращает позицию 0, но запись log[0]
 		// не соответствует idx и не должна применяться к FSM.
 		if cm.cmState.log[pos].Index != idx {
-			cm.traceLockedLogf(
-				_traceLevelKeyEvents,
-				"sendBatch: no log entry at index %d (entry=%d), skipping",
-				idx, cm.cmState.log[pos].Index,
-			)
+			if traceEnabled(_traceLevelKeyEvents) {
+				cm.traceLogfLocked(
+					"sendBatch: no log entry at index %d (entry=%d), skipping",
+					idx, cm.cmState.log[pos].Index,
+				)
+			}
 			cm.counters.sendBatchEntrySkipped.Add(1)
 			continue
 		}

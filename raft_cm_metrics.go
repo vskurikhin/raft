@@ -79,13 +79,11 @@ func (l *cmLatency) snapshotAndReset() latencyReport {
 	}
 }
 
-// format форматирует снимок агрегатов в одну строку отчёта. Чистая функция:
-// не читает глобалей и полей CM, не логирует. Набор и порядок колонок,
-// а также формат %5.2fms сохраняются; имена колонок сокращены для
-// компактности (например TakeSnap вместо TakeSnapshot). Собственной метки
-// времени и префикса [state,N:id,T:term] нет — их добавляют логгер
-// трассировки и traceLogf. Приём только по указателю —
-// (88 B > порог gocritic:hugeParam).
+// format — строка отчёта со снимком агрегатов. Чистая функция: без доступа
+// к глобальным переменным, полям CM и логирования.
+// Колонки фиксированы (%5.2fms), имена сокращены (TakeSnap и т. п.).
+// Префикс и метку времени добавляют снаружи (логгер, traceLogf).
+// Аргумент — указатель (88 Б > порог gocritic:hugeParam).
 func (r *latencyReport) format() string {
 	return fmt.Sprintf(
 		"AE=%5.2fms, BatchingFSM=%5.2fms, Election=%5.2fms, FSMSnapSh=%5.2fms,"+
@@ -243,10 +241,11 @@ func (c *stepDownCounters) report() string {
 	)
 }
 
-// incPeerCount инкрементирует счётчик по каждому соседу, лениво инициализируя
-// карту (нулевое значение raftCounters должно быть готово к использованию),
-// и возвращает (возможно, переаллоцированную) карту. Требует удержания cm.mu.
-func incPeerCount(m map[int]int64, peerID int) map[int]int64 {
+// incPeerCountLocked инкрементирует счётчик по каждому соседу, лениво
+// инициализируя карту (нулевое значение raftCounters должно быть готово
+// к использованию), и возвращает (возможно, переаллоцированную) карту.
+// Требует удержания cm.mu — мьютекса владельца карты.
+func incPeerCountLocked(m map[int]int64, peerID int) map[int]int64 {
 	if m == nil {
 		m = make(map[int]int64)
 	}
@@ -254,9 +253,10 @@ func incPeerCount(m map[int]int64, peerID int) map[int]int64 {
 	return m
 }
 
-// peerSum суммирует значения карты по каждому соседу. Чтение — только под cm.mu
-// (горутина stats); суммирование для отчёта, не для hot path.
-func peerSum(m map[int]int64) int64 {
+// peerSumLocked суммирует значения карты по каждому соседу. Вызывается
+// горутиной stats для отчёта, не для горячего пути.
+// Требует удержания cm.mu — мьютекса владельца карты.
+func peerSumLocked(m map[int]int64) int64 {
 	var total int64
 	for _, v := range m {
 		total += v
@@ -274,12 +274,12 @@ func (c *raftCounters) report(ls *leaderState) string {
 		"ISsent=%d ISrecv=%d ISstale=%d AErej=%d NIrejIgn=%d BndViol=%d SnapLag=%d "+
 			"BatchSkip=%d VrfDone=%d VrfWtd=%d AESent=%d "+
 			"VrfRedisp=%d VrfRedispSupp=%d",
-		peerSum(c.installSnapshotSent), c.installSnapshotReceived.Load(),
-		peerSum(c.installSnapshotSkippedStale), peerSum(c.appendEntriesRejected),
-		peerSum(c.nextIndexRejectionIgnored), c.snapshotLogBoundaryViolation.Load(),
+		peerSumLocked(c.installSnapshotSent), c.installSnapshotReceived.Load(),
+		peerSumLocked(c.installSnapshotSkippedStale), peerSumLocked(c.appendEntriesRejected),
+		peerSumLocked(c.nextIndexRejectionIgnored), c.snapshotLogBoundaryViolation.Load(),
 		c.snapshotIndexBehindDispatched.Load(), c.sendBatchEntrySkipped.Load(),
-		c.verifyCompleted, c.verifyWaitedHeartbeat, peerSum(c.aeSentPerPeer),
-		peerSum(c.verifyRedispatched), peerSum(c.verifyRedispatchSuppressed))
+		c.verifyCompleted, c.verifyWaitedHeartbeat, peerSumLocked(c.aeSentPerPeer),
+		peerSumLocked(c.verifyRedispatched), peerSumLocked(c.verifyRedispatchSuppressed))
 	peers := make([]int, 0, len(ls.nextIndex))
 	for p := range ls.nextIndex {
 		peers = append(peers, p)

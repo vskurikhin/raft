@@ -6,6 +6,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/vskurikhin/raft/internal/tracelog"
 )
 
 // ConsensusModule (CM) реализует единый узел консенсуса Raft.
@@ -53,6 +55,15 @@ type ConsensusModule struct {
 	// могли задать заведомо больший или меньший срок. Читается только
 	// в цикле лидера под cm.mu.
 	checkQuorumTimeout time.Duration
+
+	// Временные параметры узла. Записываются один раз до close(ready)
+	// (конструктор — умолчания, setTimerConfig — конфигурация), все записи
+	// и чтения — под cm.mu; чтение нормализует нулевое или отрицательное
+	// значение в соответствующее умолчание Default*.
+	applyBatchInterval time.Duration // интервал батча применения к FSM
+	heartbeatTimeout   time.Duration // период пульса лидера
+	reelectionTimeout  time.Duration // база тайм-аута выборов
+	tickerTimeout      time.Duration // такт тикера выборов
 
 	// latency — структура с агрегированными показателями задержки (латентности) ConsensusModule.
 	// Нулевое значение структуры корректно и готово к использованию: явная инициализация не требуется.
@@ -113,9 +124,10 @@ type ConsensusModule struct {
 
 	// verifyRedispatchMinInterval — минимальный интервал между немедленными
 	// перерассылками AppendEntries одному соседу при неудовлетворённом
-	// verify-запросе. Значение по умолчанию — _verifyRedispatchMinIntervalMs;
-	// поле, а не константа, чтобы тесты пакета могли задать заведомо малое
-	// значение (укороченное окно) для проверки границы частоты. Читается и
+	// verify-запросе. Значение по умолчанию вычисляется как
+	// heartbeatTimeout × 8 / 11 (строго меньше пульса); поле, а не
+	// константа, чтобы тесты пакета могли задать заведомо малое значение
+	// (укороченное окно) для проверки границы частоты. Читается и
 	// записывается только под cm.mu в redispatchVerifyIfPendingLocked.
 	verifyRedispatchMinInterval time.Duration
 }
@@ -168,7 +180,7 @@ type cmState struct {
 	lastApplied int
 
 	// lastLogIndex — кэш индекса последней записи в журнале.
-	// Обновляется через setLastLog при любом изменении журнала.
+	// Обновляется через setLastLogLocked при любом изменении журнала.
 	lastLogIndex int
 
 	// lastLogTerm — кэш терма последней записи в журнале.
@@ -192,7 +204,7 @@ type cmState struct {
 
 	// termIndexMap — карта term → последний LogEntry.Index с этим term.
 	// O(1) lookup для ConflictTerm.
-	// Инкрементально обновляется в dispatchLogsUnsafe; перестраивается
+	// Инкрементально обновляется в dispatchLogsLocked; перестраивается
 	// целиком при обрезке/сжатии/замене журнала.
 	// Требует удержания cm.mu (Lock) при чтении и записи.
 	termIndexMap map[int]int
@@ -336,7 +348,9 @@ func (cm *ConsensusModule) Stop() {
 		cm.shutdownClosed = true
 		cm.mu.Unlock()
 
-		cm.traceLogf(_traceLevelKeyEvents, "CM.Stop called / becomes Dead")
+		if traceEnabled(_traceLevelKeyEvents) {
+			cm.traceLogf("CM.Stop called / becomes Dead")
+		}
 		close(cm.shutdownCh)
 		cm.wg.Wait()
 	})
@@ -354,6 +368,8 @@ func (cm *ConsensusModule) Stop() {
 // Критическое ограничение: нельзя временно освобождать cm.mu внутри вызывающих функций,
 // чтобы использовать «unlocked»-вариант. Если это сделать, атомарность нарушится:
 // между проверкой состояния и wg.Add может успеть выполниться Stop(), и возникнет гонка.
+//
+// Требует удержания cm.mu.
 func (cm *ConsensusModule) goSpawnLocked(fn func()) {
 	if cm.cmState.state == Dead || cm.shutdownClosed {
 		return // узел останавливается: запускать новую горутину нельзя
@@ -376,35 +392,123 @@ func (cm *ConsensusModule) goSpawn(fn func()) {
 	cm.mu.Unlock()
 }
 
+// initTimerDefaults устанавливает временные поля в значения по умолчанию
+// и пересчитывает зависимую величину verify-перерассылки от пульса.
+// Вызывается из конструктора до первого goSpawn — горутины ещё не запущены,
+// поэтому блокировка cm.mu не требуется.
+func (cm *ConsensusModule) initTimerDefaults() {
+	cm.applyBatchInterval = DefaultApplyBatchInterval
+	cm.heartbeatTimeout = DefaultHeartbeatTimeout
+	cm.reelectionTimeout = DefaultReelectionTimeout
+	cm.tickerTimeout = DefaultTickerTimeout
+	cm.verifyRedispatchMinInterval = DefaultHeartbeatTimeout * 8 / 11
+}
+
+// setTimerConfig устанавливает временные параметры узла. Вызывается только
+// до закрытия канала готовности (close(ready)).
+// Требования:
+// - Вызывающий код должен передать нормализованные значения > 0.
+// - Метод принимает значения без изменений и пересчитывает зависимую величину.
+// Метод автоматически захватывает блокировку cm.mu и снимает её через defer.
+func (cm *ConsensusModule) setTimerConfig(tc TimerConfig) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.applyBatchInterval = tc.ApplyBatch
+	cm.heartbeatTimeout = tc.Heartbeat
+	cm.reelectionTimeout = tc.Reelection
+	cm.tickerTimeout = tc.Ticker
+	cm.verifyRedispatchMinInterval = tc.Heartbeat * 8 / 11
+}
+
+// stdoutTracePrintln выводит строку статистики в стандартный поток вывода:
+// форматирование и вывод синхронны и выполняются под cm.mu, взятой и
+// снятой здесь же через defer. Ошибка вывода передаётся сборщику ошибок
+// писателя трассировки; при выключенной трассировке писателя нет.
 func (cm *ConsensusModule) stdoutTracePrintln(msg string) {
 	cm.mu.Lock()
-	_, _ = fmt.Printf("[%c,N:%d,T:%03d] %s\n", stateLetter(cm.cmState.state), cm.id, cm.cmState.currentTerm, msg)
-	cm.mu.Unlock()
-}
-
-// traceLockedLogf выводит отладочное сообщение, если _traceCM > level.
-// Ожидается, что cm.mu уже заблокирован вызывающим кодом, поэтому
-// состояние (cm.cmState.state, cm.id, cm.cmState.currentTerm) читается напрямую.
-func (cm *ConsensusModule) traceLockedLogf(level int, format string, args ...any) {
-	if level < _traceCM {
-		format = fmt.Sprintf("[%c,N:%d,T:%03d] ", stateLetter(cm.cmState.state), cm.id, cm.cmState.currentTerm) +
-			format
-		_traceLogger.Printf(format, args...)
+	defer cm.mu.Unlock()
+	prefix := tracelog.FormatPrefix(tracelog.Prefix{
+		Letter: stateLetter(cm.cmState.state),
+		ID:     cm.id,
+		Term:   cm.cmState.currentTerm,
+	})
+	_, err := fmt.Printf("%s%s\n", prefix, msg)
+	if _traceWriter != nil {
+		_traceWriter.RecordError(err)
 	}
 }
 
-// traceLogf — потокобезопасная обёртка над traceLockedLogf для вызовов
-// БЕЗ удержания cm.mu: самостоятельно захватывает блокировку, чтобы
-// прочитать состояние без data race. Для вызовов из кода, который уже
-// держит cm.mu, используйте traceLockedLogf — иначе будет deadlock.
-func (cm *ConsensusModule) traceLogf(level int, format string, args ...any) {
-	if level < _traceCM {
-		cm.mu.Lock()
-		cm.traceLockedLogf(level, format, args...)
-		cm.mu.Unlock()
-	}
+// traceLogfLocked ставит отладочное сообщение в очередь писателя.
+// Форматирование префикса и тела выполняет писатель; скаляры состояния
+// снимаются здесь под уже удержанной cm.mu.
+// Требует удержания cm.mu и внешней проверки порога вызывающим
+// (traceEnabled с уровнем данного места); вызов без guard — нарушение
+// контракта.
+//
+//nolint:goprintffuncname // имя закреплено контрактом вывода, формат передаётся писателю.
+func (cm *ConsensusModule) traceLogfLocked(format string, args ...any) {
+	cm.enqueueTraceLocked(_traceWriter, format, args...)
 }
 
+// traceSprintfLocked ставит отладочное сообщение с телом, сформированным
+// синхронно. Применяется в местах со ссылочными аргументами:
+// форматирование под cm.mu исключает чтение изменяемых объектов
+// в асинхронном пути.
+// Требует удержания cm.mu и внешней проверки порога вызывающим
+// (traceEnabled с уровнем данного места); вызов без guard — нарушение
+// контракта.
+//
+//nolint:goprintffuncname // имя закреплено контрактом вывода, формат передаётся писателю.
+func (cm *ConsensusModule) traceSprintfLocked(format string, args ...any) {
+	cm.enqueueTraceSprintfLocked(_traceWriter, format, args...)
+}
+
+// traceLogf — потокобезопасная обёртка для вызовов БЕЗ удержания cm.mu:
+// безусловно захватывает блокировку и снимает её через defer, затем
+// ставит сообщение в очередь писателя непосредственно. Требует внешней
+// проверки порога вызывающим (traceEnabled с уровнем данного места);
+// вызов без guard — нарушение контракта. Для вызовов из кода, который
+// уже держит cm.mu, используйте traceLogfLocked — иначе будет deadlock.
+func (cm *ConsensusModule) traceLogf(format string, args ...any) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.enqueueTraceLocked(_traceWriter, format, args...)
+}
+
+// enqueueTraceLocked добавляет сообщение с префиксными скалярными значениями в очередь
+// для записи: скалярные значения извлекаются с захваченной блокировкой cm.mu,
+// а тело сообщения форматируется модулем записи.
+//
+// Вызывающий код уже выполнил проверку порога и всех необходимых условий.
+// Метод требует, чтобы блокировка cm.mu была удержана на момент вызова.
+//
+//nolint:goprintffuncname // имя закреплено контрактом вывода, формат передаётся писателю.
+func (cm *ConsensusModule) enqueueTraceLocked(w *tracelog.Writer, format string, args ...any) {
+	w.Enqueue(tracelog.Prefix{
+		Letter: stateLetter(cm.cmState.state),
+		ID:     cm.id,
+		Term:   cm.cmState.currentTerm,
+	}, format, args...)
+}
+
+// enqueueTraceSprintfLocked ставит сообщение с готовым телом: fmt.Sprintf
+// выполняется синхронно под блокировкой cm.mu — это защищает от чтения
+// ссылочных аргументов после снятия блокировки.
+// Порог и все требуемые проверки уже выполнены вызывающим кодом.
+// Требуется удержание блокировки cm.mu.
+//
+//nolint:goprintffuncname // имя закреплено контрактом вывода.
+func (cm *ConsensusModule) enqueueTraceSprintfLocked(w *tracelog.Writer, format string, args ...any) {
+	w.EnqueueText(tracelog.Prefix{
+		Letter: stateLetter(cm.cmState.state),
+		ID:     cm.id,
+		Term:   cm.cmState.currentTerm,
+	}, fmt.Sprintf(format, args...))
+}
+
+// stateLetter сопоставляет состоянию консенсус-модуля букву префикса
+// строки трассировки; состояния без собственной буквы печатаются как «?».
+// Вызывается только под cm.mu. Чистая функция без аллокаций.
 func stateLetter(s CMState) rune {
 	switch s {
 	case Follower:

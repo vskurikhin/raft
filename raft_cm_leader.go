@@ -3,6 +3,8 @@ package raft
 import (
 	"sync/atomic"
 	"time"
+
+	"github.com/vskurikhin/raft/pkg/raft/contract"
 )
 
 // _leadershipTransferPollInterval — период опроса nextIndex целевого
@@ -54,7 +56,7 @@ func (cm *ConsensusModule) AddVoter(id ServerID, addr ServerAddress) IndexFuture
 func (cm *ConsensusModule) Apply(command any, timeout time.Duration) ApplyFuture {
 	select {
 	case <-cm.shutdownCh:
-		return errorFuture{ErrRaftShutdown}
+		return errorFuture{contract.ErrRaftShutdown}
 	default:
 	}
 
@@ -86,9 +88,9 @@ func (cm *ConsensusModule) Apply(command any, timeout time.Duration) ApplyFuture
 	}
 	select {
 	case <-timer:
-		return errorFuture{ErrEnqueueTimeout}
+		return errorFuture{contract.ErrEnqueueTimeout}
 	case <-cm.shutdownCh:
-		return errorFuture{ErrRaftShutdown}
+		return errorFuture{contract.ErrRaftShutdown}
 	case cm.applyCh <- future:
 		return future
 	}
@@ -151,7 +153,7 @@ func (cm *ConsensusModule) LeadershipTransfer(targetID ServerID) LeadershipTrans
 	case cm.leaderState.leadershipTransferCh <- future:
 		return future
 	case <-cm.shutdownCh:
-		return errorFuture{ErrRaftShutdown}
+		return errorFuture{contract.ErrRaftShutdown}
 	}
 }
 
@@ -196,7 +198,7 @@ func (cm *ConsensusModule) VerifyLeader() Future {
 	case cm.verifyCh <- vf:
 		return vf
 	case <-cm.shutdownCh:
-		return errorFuture{err: ErrRaftShutdown}
+		return errorFuture{err: contract.ErrRaftShutdown}
 	}
 }
 
@@ -233,7 +235,7 @@ func (cm *ConsensusModule) appendConfigurationEntry(future *configurationChangeF
 	cm.cmState.configurations.latest = nextCfg
 	cm.cmState.configurations.latestIndex = cm.cmState.lastLogIndex + 1
 
-	cm.dispatchLogsUnsafe([]*logFuture{entry})
+	cm.dispatchLogsLocked([]*logFuture{entry})
 	cm.cmState.configurations.latestIndex = entry.log.Index
 	future.index = entry.log.Index
 
@@ -251,7 +253,9 @@ func (cm *ConsensusModule) appendConfigurationEntry(future *configurationChangeF
 	cm.leaderState.commitmentTracker.commit(cm.cmState.lastLogIndex, cm.lookupTermLocked)
 	savedCommitIndex := cm.cmState.commitIndex
 	if newCI := cm.leaderState.commitmentTracker.getCommitIndex(); newCI > cm.cmState.commitIndex {
-		cm.traceLockedLogf(_traceLevelProgress, "leader sets commitIndex := %d", newCI)
+		if traceEnabled(_traceLevelProgress) {
+			cm.traceLogfLocked("leader sets commitIndex := %d", newCI)
+		}
 		cm.cmState.commitIndex = newCI
 	}
 	// Значение снимается в критической секции до Unlock (RISK-002):
@@ -315,7 +319,7 @@ func (cm *ConsensusModule) enqueueConfigurationChange(future *configurationChang
 	case cm.confChangeCh <- future:
 		return nil
 	case <-cm.shutdownCh:
-		return ErrRaftShutdown
+		return contract.ErrRaftShutdown
 	}
 }
 
@@ -383,7 +387,7 @@ func (cm *ConsensusModule) handleLeadershipTransfer(future *leadershipTransferFu
 			}
 		case <-cm.shutdownCh:
 			atomic.StoreInt32(&cm.leaderState.leadershipTransferInProgress, 0)
-			future.respond(ErrRaftShutdown)
+			future.respond(contract.ErrRaftShutdown)
 			return
 		case <-time.After(cm.electionTimeout()):
 			atomic.StoreInt32(&cm.leaderState.leadershipTransferInProgress, 0)
@@ -438,28 +442,41 @@ func (cm *ConsensusModule) runLeaderLoop() {
 	startNow := time.Now()
 	cm.mu.Lock()
 	cm.leaderLoopsAlive++
+	// Локальные копии таймингов с нормализацией нуля: тикеры создаются от
+	// локальных значений, а не от состояния модуля (переменная цикла, а не
+	// состояние модуля). Чтение под cm.mu на входе в цикл.
+	heartbeatTimeout := cm.heartbeatTimeout
+	if heartbeatTimeout <= 0 {
+		heartbeatTimeout = DefaultHeartbeatTimeout
+	}
+	applyBatchInterval := cm.applyBatchInterval
+	if applyBatchInterval <= 0 {
+		applyBatchInterval = DefaultApplyBatchInterval
+	}
 	cm.mu.Unlock()
 	defer func() {
 		cm.mu.Lock()
 		cm.leaderLoopExitCleanupLocked()
 		cm.mu.Unlock()
 		elapsed := time.Since(startNow)
-		cm.traceLogf(_traceLevelLoops, "leaderLoop exit: elapsed=%v", elapsed)
+		if traceEnabled(_traceLevelLoops) {
+			cm.traceLogf("leaderLoop exit: elapsed=%v", elapsed)
+		}
 	}()
 
-	heartbeatTicker := time.NewTicker(HeartbeatTimeoutMs * time.Millisecond)
+	heartbeatTicker := time.NewTicker(heartbeatTimeout)
 	defer heartbeatTicker.Stop()
 
 	// Страховка на случай пропущенного уведомления о фиксации: основной
 	// путь применения — ветка commitCh, применяющая записи по факту
 	// фиксации.
-	applyTicker := time.NewTicker(_applyBatchInterval)
+	applyTicker := time.NewTicker(applyBatchInterval)
 	defer applyTicker.Stop()
 
 	for {
 		select {
 		case future := <-cm.applyCh:
-			if !cm.handleLeaderApplyBatch(future, heartbeatTicker) {
+			if !cm.handleLeaderApplyBatch(future, heartbeatTicker, heartbeatTimeout) {
 				return
 			}
 
@@ -483,7 +500,9 @@ func (cm *ConsensusModule) runLeaderLoop() {
 
 		case <-cm.stepDown:
 			cm.mu.Lock()
-			cm.traceLockedLogf(_traceLevelLoops, "leader stepping down")
+			if traceEnabled(_traceLevelLoops) {
+				cm.traceLogfLocked("leader stepping down")
+			}
 			if cm.leaderState.leadershipTransferFuture != nil {
 				atomic.StoreInt32(&cm.leaderState.leadershipTransferInProgress, 0)
 				cm.leaderState.leadershipTransferFuture.respond(nil)
@@ -537,7 +556,9 @@ func (cm *ConsensusModule) leaderLoopExitCleanupLocked() {
 		cm.leaderState.pendingVerify = nil
 	}
 	inflightCount := len(cm.leaderState.inflight)
-	cm.traceLockedLogf(_traceLevelLoops, "leaderLoop exit: responding to %d inflight futures", inflightCount)
+	if traceEnabled(_traceLevelLoops) {
+		cm.traceLogfLocked("leaderLoop exit: responding to %d inflight futures", inflightCount)
+	}
 	for _, future := range cm.leaderState.inflight {
 		future.respond(ErrLeadershipLost)
 	}
@@ -562,13 +583,14 @@ func (cm *ConsensusModule) leaderLoopExitCleanupLocked() {
 // handleLeaderApplyBatch обрабатывает команду клиента, взятую циклом лидера
 // из канала команд: добирает из того же канала ещё до _leaderBatchSize - 1
 // команд, записывает всю группу в журнал одной записью, немедленно рассылает
-// её соседям и сдвигает тик пульса. Тикер пульса — переменная цикла, а не
-// состояние модуля, поэтому передаётся указателем.
+// её соседям и сдвигает тик пульса. Тикер пульса и его длительность —
+// переменные цикла, а не состояние модуля, поэтому передаются параметрами
+// из runLeaderLoop.
 //
 // Возвращает false, когда узел перестал быть лидером: цикл лидера в этом
 // случае завершается. Самостоятельно управляет cm.mu.
 func (cm *ConsensusModule) handleLeaderApplyBatch(
-	future *logFuture, heartbeatTicker *time.Ticker,
+	future *logFuture, heartbeatTicker *time.Ticker, heartbeat time.Duration,
 ) (keepRunning bool) {
 	cm.mu.Lock()
 	if cm.cmState.state != Leader {
@@ -593,7 +615,7 @@ groupCommit:
 	cm.leaderSendAEs()
 
 	heartbeatTicker.Stop()
-	heartbeatTicker.Reset(HeartbeatTimeoutMs * time.Millisecond)
+	heartbeatTicker.Reset(heartbeat)
 	return true
 }
 
@@ -609,7 +631,9 @@ groupCommit:
 func (cm *ConsensusModule) handleLeaderCommitAdvance(newCommitIndex int) (keepRunning bool) {
 	cm.mu.Lock()
 	if newCommitIndex > cm.cmState.commitIndex {
-		cm.traceLockedLogf(_traceLevelProgress, "leader sets commitIndex := %d", newCommitIndex)
+		if traceEnabled(_traceLevelProgress) {
+			cm.traceLogfLocked("leader sets commitIndex := %d", newCommitIndex)
+		}
 		cm.cmState.commitIndex = newCommitIndex
 
 		// Обновить committed конфигурацию, если latest был зафиксирован.
@@ -621,7 +645,9 @@ func (cm *ConsensusModule) handleLeaderCommitAdvance(newCommitIndex int) (keepRu
 
 		// Проверить, остался ли лидер в committed конфигурации.
 		if !hasVote(cm.cmState.configurations.committed, cm.id) {
-			cm.traceLockedLogf(_traceLevelLoops, "leader stepping down: not in committed configuration")
+			if traceEnabled(_traceLevelLoops) {
+				cm.traceLogfLocked("leader stepping down: not in committed configuration")
+			}
 			cm.counters.stepDowns.configExit.Add(1)
 			cm.becomeFollowerLocked(cm.cmState.currentTerm)
 			cm.mu.Unlock()
@@ -709,11 +735,12 @@ func (cm *ConsensusModule) checkQuorumContact() {
 	if cm.cmState.state != Leader || cm.quorumContactedLocked(time.Now()) {
 		return
 	}
-	cm.traceLockedLogf(
-		_traceLevelKeyEvents,
-		"leader stepping down: no contact with quorum of voters for %v",
-		cm.checkQuorumTimeout,
-	)
+	if traceEnabled(_traceLevelKeyEvents) {
+		cm.traceLogfLocked(
+			"leader stepping down: no contact with quorum of voters for %v",
+			cm.checkQuorumTimeout,
+		)
+	}
 	cm.counters.stepDowns.checkQuorum.Add(1)
 	cm.becomeFollowerLocked(cm.cmState.currentTerm)
 }
@@ -788,10 +815,12 @@ func (cm *ConsensusModule) startLeaderLocked() {
 		}
 		cm.leaderState.inflightAE[peerID].Store(false)
 	}
-	cm.traceLockedLogf(
-		_traceLevelKeyEvents, "becomes Leader; term=%d, nextIndex=%v, matchIndex=%v; len(log)=%d",
-		cm.cmState.currentTerm, cm.leaderState.nextIndex, cm.leaderState.matchIndex, len(cm.cmState.log),
-	)
+	if traceEnabled(_traceLevelKeyEvents) {
+		cm.traceSprintfLocked(
+			"becomes Leader; term=%d, nextIndex=%v, matchIndex=%v; len(log)=%d",
+			cm.cmState.currentTerm, cm.leaderState.nextIndex, cm.leaderState.matchIndex, len(cm.cmState.log),
+		)
+	}
 
 	cm.leaderState.leaderStartIndex = cm.cmState.lastLogIndex
 	cm.leaderState.commitmentTracker = newCommitmentTracker(
@@ -809,10 +838,10 @@ func (cm *ConsensusModule) startLeaderLocked() {
 		},
 	}
 	noop.init(cm.shutdownCh)
-	cm.dispatchLogsUnsafe([]*logFuture{noop})
+	cm.dispatchLogsLocked([]*logFuture{noop})
 
 	// Синхронизировать self-match трекера с только что добавленной
-	// noop-записью: dispatchLogsUnsafe трекер
+	// noop-записью: dispatchLogsLocked трекер
 	// не обновляет (в отличие от dispatchLogs — raft_cm_log.go), а
 	// setMatch(self, …) выше был выполнен ДО noop. Без этого вызова
 	// медиана при чётном n попадает на запись прошлого терма и

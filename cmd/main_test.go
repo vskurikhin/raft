@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"runtime"
 	"testing"
 	"time"
@@ -12,7 +14,28 @@ import (
 	"github.com/fortytw2/leaktest"
 	"github.com/vskurikhin/raft"
 	"github.com/vskurikhin/raft/internal/config"
+	"github.com/vskurikhin/raft/pkg/raft/store"
+	"github.com/vskurikhin/raft/pkg/raft/transp"
 )
+
+// traceShutdownTimeout — предельное время остановки писателя трассировки
+// при завершении тестового процесса.
+const traceShutdownTimeout = 2 * time.Second
+
+// TestMain останавливает процессного писателя после прогона: трассировка
+// консенсус-модуля сконфигурирована в internal/_init до тестов (уровень
+// по умолчанию положителен), поэтому иначе горутина писателя пережила бы
+// тестовый процесс.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	ctx, cancel := context.WithTimeout(context.Background(), traceShutdownTimeout)
+	if err := raft.ShutdownTrace(ctx); err != nil {
+		_, _ = os.Stderr.WriteString("raft: trace shutdown failed: " + err.Error() + "\n")
+		code = 1
+	}
+	cancel()
+	os.Exit(code)
+}
 
 // TestRunWithEmptyPeers запускает узел без соседей через runWith и
 // останавливает его как следствие:
@@ -34,8 +57,10 @@ func TestRunWithEmptyPeers(t *testing.T) {
 // TestRunWithNonDefaultNodeFlags запускает узел с нестандартными значениями
 // всех четырёх параметров узла: тайм-аут TCP RPC, размер пула, интервал
 // и порог снимков. Проверка значений внутри узла — поведенческая
-// (старт/стоп без ошибок, leaktest чист); маршрут значений до
-// raft.Config/ConsensusModule доказан юнит-тестами server_test.go.
+// (старт/стоп без ошибок, leaktest чист); маршрут значений теперь прямой —
+// тайм-аут и пул передаются аргументами NewTCPTransport в runWith, а
+// подстановка дефолтов транспорта покрыта тестами transport_tcp_test.go;
+// параметры снимков доказываются юнит-тестами server_test.go.
 func TestRunWithNonDefaultNodeFlags(t *testing.T) {
 	t.Cleanup(leaktest.CheckTimeout(t, raft.LeaktestBudget))
 
@@ -65,8 +90,18 @@ func TestRunWithPeerConnect(t *testing.T) {
 		for range commitChannel {
 		}
 	}()
-	peer := raft.NewServer(1, []int{}, raft.NewCommitChannelFSM(commitChannel), peerReady)
-	peer.Serve(":0")
+	peerTransport, err := transp.NewTCPTransport(":0", transp.TCPTimeouts{}, 0)
+	if err != nil {
+		t.Fatalf("transp.NewTCPTransport: %v", err)
+	}
+	peer := raft.New(&raft.Config{
+		Fsm:       raft.NewCommitChannelFSM(commitChannel),
+		PeerIds:   []int{},
+		ServerID:  1,
+		Storage:   store.NewMapStorage(),
+		Transport: peerTransport,
+	}, peerReady)
+	peer.Serve()
 	close(peerReady)
 	t.Cleanup(func() {
 		peer.Shutdown()
@@ -82,6 +117,57 @@ func TestRunWithPeerConnect(t *testing.T) {
 		t.Fatalf("runWith returned: %v", err)
 	}
 	t.Cleanup(stop)
+}
+
+// TestTransportTimeouts проверяет маршрут «флаг → поле» сборки
+// TCPTimeouts из Values: каждое поле берётся из своего значения
+// конфигурации, ResponseTimeout конструктивно равен GenericRPCTimeout,
+// нулевые Values дают нулевую структуру (дефолты ставит конструктор
+// транспорта).
+func TestTransportTimeouts(t *testing.T) {
+	tests := []struct {
+		name   string
+		values config.Values
+		want   transp.TCPTimeouts
+	}{
+		{
+			name: "distinct values map field to field",
+			values: config.Values{
+				TCPConnectTimeout:      11 * time.Millisecond,
+				TCPRPCTimeout:          22 * time.Millisecond,
+				InstallSnapshotTimeout: 33 * time.Millisecond,
+			},
+			want: transp.TCPTimeouts{
+				ConnectionTimeout:      11 * time.Millisecond,
+				GenericRPCTimeout:      22 * time.Millisecond,
+				InstallSnapshotTimeout: 33 * time.Millisecond,
+				ResponseTimeout:        22 * time.Millisecond,
+			},
+		},
+		{
+			name: "response equals generic",
+			values: config.Values{
+				TCPRPCTimeout: 77 * time.Millisecond,
+			},
+			want: transp.TCPTimeouts{
+				GenericRPCTimeout: 77 * time.Millisecond,
+				ResponseTimeout:   77 * time.Millisecond,
+			},
+		},
+		{
+			name:   "zero values give zero struct",
+			values: config.Values{},
+			want:   transp.TCPTimeouts{},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := transportTimeouts(&tc.values)
+			if got != tc.want {
+				t.Errorf("transportTimeouts(%+v) = %+v, want %+v", tc.values, got, tc.want)
+			}
+		})
+	}
 }
 
 // newTestValues собирает конфигурацию узла для тестов:
@@ -185,8 +271,10 @@ func TestStartPprofServesProfiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET %s: %v", url, err)
 	}
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("GET %s: status = %d, want 200", url, resp.StatusCode)
+	if resp != nil {
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("GET %s: status = %d, want 200", url, resp.StatusCode)
+		}
 	}
 }
