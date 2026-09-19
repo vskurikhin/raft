@@ -15,10 +15,10 @@ import (
 // -- Тесты кэша четырёх скалярных кодировок (L1). Кэш хранит последнее
 // -- закодированное значение и готовые байты gob-представления для
 // -- currentTerm, votedFor, lastSnapshotIndex, lastSnapshotTerm.
-// -- Доказательство «повторного кодирования нет» — белый ящик по
-// -- ADR-084 §7: прямое чтение valid/value и сравнение идентичности
-// -- подлежащего массива encoded до и после вызова. Production-хуков
-// -- наблюдения (счётчиков, колбэков, экспорта) в коде нет. --
+// -- Доказательство «повторного кодирования нет» — белый ящик: прямое
+// -- чтение valid/value и сравнение идентичности подлежащего массива
+// -- encoded до и после вызова. Production-хуков наблюдения (счётчиков,
+// -- колбэков, экспорта) в коде нет. --
 
 // newScalarCacheCM собирает CM с хранилищем в памяти и заданным набором
 // четырёх скаляров; журнал не задан, поэтому первое сохранение скалярное.
@@ -34,9 +34,9 @@ func newScalarCacheCM(currentTerm, votedFor, lastSnapshotIndex, lastSnapshotTerm
 }
 
 // assertScalarEntry сверяет элемент кэша с ожидаемым значением: valid,
-// value и байтовое равенство gob-представлению. Это прямое чтение полей
-// кэша из внутритестового кода пакета raft — допустимый способ
-// доказательства по ADR-084 §7 (редакция 2).
+// value и байтовое равенство gob-представлению. Поля кэша читаются напрямую
+// из внутритестового кода пакета raft: это способ доказательства
+// переиспользования массива без production-хуков наблюдения.
 func assertScalarEntry(t *testing.T, entry scalarCacheEntry, want int) {
 	t.Helper()
 	if !entry.valid {
@@ -63,6 +63,18 @@ func cacheSnapshotOf(cm *ConsensusModule) scalarCache {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	return cm.scalarCache
+}
+
+// encodeScalarEntryForTest кодирует произвольное значение в элемент кэша
+// currentTerm под cm.mu и возвращает снимок элемента. Проверяется только
+// представление int, а не достижимое состояние CM: значения терма, голоса и
+// границ снимка CM не подменяются. Владение cm.mu не передаётся — захват и
+// снятие выполняются в этой же функции.
+func encodeScalarEntryForTest(cm *ConsensusModule, value int) scalarCacheEntry {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	encodeScalarLocked(&cm.scalarCache.currentTerm, value)
+	return cm.scalarCache.currentTerm
 }
 
 // TestScalarCache_FirstCallEncodesAllFour проверяет пустой кэш: первое
@@ -143,57 +155,56 @@ func TestScalarCache_OneChangeReencodesExactlyOne(t *testing.T) {
 	assertScalarEntry(t, after.lastSnapshotTerm, -1)
 }
 
-// TestScalarCache_ABAReencodesA проверяет путь A→B→A: история из двух
-// значений не хранится, поэтому возврат к A кодирует A заново — массив
-// отличается и от A-первого, и от B-промежуточного, байты снова равны
-// gob(A).
+// TestScalarCache_ABAReencodesA проверяет путь A→B→A на отдельном элементе
+// кодировщика: история из двух значений не хранится, поэтому возврат к A
+// кодирует A заново — массив отличается и от A-первого, и от B-промежуточного,
+// байты снова равны gob(A). Значения подаются напрямую в кодировщик под cm.mu;
+// терм и голоса CM при этом не изменяются.
 func TestScalarCache_ABAReencodesA(t *testing.T) {
-	cm := newScalarCacheCM(5, -1, -1, -1)
-	persistToStorageForTest(cm)
-	ptrA := scalarEntryPtr(cacheSnapshotOf(cm).currentTerm)
+	cm := newScalarCacheCM(1, -1, -1, -1)
 
-	cm.cmState.currentTerm = 9
-	persistToStorageForTest(cm)
-	ptrB := scalarEntryPtr(cacheSnapshotOf(cm).currentTerm)
+	ptrA := scalarEntryPtr(encodeScalarEntryForTest(cm, 5))
+	ptrB := scalarEntryPtr(encodeScalarEntryForTest(cm, 9))
 	if ptrA == ptrB {
 		t.Fatal("A→B не перекодировал значение: массив прежний")
 	}
 
-	cm.cmState.currentTerm = 5
-	persistToStorageForTest(cm)
-	after := cacheSnapshotOf(cm)
-	if scalarEntryPtr(after.currentTerm) == ptrB {
+	after := encodeScalarEntryForTest(cm, 5)
+	if scalarEntryPtr(after) == ptrB {
 		t.Fatal("B→A переиспользовал массив B вместо нового кодирования A")
 	}
-	assertScalarEntry(t, after.currentTerm, 5)
+	if scalarEntryPtr(after) == ptrA {
+		t.Fatal("B→A переиспользовал массив первого A: история из двух значений сохранена")
+	}
+	assertScalarEntry(t, after, 5)
 }
 
 // TestScalarCache_BoundaryAndNegativeValues проверяет граничные и
-// отрицательные значения int: каждый переход между значениями кодируется
-// заново с байтами, равными прежнему gob; повтор того же значения массив
-// не заменяет.
+// отрицательные значения int на отдельном элементе кодировщика: каждый переход
+// между значениями кодируется заново с байтами, равными прежнему gob; повтор
+// того же значения массив не заменяет. Значения подаются напрямую в кодировщик
+// под cm.mu, поэтому невозможные для терма корректного узла величины (нули,
+// отрицательные, границы int) не записываются как состояние CM.
 func TestScalarCache_BoundaryAndNegativeValues(t *testing.T) {
 	values := []int{
 		0, -1, 1, math.MinInt64, math.MaxInt64, math.MinInt32, math.MaxInt32,
 		-(1 << 40), 1 << 40,
 	}
-	cm := newScalarCacheCM(values[0], -1, -1, -1)
-	persistToStorageForTest(cm)
-	assertScalarEntry(t, cacheSnapshotOf(cm).currentTerm, values[0])
+	cm := newScalarCacheCM(1, -1, -1, -1)
 
-	prevPtr := scalarEntryPtr(cacheSnapshotOf(cm).currentTerm)
+	entry := encodeScalarEntryForTest(cm, values[0])
+	assertScalarEntry(t, entry, values[0])
+	prevPtr := scalarEntryPtr(entry)
+
 	for _, v := range values[1:] {
-		cm.cmState.currentTerm = v
-		persistToStorageForTest(cm)
-		entry := cacheSnapshotOf(cm).currentTerm
+		entry = encodeScalarEntryForTest(cm, v)
 		if scalarEntryPtr(entry) == prevPtr {
 			t.Fatalf("переход к %d не перекодировал значение: массив прежний", v)
 		}
 		assertScalarEntry(t, entry, v)
 
 		// Повтор того же граничного значения — попадание в кэш.
-		persistToStorageForTest(cm)
-		if ptr := scalarEntryPtr(cacheSnapshotOf(cm).currentTerm); ptr != scalarEntryPtr(entry) {
+		if ptr := scalarEntryPtr(encodeScalarEntryForTest(cm, v)); ptr != scalarEntryPtr(entry) {
 			t.Fatalf("повтор значения %d заменил массив кодирования", v)
 		}
 		prevPtr = scalarEntryPtr(entry)
@@ -225,13 +236,17 @@ func TestScalarCache_TwoCMsIndependent(t *testing.T) {
 
 // TestScalarCache_RestoreLeavesCacheEmpty проверяет восстановленный CM:
 // restore не прогревает кэш от диска — все элементы невалидны, а первое
-// сохранение снова кодирует четыре текущих значения.
+// сохранение снова кодирует четыре текущих значения. Инициализация
+// выполняется как в производственном конструкторе: границы отсутствующего
+// снимка равны -1, поэтому после restore при отсутствии snapshot-ключей
+// сохраняются именно -1, а не нулевое значение Go.
 func TestScalarCache_RestoreLeavesCacheEmpty(t *testing.T) {
 	storage := store.NewMapStorage()
 	storage.Set("currentTerm", gobEncode(t, 2))
 	storage.Set("votedFor", gobEncode(t, 0))
 	storage.Set("log", gobEncode(t, []LogEntry{{Index: 0, Term: 1}}))
 	cm := &ConsensusModule{storage: storage}
+	cm.initSnapshotConfig(nil)
 	cm.restoreFromStorage()
 
 	if cache := cacheSnapshotOf(cm); cache.currentTerm.valid ||
@@ -245,9 +260,10 @@ func TestScalarCache_RestoreLeavesCacheEmpty(t *testing.T) {
 	assertScalarEntry(t, cache.currentTerm, 2)
 	assertScalarEntry(t, cache.votedFor, 0)
 	// Снимок-ключи в хранилище отсутствуют, restore их не заполняет:
-	// остаётся нулевое значение состояния свежего узла.
-	assertScalarEntry(t, cache.lastSnapshotIndex, 0)
-	assertScalarEntry(t, cache.lastSnapshotTerm, 0)
+	// сохраняются границы отсутствующего снимка -1/-1, заданные
+	// инициализацией, а не нулевое значение свежего узла.
+	assertScalarEntry(t, cache.lastSnapshotIndex, -1)
+	assertScalarEntry(t, cache.lastSnapshotTerm, -1)
 }
 
 // recordedSet — одна наблюдённая запись (ключ, клонированное значение).
