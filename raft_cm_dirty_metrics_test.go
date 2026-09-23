@@ -388,11 +388,11 @@ func TestDirtyDocument_UnattributedVsZeroAge(t *testing.T) {
 	}
 }
 
-// TestDirtyDocument_InPersistV1 проверяет интеграцию группы грязных периодов
-// в документ PersistV1: агрегаты попадают в третью строку, повторная
+// TestDirtyDocument_InPersistV2 проверяет интеграцию группы грязных периодов
+// в документ PersistV2: агрегаты попадают в третью строку, повторная
 // публикация не сбрасывает накопительные суммы, а незавершённый период
 // публикуется активным.
-func TestDirtyDocument_InPersistV1(t *testing.T) {
+func TestDirtyDocument_InPersistV2(t *testing.T) {
 	cm := newStatsTestCM()
 	cm.mu.Lock()
 	cm.dirty.markAt(dirtyCauseLeaderAppend, 3, dirtyBaseTime)
@@ -402,24 +402,24 @@ func TestDirtyDocument_InPersistV1(t *testing.T) {
 
 	var out bytes.Buffer
 	cm.publishStats(&out, io.Discard)
-	doc := statsDecodePersistV1(t, statsThirdLineBody(t, out.String()))
+	doc := statsDecodePersistV2(t, statsThirdLineBody(t, out.String()))
 	if doc.Dirty != _statsGroupAvailable || doc.DirtyPeriods == nil {
 		t.Fatalf("Dirty = %q, DirtyPeriods = %v, want ok и документ", doc.Dirty, doc.DirtyPeriods)
 	}
 	leader := doc.DirtyPeriods.Causes[dirtyCauseLeaderAppend]
 	if leader.Periods != 1 || leader.SumAdditions != 3 || leader.SumAgeNs != int64(20*time.Millisecond) ||
 		leader.SumWaitNs != int64(5*time.Millisecond) {
-		t.Fatalf("leader_append в PersistV1 = %+v", leader)
+		t.Fatalf("leader_append в PersistV2 = %+v", leader)
 	}
 	if doc.DirtyPeriods.Active == nil || doc.DirtyPeriods.Active.Cause != _dirtyCauseCompactName {
-		t.Fatalf("активный период в PersistV1 = %+v, want compact", doc.DirtyPeriods.Active)
+		t.Fatalf("активный период в PersistV2 = %+v, want compact", doc.DirtyPeriods.Active)
 	}
 
 	// Публикация не сбрасывает накопительные суммы и не завершает
 	// открытый период: смена тика не является наблюдением.
 	var out2 bytes.Buffer
 	cm.publishStats(&out2, io.Discard)
-	second := statsDecodePersistV1(t, statsThirdLineBody(t, out2.String()))
+	second := statsDecodePersistV2(t, statsThirdLineBody(t, out2.String()))
 	if second.DirtyPeriods == nil {
 		t.Fatal("вторая публикация потеряла группу грязных периодов")
 	}
@@ -433,12 +433,14 @@ func TestDirtyDocument_InPersistV1(t *testing.T) {
 }
 
 // TestDirtyDocument_PersistLineLimitAtExtremes проверяет предел 16 KiB на
-// предельных значениях: документ PersistV1 с максимальными матрицей и
+// предельных значениях: документ PersistV2 с максимальными матрицей и
 // грязными агрегатами остаётся корректным JSON и укладывается в лимит.
 func TestDirtyDocument_PersistLineLimitAtExtremes(t *testing.T) {
 	var persist persistenceSnapshot
 	persist.logLenSum = math.MaxInt64
-	persist.logBytesSum = math.MaxInt64
+	persist.logBytesWrittenSum = math.MaxInt64
+	persist.logWrites = math.MaxInt64
+	persist.conflictSuffixReplacements = math.MaxInt64
 	persist.logLenMin = math.MaxInt
 	persist.logLenMax = math.MaxInt
 	persist.logLenObserved = true
@@ -497,10 +499,10 @@ func TestDirtyDocument_PersistLineLimitAtExtremes(t *testing.T) {
 	}
 	body := snap.persistReport(math.MaxUint64, nil, storageDiagnostics{}, _statsPersistLineLimit)
 	if len(body) > _statsPersistLineLimit {
-		t.Fatalf("тело PersistV1 %d байт, предел %d", len(body), _statsPersistLineLimit)
+		t.Fatalf("тело PersistV2 %d байт, предел %d", len(body), _statsPersistLineLimit)
 	}
-	doc := statsDecodePersistV1(t, body)
-	if doc.Schema != 1 || doc.Dirty != _statsGroupAvailable || doc.DirtyPeriods == nil {
+	doc := statsDecodePersistV2(t, body)
+	if doc.Schema != 2 || doc.Dirty != _statsGroupAvailable || doc.DirtyPeriods == nil {
 		t.Fatalf("предельный документ потерял обязательные поля: %+v", doc)
 	}
 	if !doc.DirtyPeriods.Overflow || doc.DirtyPeriods.Active == nil {
@@ -515,7 +517,7 @@ func TestDirtyMetrics_DisabledOutputStillAccumulates(t *testing.T) {
 	storage := store.NewMapStorage()
 	storage.Set(_storageKeyCurrentTerm, gobEncode(t, 1))
 	storage.Set(_storageKeyVotedFor, gobEncode(t, -1))
-	storage.Set(_storageKeyLog, gobEncode(t, []LogEntry{}))
+	storage.RewriteLog([]LogEntry{})
 	storage.Set(_storageKeyLastSnapshotIndex, gobEncode(t, -1))
 	storage.Set(_storageKeyLastSnapshotTerm, gobEncode(t, -1))
 
@@ -525,7 +527,7 @@ func TestDirtyMetrics_DisabledOutputStillAccumulates(t *testing.T) {
 
 	cm.mu.Lock()
 	cm.dirty.markAt(dirtyCauseLeaderAppend, 2, dirtyBaseTime)
-	cm.cmState.logNeedsPersist = true
+	cm.markLogSuffixDirtyLocked(0)
 	cm.persistToStorageLocked(persistSourceTest)
 	cm.mu.Unlock()
 

@@ -229,11 +229,9 @@ func testServerWithFSM(t testing.TB, fsm FSM) *ConsensusModule {
 		t.Fatal(err)
 	}
 	storage.Set("votedFor", copyBytes(buf.Bytes()))
-	var logBuf bytes.Buffer
-	if err := gob.NewEncoder(&logBuf).Encode([]LogEntry{}); err != nil {
-		t.Fatal(err)
-	}
-	storage.Set("log", copyBytes(logBuf.Bytes()))
+	// Пустой журнал создаётся операцией контракта: прямой ключ "log"
+	// зарезервирован за LogStorage.
+	storage.RewriteLog([]LogEntry{})
 
 	ready := make(chan any)
 	close(ready)

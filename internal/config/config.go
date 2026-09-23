@@ -56,7 +56,7 @@ type Values struct {
 	// Ноль — защитное значение: применяется дефолт конструктора.
 	SnapshotThreshold int
 	// StatsOutput — вывод периодической статистики узла. false отключает
-	// только публикацию (латентность, счётчики Raft, PersistV1), не прекращая
+	// только публикацию (латентность, счётчики Raft, PersistV2), не прекращая
 	// секундный сбор метрик. Умолчание — true; настройка не связана
 	// с TraceLogLevel.
 	StatsOutput bool
@@ -259,12 +259,12 @@ func addSnapshotFlags(fs *flag.FlagSet) (snapshotIntervalFlag *time.Duration, sn
 }
 
 // addStatsOutputFlag регистрирует флаг вывода периодической статистики:
-// три строки в секунду (латентность, счётчики Raft, PersistV1). Отсутствие
+// три строки в секунду (латентность, счётчики Raft, PersistV2). Отсутствие
 // флага эквивалентно true; настройка не связана с -trace-log-level.
 func addStatsOutputFlag(fs *flag.FlagSet) *bool {
 	return fs.Bool(
 		"stats-output", true,
-		"Periodic stats output: latency, raft counters and PersistV1 "+
+		"Periodic stats output: latency, raft counters and PersistV2 "+
 			"(default true); false keeps collecting but suppresses all three "+
 			"lines; independent of -trace-log-level",
 	)

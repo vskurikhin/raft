@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log"
 	"time"
+
+	"github.com/vskurikhin/raft/pkg/raft/contract"
 )
 
 // Ключи постоянного состояния в Storage. Имя файла данных на диске —
@@ -16,31 +18,82 @@ import (
 const (
 	_storageKeyCurrentTerm       = "currentTerm"
 	_storageKeyVotedFor          = "votedFor"
-	_storageKeyLog               = "log"
 	_storageKeyLastSnapshotIndex = "lastSnapshotIndex"
 	_storageKeyLastSnapshotTerm  = "lastSnapshotTerm"
 )
 
+// logPersistMode — явное состояние точки грязи журнала. Различает три
+// взаимоисключающих исхода следующего сохранения: журнал не изменялся,
+// изменён суффикс от абсолютного индекса либо журнал заменяется целиком.
+// Режим фиксируется при мутации журнала и сбрасывается только после
+// успешной операции хранилища.
+type logPersistMode int
+
+const (
+	// logPersistClean — журнал не изменялся: операция хранилища не
+	// выполняется, сохраняются только скаляры.
+	logPersistClean logPersistMode = iota
+	// logPersistSuffix — изменён суффикс: хранилище заменяет сохранённый
+	// суффикс от logDirtyFrom.
+	logPersistSuffix
+	// logPersistRewrite — журнал заменяется целиком: первый персист
+	// свежего узла, уплотнение и установка снимка.
+	logPersistRewrite
+)
+
+// markLogSuffixDirtyLocked отмечает изменение суффикса журнала начиная с
+// абсолютного индекса fromIndex. Полная замена имеет приоритет и не
+// понижается до суффикса; две suffix-мутации объединяются минимумом
+// индекса, чтобы сохранённый суффикс накрыл обе.
+// Требует удержания cm.mu.
+func (cm *ConsensusModule) markLogSuffixDirtyLocked(fromIndex int) {
+	switch cm.cmState.logPersistMode {
+	case logPersistRewrite:
+		return
+	case logPersistSuffix:
+		if fromIndex < cm.cmState.logDirtyFrom {
+			cm.cmState.logDirtyFrom = fromIndex
+		}
+	default:
+		cm.cmState.logPersistMode = logPersistSuffix
+		cm.cmState.logDirtyFrom = fromIndex
+	}
+}
+
+// markLogRewriteDirtyLocked отмечает необходимость полной замены журнала.
+// Переход в этот режим из любого другого безусловен: уплотнение и установка
+// снимка удаляют префикс, не выразимый заменой суффикса.
+// Требует удержания cm.mu.
+func (cm *ConsensusModule) markLogRewriteDirtyLocked() {
+	cm.cmState.logPersistMode = logPersistRewrite
+	cm.cmState.logDirtyFrom = -1
+}
+
+// clearLogDirtyLocked закрывает грязный период журнала после успешного
+// возврата операции хранилища. Требует удержания cm.mu.
+func (cm *ConsensusModule) clearLogDirtyLocked() {
+	cm.cmState.logPersistMode = logPersistClean
+	cm.cmState.logDirtyFrom = -1
+}
+
 // persistToStorageLocked сохраняет постоянное состояние CM в cm.storage.
-// Кодирование журнала выполняется только при cm.cmState.logNeedsPersist == true
-// (т.е. когда лог действительно изменился), что позволяет избежать
-// дорогого gob.Encode(cm.cmState.log) на каждом heartbeat или RPC.
+// Скаляры сохраняются всегда; операция журнала выполняется только при
+// грязном журнале, что позволяет избежать записи журнала на каждом пульсе
+// или RPC.
 //
-// Порядок записи ключей важен для отказоустойчивости:
-// currentTerm, votedFor, lastSnapshotIndex, lastSnapshotTerm, затем log.
-// Снимок-ключи пишутся ДО усечённого лога: окно «лог усечён, а
-// lastSnapshotIndex старый/отсутствует» устраняется; обратное окно
-// («lastSnapshotIndex новее, лог полный») безопасно — полный лог
-// консервативнее, а startup-restore самовосстанавливает рассинхрон
-// (restoreFromSnapshotStore).
+// Порядок операций важен для отказоустойчивости: currentTerm, votedFor,
+// lastSnapshotIndex, lastSnapshotTerm, затем журнал. Снимок-ключи пишутся
+// ДО замены журнала: окно «журнал уплотнён, а lastSnapshotIndex
+// старый/отсутствует» устраняется; обратное окно («lastSnapshotIndex новее,
+// журнал полный») безопасно — полный журнал консервативнее, а
+// startup-restore самовосстанавливает рассинхрон (restoreFromSnapshotStore).
 //
-// На входе фиксируются источник, режим и начальный момент. Успешное
-// завершение всех прежних Set регистрирует одно наблюдение: источник,
-// режим и длительность от входа до последнего необходимого Set (до
-// обновления агрегатов и постановки прежней trace-строки). В полном режиме
-// вместе с наблюдением используются размер журнала и уже закодированные
-// байты: повторного кодирования ради статистики нет. Метрики не влияют на
-// решение о сохранении и не создают записей Storage.
+// Режим журнала выбирает операцию хранилища: suffix передаёт текущий суффикс
+// от logDirtyFrom, rewrite — весь retained-журнал. Байты и число записей
+// берутся из результата операции, повторного кодирования ради статистики
+// нет. Грязный период журнала закрывается только после успешного возврата
+// операции; при стратегии немедленного отказа успешного возврата при
+// незакреплённых данных не бывает.
 //
 // Четыре скалярных значения кодируются через кэш последнего представления
 // (cm.scalarCache): неизменённое значение переиспользует готовые байты,
@@ -51,7 +104,7 @@ const (
 // Требует удержания cm.mu — мьютекса владельца сохраняемого состояния.
 func (cm *ConsensusModule) persistToStorageLocked(source persistSource) {
 	start := time.Now()
-	full := cm.cmState.logNeedsPersist
+	mode := cm.cmState.logPersistMode
 	cm.storage.Set(_storageKeyCurrentTerm,
 		encodeScalarLocked(&cm.scalarCache.currentTerm, cm.cmState.currentTerm))
 	cm.storage.Set(_storageKeyVotedFor,
@@ -61,31 +114,45 @@ func (cm *ConsensusModule) persistToStorageLocked(source persistSource) {
 	cm.storage.Set(_storageKeyLastSnapshotTerm,
 		encodeScalarLocked(&cm.scalarCache.lastSnapshotTerm, cm.cmState.lastSnapshotTerm))
 
-	var logLen, logBytes int
-	if full {
-		var logData bytes.Buffer
-		if err := gob.NewEncoder(&logData).Encode(cm.cmState.log); err != nil {
-			log.Fatal(err)
-		}
-		// Размер журнала и готовые байты кодирования снимаются до Set;
-		// буфер не копируется и повторно не кодируется.
+	var logLen int
+	var bytesWritten, writes uint64
+	if mode != logPersistClean {
 		logLen = len(cm.cmState.log)
-		logBytes = logData.Len()
-		cm.storage.Set(_storageKeyLog, logData.Bytes())
-		// Период грязного журнала закрывается после успешного Set(log)
-		// и до прежнего сброса флага: возраст считается до этого момента,
-		// ожидание — от первой отметки до входа в сохранение. Обе операции
-		// выполняются под одним удержанием cm.mu, порядок на семантику
-		// не влияет.
+		switch mode {
+		case logPersistSuffix:
+			from := cm.cmState.logDirtyFrom
+			pos := cm.logPositionLocked(from)
+			result := cm.storage.StoreLogEntries(from, cm.cmState.log[pos:])
+			bytesWritten, writes = result.BytesWritten, result.Writes
+		case logPersistRewrite:
+			result := cm.storage.RewriteLog(cm.cmState.log)
+			bytesWritten, writes = result.BytesWritten, result.Writes
+		}
+		// Период грязного журнала закрывается после успешного возврата
+		// операции и до прежнего сброса режима: возраст считается до этого
+		// момента, ожидание — от первой отметки до входа в сохранение.
 		cm.dirty.completeAt(start, time.Now())
-		cm.cmState.logNeedsPersist = false
+		cm.clearLogDirtyLocked()
 	}
 
 	elapsed := time.Since(start)
-	cm.persistence.observe(source, full, elapsed, logLen, logBytes)
+	cm.persistence.observe(source, mode != logPersistClean, elapsed, logLen, bytesWritten, writes)
 	if traceEnabled(_traceLevelProgress) {
 		cm.traceLogfLocked("persistToStorage elapsed %s", elapsed)
 	}
+}
+
+// loadLogForRestore читает сохранённый журнал операцией хранилища и
+// переводит маркерную ошибку отсутствия журнала в ошибку с прежним текстом
+// «log not found» и сохранённой причиной. Существующий пустой журнал даёт
+// пустой срез и nil: он отличается от отсутствующего. Выделено в отдельную
+// функцию, чтобы путь отказа был проверяем без завершения процесса.
+func (cm *ConsensusModule) loadLogForRestore() ([]LogEntry, error) {
+	entries, err := cm.storage.LoadLog()
+	if errors.Is(err, contract.ErrLogNotFound) {
+		return nil, fmt.Errorf("log not found in storage: %w", err)
+	}
+	return entries, err
 }
 
 // restoreFromStorage восстанавливает постоянное состояние данного CM
@@ -110,14 +177,15 @@ func (cm *ConsensusModule) restoreFromStorage() {
 	if err := d.Decode(&cm.cmState.votedFor); err != nil {
 		log.Fatal(err)
 	}
-	logData, found := cm.storage.Get(_storageKeyLog)
-	if !found {
-		log.Fatal("log not found in storage")
-	}
-	d = gob.NewDecoder(bytes.NewBuffer(logData))
-	if err := d.Decode(&cm.cmState.log); err != nil {
+	// Журнал читается операцией хранилища. Отсутствующий журнал при
+	// HasData=true — прежний отказ старта с прежним смыслом «log not
+	// found»; существующий пустой журнал допустим. Ошибка чтения или
+	// декодирования не маскируется отсутствием.
+	logEntries, err := cm.loadLogForRestore()
+	if err != nil {
 		log.Fatal(err)
 	}
+	cm.cmState.log = logEntries
 	if err := cm.checkSnapshotKeysConsistency(); err != nil {
 		log.Fatal(err)
 	}
@@ -255,8 +323,8 @@ func (cm *ConsensusModule) restoreFromSnapshotStore() error {
 	}
 
 	if snapshotChanged {
-		// logNeedsPersist уже false (сброшен после restoreFromStorage),
-		// поэтому log-ключ не переписывается — только дешёвые ключи.
+		// Точка грязи чиста (сброшена после restoreFromStorage), поэтому
+		// журнал не переписывается — только дешёвые скалярные ключи.
 		// Локальная блокировка охватывает только сохранение и
 		// заканчивается в этой же функции: snapshotStore.List/Open и
 		// fsm.Restore выше выполнялись без cm.mu (однопоточный старт).

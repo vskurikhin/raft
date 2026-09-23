@@ -35,7 +35,8 @@ func newBenchCM(dir string) *ConsensusModule {
 func BenchmarkPersistToStorageUnchanged(b *testing.B) {
 	cm := newBenchCM(b.TempDir())
 	cm.cmState.log = benchLogEntries(100, benchValueSizeLog)
-	cm.cmState.logNeedsPersist = false
+	// Точка грязи чиста: операция журнала не выполняется.
+	cm.clearLogDirtyLocked()
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	b.ResetTimer()
@@ -58,7 +59,9 @@ func BenchmarkPersistToStorageLogChanged(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		cm.cmState.log[last].Term = i + 1
-		cm.cmState.logNeedsPersist = true
+		// Полная замена сохраняет прежний смысл измерения: журнал
+		// переписывается целиком на каждой итерации.
+		cm.markLogRewriteDirtyLocked()
 		cm.persistToStorageLocked(persistSourceTest)
 	}
 	b.StopTimer()
@@ -76,7 +79,8 @@ func BenchmarkProcessLogsFileStorage(b *testing.B) {
 	cm.cmState.lastLogIndex = b.N - 1
 	cm.cmState.lastLogTerm = 1
 	cm.cmState.lastApplied = -1
-	cm.cmState.logNeedsPersist = false
+	// Точка грязи чиста: processLogs сохраняет только скаляры.
+	cm.clearLogDirtyLocked()
 
 	// Батчи забирает отдельный потребитель: без него отправка в fsmMutateCh
 	// заблокировалась бы при заполнении буфера.

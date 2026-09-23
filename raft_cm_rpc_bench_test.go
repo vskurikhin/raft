@@ -45,6 +45,11 @@ func newAppendEntriesBenchCM(n int) *ConsensusModule {
 	cm.cmState.lastLogIndex = n
 	cm.cmState.lastLogTerm = 1
 	cm.cmState.termIndexMap = map[int]int{1: n}
+	// Хранилище приводится в соответствие памяти: журнал создаётся полной
+	// заменой, как после первого персиста. Состояние достижимо, и
+	// последующие замены суффикса не завершают процесс.
+	cm.storage.RewriteLog(cm.cmState.log)
+	cm.clearLogDirtyLocked()
 	return cm
 }
 

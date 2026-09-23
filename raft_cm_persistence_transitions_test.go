@@ -18,7 +18,7 @@ import (
 
 // assertPersistenceInvariants проверяет точные равенства согласованного
 // снимка: N = N_log + N_scalar = сумме одиннадцати источников.
-func assertPersistenceInvariants(t *testing.T, doc *statsPersistenceV1) {
+func assertPersistenceInvariants(t *testing.T, doc *statsPersistenceV2) {
 	t.Helper()
 	var sourceSum int64
 	for i := range doc.Sources {
@@ -40,7 +40,7 @@ func TestPersistCounters_AppendEntriesHeartbeatScalar(t *testing.T) {
 	cm, storage := newAEDurabilityCM(dir)
 
 	before := persistenceSnapshotOf(cm)
-	writesBefore := storage.WriteCount()
+	scalarsBefore := storage.WriteCount()
 
 	var reply AppendEntriesReply
 	if err := cm.AppendEntries(aeArgs(-1, -1, -1, nil), &reply); err != nil {
@@ -57,8 +57,11 @@ func TestPersistCounters_AppendEntriesHeartbeatScalar(t *testing.T) {
 		t.Fatalf("ae_finish = (log %d, scalar %d), want (log %d, scalar %d)",
 			cellAfter.logCalls, cellAfter.scalarCalls, cellBefore.logCalls, cellBefore.scalarCalls+1)
 	}
-	if got := storage.WriteCount() - writesBefore; got != 0 {
-		t.Fatalf("%d записей на пульсе, want 0", got)
+	if got := storage.WriteCount() - scalarsBefore; got != 0 {
+		t.Fatalf("%d скалярных записей на пульсе, want 0", got)
+	}
+	if got := after.logWrites - before.logWrites; got != 0 {
+		t.Fatalf("%d записей журнала на пульсе, want 0", got)
 	}
 	assertPersistenceInvariants(t, after.document())
 }
@@ -77,7 +80,7 @@ func TestPersistCounters_AppendEntriesCommitAdvance(t *testing.T) {
 	defer close(cm.shutdownCh)
 
 	before := persistenceSnapshotOf(cm)
-	writesBefore := storage.WriteCount()
+	scalarsBefore := storage.WriteCount()
 
 	entries := []LogEntry{{Index: 0, Term: 1, Type: LogCommand, Data: "k0=v0"}}
 	var reply AppendEntriesReply
@@ -89,8 +92,11 @@ func TestPersistCounters_AppendEntriesCommitAdvance(t *testing.T) {
 	}
 
 	after := persistenceSnapshotOf(cm)
-	if got := storage.WriteCount() - writesBefore; got != 1 {
-		t.Fatalf("%d записей на AppendEntries с продвижением фиксации, want 1", got)
+	if got := after.logWrites - before.logWrites; got != 1 {
+		t.Fatalf("%d записей журнала на AppendEntries с продвижением фиксации, want 1", got)
+	}
+	if got := storage.WriteCount() - scalarsBefore; got != 0 {
+		t.Fatalf("%d скалярных записей на AppendEntries, want 0", got)
 	}
 	commit := persistenceCellOf(after, persistSourceAECommit)
 	commitBefore := persistenceCellOf(before, persistSourceAECommit)

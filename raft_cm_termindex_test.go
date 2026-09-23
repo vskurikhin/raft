@@ -44,6 +44,9 @@ func TestTermIndexMap_AppendEntries(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	storage := store.NewMapStorage()
+	// Пустой журнал создаётся полной заменой, как после первого персиста:
+	// последующая замена суффикса не завершает процесс. Состояние достижимо.
+	storage.RewriteLog([]LogEntry{})
 	cm := &ConsensusModule{
 		leaderState: leaderState{
 			matchIndex: map[int]int{0: 0},
@@ -170,8 +173,9 @@ func TestTermIndexMap_CompactLogs(t *testing.T) {
 func TestTermIndexMap_AppendEntriesConflict(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
+	storage := store.NewMapStorage()
 	cm := &ConsensusModule{
-		storage:    store.NewMapStorage(),
+		storage:    storage,
 		shutdownCh: make(chan struct{}),
 		cmState: cmState{
 			state:        Follower,
@@ -193,6 +197,9 @@ func TestTermIndexMap_AppendEntriesConflict(t *testing.T) {
 		{Index: 2, Term: 1},
 		{Index: 3, Term: 2},
 	}
+	// Хранилище приводится в соответствие памяти: журнал создаётся полной
+	// заменой, как после первого персиста. Состояние достижимо.
+	storage.RewriteLog(cm.cmState.log)
 	cm.rebuildTermIndexMapLocked()
 
 	// AppendEntries с конфликтом на Index=3.

@@ -93,7 +93,7 @@ func TestLoadAll_RawFrameValidation(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			dir := t.TempDir()
-			writeDatFile(t, dir, "log.dat", tt.raw)
+			writeDatFile(t, dir, "k.dat", tt.raw)
 
 			fs := newFileStorage(dir, defaultWriteSeam(), defaultReadSeam())
 			err := fs.loadAll()
@@ -104,7 +104,7 @@ func TestLoadAll_RawFrameValidation(t *testing.T) {
 				t.Fatalf("loadAll вернул %v, want nil", err)
 			}
 			if !tt.wantErr {
-				if got, ok := fs.Get("log"); !ok || string(got) != "payload" {
+				if got, ok := fs.Get("k"); !ok || string(got) != "payload" {
 					t.Fatalf("загруженное значение = %q, ok=%v, want payload", got, ok)
 				}
 			}
@@ -218,7 +218,7 @@ func TestLoadAll_DirectoryDatSkipped(t *testing.T) {
 		readDir: func(string) ([]entry, error) {
 			return []entry{
 				{name: "snapshots.dat", typ: entryDir},
-				{name: "log.dat", typ: entryRegular},
+				{name: "value.dat", typ: entryRegular},
 			}, nil
 		},
 		lstat: func(_, name string) (entryType, error) { return entryRegular, nil },
@@ -241,11 +241,11 @@ func TestLoadAll_DirectoryDatSkipped(t *testing.T) {
 	if err := fs.loadAll(); err != nil {
 		t.Fatalf("loadAll вернул %v, want nil", err)
 	}
-	if len(opened) != 1 || opened[0] != "log.dat" {
-		t.Fatalf("открытые файлы = %v, want только log.dat", opened)
+	if len(opened) != 1 || opened[0] != "value.dat" {
+		t.Fatalf("открытые файлы = %v, want только value.dat", opened)
 	}
-	if got, ok := fs.Get("log"); !ok || string(got) != "value" {
-		t.Fatalf("значение log = %q, ok=%v, want value", got, ok)
+	if got, ok := fs.Get("value"); !ok || string(got) != "value" {
+		t.Fatalf("значение value = %q, ok=%v, want value", got, ok)
 	}
 }
 
@@ -266,7 +266,7 @@ func TestLoadAll_NonRegularAndSymlinkRefusedBeforeOpen(t *testing.T) {
 			opened := false
 			probe := &probeReadSeam{
 				readDir: func(string) ([]entry, error) {
-					return []entry{{name: "log.dat", typ: entryRegular}}, nil
+					return []entry{{name: "x.dat", typ: entryRegular}}, nil
 				},
 				lstat: func(string, string) (entryType, error) { return tt.typ, nil },
 				openRegular: func(string, string) (readFile, int64, error) {
@@ -293,7 +293,7 @@ func TestLoadAll_NonRegularAndSymlinkRefusedBeforeOpen(t *testing.T) {
 func TestLoadAll_LstatAuthoritativeOverDirEntryType(t *testing.T) {
 	probe := &probeReadSeam{
 		readDir: func(string) ([]entry, error) {
-			return []entry{{name: "log.dat", typ: entryRegular}}, nil
+			return []entry{{name: "x.dat", typ: entryRegular}}, nil
 		},
 		lstat: func(string, string) (entryType, error) { return entrySymlink, nil },
 	}
@@ -313,7 +313,7 @@ func TestLoadAll_LengthCheckedBeforeAllocation(t *testing.T) {
 	readAllCalled := false
 	probe := &probeReadSeam{
 		readDir: func(string) ([]entry, error) {
-			return []entry{{name: "log.dat", typ: entryRegular}}, nil
+			return []entry{{name: "x.dat", typ: entryRegular}}, nil
 		},
 		lstat: func(string, string) (entryType, error) { return entryRegular, nil },
 		openRegular: func(string, string) (readFile, int64, error) {
@@ -343,7 +343,7 @@ func TestLoadAll_HeaderReadAtOffsetZeroAndTruncation(t *testing.T) {
 	readAllCalled := false
 	probe := &probeReadSeam{
 		readDir: func(string) ([]entry, error) {
-			return []entry{{name: "log.dat", typ: entryRegular}}, nil
+			return []entry{{name: "x.dat", typ: entryRegular}}, nil
 		},
 		lstat: func(string, string) (entryType, error) { return entryRegular, nil },
 		openRegular: func(string, string) (readFile, int64, error) {
@@ -398,7 +398,7 @@ func TestLoadAll_OpenReadCloseErrors(t *testing.T) {
 			name: "ошибка открытия",
 			probe: &probeReadSeam{
 				readDir: func(string) ([]entry, error) {
-					return []entry{{name: "log.dat", typ: entryRegular}}, nil
+					return []entry{{name: "x.dat", typ: entryRegular}}, nil
 				},
 				lstat: func(string, string) (entryType, error) { return entryRegular, nil },
 				openRegular: func(string, string) (readFile, int64, error) {
@@ -410,7 +410,7 @@ func TestLoadAll_OpenReadCloseErrors(t *testing.T) {
 			name: "ошибка чтения payload",
 			probe: &probeReadSeam{
 				readDir: func(string) ([]entry, error) {
-					return []entry{{name: "log.dat", typ: entryRegular}}, nil
+					return []entry{{name: "x.dat", typ: entryRegular}}, nil
 				},
 				lstat: func(string, string) (entryType, error) { return entryRegular, nil },
 				openRegular: func(string, string) (readFile, int64, error) {
@@ -423,7 +423,7 @@ func TestLoadAll_OpenReadCloseErrors(t *testing.T) {
 			name: "ошибка закрытия",
 			probe: &probeReadSeam{
 				readDir: func(string) ([]entry, error) {
-					return []entry{{name: "log.dat", typ: entryRegular}}, nil
+					return []entry{{name: "x.dat", typ: entryRegular}}, nil
 				},
 				lstat: func(string, string) (entryType, error) { return entryRegular, nil },
 				openRegular: func(string, string) (readFile, int64, error) {
@@ -447,7 +447,7 @@ func TestLoadAll_OpenReadCloseErrors(t *testing.T) {
 			if err := fs.loadAll(); err == nil {
 				t.Fatal("loadAll вернул nil, want отказ")
 			}
-			if _, ok := fs.Get("log"); ok {
+			if _, ok := fs.Get("x"); ok {
 				t.Fatal("ключ загружен несмотря на отказ, want отсутствие")
 			}
 		})
@@ -474,7 +474,7 @@ func TestLoadAll_ChecksumMismatch(t *testing.T) {
 
 	probe := &probeReadSeam{
 		readDir: func(string) ([]entry, error) {
-			return []entry{{name: "log.dat", typ: entryRegular}}, nil
+			return []entry{{name: "x.dat", typ: entryRegular}}, nil
 		},
 		lstat: func(string, string) (entryType, error) { return entryRegular, nil },
 		openRegular: func(string, string) (readFile, int64, error) {

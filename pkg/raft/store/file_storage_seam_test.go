@@ -109,8 +109,8 @@ func TestSetLocked_WriteFaultMatrix(t *testing.T) {
 
 			// Прежнее значение записывается штатным путём на диск.
 			seed := newFileStorage(dir, defaultWriteSeam(), defaultReadSeam())
-			seed.Set("log", []byte("old"))
-			before := readDatFile(t, dir, "log")
+			seed.Set("k", []byte("old"))
+			before := readDatFile(t, dir, "k")
 
 			seam := defaultWriteSeam()
 			tt.inject(&seam)
@@ -120,14 +120,14 @@ func TestSetLocked_WriteFaultMatrix(t *testing.T) {
 				t.Fatalf("loadAll: %v", err)
 			}
 
-			err := fs.setLocked("log", []byte("new"))
+			err := fs.setLocked("k", []byte("new"))
 			if err == nil {
 				t.Fatal("setLocked вернул nil, want отказ")
 			}
 
 			// Успешного возврата нет: кэш, счётчик записей и наблюдения не
 			// изменились.
-			if got, ok := fs.Get("log"); !ok || string(got) != "old" {
+			if got, ok := fs.Get("k"); !ok || string(got) != "old" {
 				t.Fatalf("кэш = %q, ok=%v, want old", got, ok)
 			}
 			if got := fs.WriteCount(); got != 0 {
@@ -139,7 +139,7 @@ func TestSetLocked_WriteFaultMatrix(t *testing.T) {
 			}
 
 			if !tt.fileMayChange {
-				after := readDatFile(t, dir, "log")
+				after := readDatFile(t, dir, "k")
 				if !bytes.Equal(before, after) {
 					t.Fatalf("файл данных изменён при отказе %s: %x -> %x", tt.name, before, after)
 				}
@@ -186,7 +186,7 @@ func TestSetLocked_WriterTrace(t *testing.T) {
 	}
 
 	fs := newFileStorage(t.TempDir(), seam, defaultReadSeam())
-	if err := fs.setLocked("log", []byte("value")); err != nil {
+	if err := fs.setLocked("k", []byte("value")); err != nil {
 		t.Fatalf("setLocked: %v", err)
 	}
 
@@ -217,7 +217,7 @@ func TestSetLocked_HeaderStaysOnInstance(t *testing.T) {
 
 	allocs := testing.AllocsPerRun(100, func() {
 		value[0]++
-		if err := fs.setLocked("log", value); err != nil {
+		if err := fs.setLocked("k", value); err != nil {
 			t.Fatalf("setLocked: %v", err)
 		}
 	})
@@ -421,14 +421,14 @@ func TestFileStorage_PowerLossModel(t *testing.T) {
 	for crashAt := 0; crashAt <= 7; crashAt++ {
 		t.Run(fmt.Sprintf("сбой_на_%d", crashAt), func(t *testing.T) {
 			m := newPowerLossMedium(crashAt)
-			m.files["/data/log.dat"] = frameBytes([]byte("old"))
-			m.names["/data/log.dat"] = true
+			m.files["/data/k.dat"] = frameBytes([]byte("old"))
+			m.names["/data/k.dat"] = true
 
 			fs := newFileStorage("/data", m.writeSeam(), m.readSeam())
 			if err := fs.loadAll(); err != nil {
 				t.Fatalf("loadAll до записи: %v", err)
 			}
-			err := fs.setLocked("log", []byte("new"))
+			err := fs.setLocked("k", []byte("new"))
 
 			if crashAt == 0 {
 				if err != nil {
@@ -445,7 +445,7 @@ func TestFileStorage_PowerLossModel(t *testing.T) {
 			if loadErr := reopened.loadAll(); loadErr != nil {
 				t.Fatalf("повторная загрузка: %v", loadErr)
 			}
-			got, ok := reopened.Get("log")
+			got, ok := reopened.Get("k")
 			if !ok {
 				t.Fatal("ключ log отсутствует после сбоя")
 			}
@@ -570,7 +570,7 @@ func TestSetFatalOnWriteError(t *testing.T) {
 		seam := defaultWriteSeam()
 		seam.syncFile = func(writeAtFile) error { return errors.New("отказ синхронизации") }
 		fs := newFileStorage(t.TempDir(), seam, defaultReadSeam())
-		fs.Set("log", []byte("value"))
+		fs.Set("k", []byte("value"))
 		// log.Fatalf завершает процесс: возврат сюда недостижим.
 		return
 	}
@@ -614,7 +614,7 @@ func TestSetKillBeforeAndAfterResponse(t *testing.T) {
 			dir := t.TempDir()
 
 			seed := NewFileStorage(dir)
-			seed.Set("log", []byte("old"))
+			seed.Set("k", []byte("old"))
 
 			cmd := exec.Command(os.Args[0], "-test.run=^TestSetKillBeforeAndAfterResponse$")
 			cmd.Env = append(os.Environ(),
@@ -644,7 +644,7 @@ func TestSetKillBeforeAndAfterResponse(t *testing.T) {
 			_ = cmd.Wait()
 
 			reopened := NewFileStorage(dir)
-			got, ok := reopened.Get("log")
+			got, ok := reopened.Get("k")
 			if tt.wantOldKey {
 				if !ok || string(got) != "old" {
 					t.Fatalf("после kill до ответа log = %q, ok=%v, want old", got, ok)
@@ -675,12 +675,12 @@ func runKillHelper(mode string) {
 			select {}
 		}
 		fs := newFileStorage(dir, seam, defaultReadSeam())
-		fs.Set("log", []byte("new"))
+		fs.Set("k", []byte("new"))
 		return
 	}
 
 	fs := newFileStorage(dir, defaultWriteSeam(), defaultReadSeam())
-	fs.Set("log", []byte("new"))
+	fs.Set("k", []byte("new"))
 	_, _ = os.Stdout.WriteString("ready\n")
 	select {}
 }

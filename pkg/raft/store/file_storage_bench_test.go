@@ -45,12 +45,12 @@ func BenchmarkFileStorageSetSameValue(b *testing.B) {
 			// (ключа ещё нет на диске) и измеряется отдельным бенчмарком.
 			// Измеряется установившийся режим, в котором значение на диске
 			// уже совпадает с записываемым.
-			storage.Set("log", value)
+			storage.Set("blob", value)
 			before := storage.WriteCount()
 			b.SetBytes(int64(variant.size))
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				storage.Set("log", value)
+				storage.Set("blob", value)
 			}
 			b.StopTimer()
 			b.ReportMetric(float64(storage.WriteCount()-before)/float64(b.N), "writes/op")
@@ -74,7 +74,7 @@ func BenchmarkFileStorageSetChangedValue(b *testing.B) {
 				// значение отличается от записанного на предыдущей итерации,
 				// поэтому пропуска записи не происходит ни разу.
 				binary.LittleEndian.PutUint64(next, uint64(i))
-				storage.Set("log", next)
+				storage.Set("blob", next)
 			}
 			b.StopTimer()
 			b.ReportMetric(float64(storage.WriteCount())/float64(b.N), "writes/op")

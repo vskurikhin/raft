@@ -25,7 +25,7 @@ func newAEDurabilityCM(dir string) (*ConsensusModule, *store.FileStorage) {
 	cm.cmState.lastApplied = -1
 	cm.cmState.fsmAppliedIndex = -1
 	cm.cmState.termIndexMap = make(map[int]int)
-	cm.cmState.logNeedsPersist = true
+	cm.markLogRewriteDirtyLocked()
 	cm.mu.Lock()
 	cm.persistToStorageLocked(persistSourceTest)
 	cm.mu.Unlock()
@@ -63,12 +63,10 @@ func aeArgs(prevLogIndex, prevLogTerm, leaderCommit int, entries []LogEntry) App
 // журнал, фактически лежащий на диске.
 func readLogFromDisk(t *testing.T, dir string) []LogEntry {
 	t.Helper()
-	data, ok := store.NewFileStorage(dir).Get("log")
-	if !ok {
-		t.Fatal("key log not found on disk")
+	log, err := store.NewFileStorage(dir).LoadLog()
+	if err != nil {
+		t.Fatalf("LoadLog: %v", err)
 	}
-	var log []LogEntry
-	gobDecode(t, data, &log)
 	return log
 }
 
@@ -175,12 +173,12 @@ func TestAppendEntries_SingleWriteWithCommitAdvance(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	dir := t.TempDir()
-	cm, storage := newAEDurabilityCM(dir)
+	cm, _ := newAEDurabilityCM(dir)
 	startAEDurabilityFSM(t, cm)
 	defer close(cm.shutdownCh)
 
 	entries := []LogEntry{{Index: 0, Term: 1, Type: LogCommand, Data: "k0=v0"}}
-	before := storage.WriteCount()
+	beforeJournal := journalWritesOf(cm)
 	var reply AppendEntriesReply
 	if err := cm.AppendEntries(aeArgs(-1, -1, 0, entries), &reply); err != nil {
 		t.Fatalf("AppendEntries: %v", err)
@@ -188,7 +186,7 @@ func TestAppendEntries_SingleWriteWithCommitAdvance(t *testing.T) {
 	if !reply.Success {
 		t.Fatal("reply.Success = false, want true")
 	}
-	if got := storage.WriteCount() - before; got != 1 {
-		t.Fatalf("%d writes on AppendEntries with commit advance, want 1", got)
+	if got := journalWritesOf(cm) - beforeJournal; got != 1 {
+		t.Fatalf("%d journal writes on AppendEntries with commit advance, want 1", got)
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/fortytw2/leaktest"
+	"github.com/vskurikhin/raft/pkg/raft/store"
 )
 
 // checkQuorumBudget — запас времени на обнаружение потери кворума:
@@ -22,9 +23,10 @@ func withCheckQuorumTimeout(timeout time.Duration) HarnessOption {
 
 // slowStorage — постоянное хранилище с искусственной задержкой записи:
 // имитация медленного диска для проверки того, что занятость лидера
-// вводом-выводом не порождает ложных шагов вниз.
+// вводом-выводом не порождает ложных шагов вниз. Задерживаются скалярная
+// запись и обе операции записи журнала; чтения выполняются без задержки.
 type slowStorage struct {
-	inner Storage
+	inner LogStorage
 	delay time.Duration
 }
 
@@ -33,7 +35,19 @@ func (s *slowStorage) Set(key string, value []byte) {
 	s.inner.Set(key, value)
 }
 
+func (s *slowStorage) StoreLogEntries(fromIndex int, entries []LogEntry) LogWriteResult {
+	time.Sleep(s.delay)
+	return s.inner.StoreLogEntries(fromIndex, entries)
+}
+
+func (s *slowStorage) RewriteLog(entries []LogEntry) LogWriteResult {
+	time.Sleep(s.delay)
+	return s.inner.RewriteLog(entries)
+}
+
 func (s *slowStorage) Get(key string) ([]byte, bool) { return s.inner.Get(key) }
+
+func (s *slowStorage) LoadLog() ([]LogEntry, error) { return s.inner.LoadLog() }
 
 func (s *slowStorage) HasData() bool { return s.inner.HasData() }
 
@@ -42,6 +56,49 @@ func (s *slowStorage) HasData() bool { return s.inner.HasData() }
 // задерживает только последующие записи.
 func withSlowStorage(delay time.Duration) HarnessOption {
 	return func(cm *ConsensusModule) { cm.storage = &slowStorage{inner: cm.storage, delay: delay} }
+}
+
+// TestSlowStorage_DelaysJournalWritesNotReads проверяет проверяемое
+// поведение двойника: задержка применяется к скалярной записи и обеим
+// операциям журнала, а чтения (Get/LoadLog/HasData) выполняются без неё.
+func TestSlowStorage_DelaysJournalWritesNotReads(t *testing.T) {
+	const delay = 25 * time.Millisecond
+
+	inner := store.NewMapStorage()
+	inner.RewriteLog([]LogEntry{{Index: 0, Term: 1}})
+	s := &slowStorage{inner: inner, delay: delay}
+
+	start := time.Now()
+	s.Set("currentTerm", []byte{1})
+	if elapsed := time.Since(start); elapsed < delay {
+		t.Fatalf("Set выполнен за %v, want не меньше %v", elapsed, delay)
+	}
+
+	start = time.Now()
+	s.StoreLogEntries(1, []LogEntry{{Index: 1, Term: 1}})
+	if elapsed := time.Since(start); elapsed < delay {
+		t.Fatalf("StoreLogEntries выполнен за %v, want не меньше %v", elapsed, delay)
+	}
+
+	start = time.Now()
+	s.RewriteLog([]LogEntry{{Index: 0, Term: 1}})
+	if elapsed := time.Since(start); elapsed < delay {
+		t.Fatalf("RewriteLog выполнен за %v, want не меньше %v", elapsed, delay)
+	}
+
+	start = time.Now()
+	if _, err := s.LoadLog(); err != nil {
+		t.Fatalf("LoadLog: %v", err)
+	}
+	if _, ok := s.Get("currentTerm"); !ok {
+		t.Fatal("Get(currentTerm) = false после Set")
+	}
+	if !s.HasData() {
+		t.Fatal("HasData = false после записей")
+	}
+	if elapsed := time.Since(start); elapsed >= delay {
+		t.Fatalf("чтения заняли %v, want меньше задержки %v", elapsed, delay)
+	}
 }
 
 // nodeState возвращает роль узла, снятую под cm.mu.

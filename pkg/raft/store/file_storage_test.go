@@ -75,7 +75,7 @@ func TestFileStorage_RestartSimulation(t *testing.T) {
 		{Index: 2, Term: 1, Data: 20},
 		{Index: 3, Term: 2, Data: 30},
 	}
-	fs1.Set("log", gobEncode(t, log))
+	fs1.RewriteLog(log)
 	fs1.Set("lastSnapshotIndex", gobEncode(t, 0))
 	fs1.Set("lastSnapshotTerm", gobEncode(t, 0))
 
@@ -96,8 +96,10 @@ func TestFileStorage_RestartSimulation(t *testing.T) {
 		t.Fatalf("votedFor = %d, want 2", votedFor)
 	}
 
-	var restoredLog []raft.LogEntry
-	gobDecode(t, mustGet(t, fs2, "log"), &restoredLog)
+	restoredLog, err := fs2.LoadLog()
+	if err != nil {
+		t.Fatalf("LoadLog: %v", err)
+	}
 	if len(restoredLog) != len(log) {
 		t.Fatalf("log length = %d, want %d", len(restoredLog), len(log))
 	}
@@ -170,7 +172,7 @@ func TestFileStorage_ConcurrentSet(t *testing.T) {
 
 	fs := NewFileStorage(t.TempDir())
 
-	keys := []string{"currentTerm", "votedFor", "log", "lastSnapshotIndex", "lastSnapshotTerm", "k1", "k2", "k3"}
+	keys := []string{"currentTerm", "votedFor", "blob", "lastSnapshotIndex", "lastSnapshotTerm", "k1", "k2", "k3"}
 	const iterations = 100
 
 	var wg sync.WaitGroup
@@ -208,11 +210,11 @@ func TestFileStorage_LargeValue(t *testing.T) {
 	}
 
 	fs1 := NewFileStorage(dir)
-	fs1.Set("log", gobEncode(t, large))
+	fs1.Set("large", gobEncode(t, large))
 
 	fs2 := NewFileStorage(dir)
 	var restored []byte
-	gobDecode(t, mustGet(t, fs2, "log"), &restored)
+	gobDecode(t, mustGet(t, fs2, "large"), &restored)
 	if len(restored) != len(large) {
 		t.Fatalf("restored length = %d, want %d", len(restored), len(large))
 	}
@@ -237,7 +239,7 @@ func TestFileStorage_GobCompatibility(t *testing.T) {
 		{Index: 1, Term: 1, Type: raft.LogCommand, Data: 100},
 		{Index: 2, Term: 1, Type: raft.LogNoop, Data: nil},
 	}
-	fs.Set("log", gobEncode(t, log))
+	fs.RewriteLog(log)
 
 	var term, votedFor, snapIdx, snapTerm int
 	gobDecode(t, mustGet(t, fs, "currentTerm"), &term)
@@ -248,8 +250,10 @@ func TestFileStorage_GobCompatibility(t *testing.T) {
 		t.Fatalf("scalars mismatch: term=%d votedFor=%d snapIdx=%d snapTerm=%d", term, votedFor, snapIdx, snapTerm)
 	}
 
-	var restoredLog []raft.LogEntry
-	gobDecode(t, mustGet(t, fs, "log"), &restoredLog)
+	restoredLog, err := fs.LoadLog()
+	if err != nil {
+		t.Fatalf("LoadLog: %v", err)
+	}
 	if len(restoredLog) != len(log) {
 		t.Fatalf("log length = %d, want %d", len(restoredLog), len(log))
 	}
@@ -309,9 +313,9 @@ func TestFileStorage_SetWritesChangedValue(t *testing.T) {
 		"votedFor":          gobEncode(t, -1),
 		"lastSnapshotIndex": gobEncode(t, 0),
 		"lastSnapshotTerm":  gobEncode(t, 0),
-		"log":               gobEncode(t, []raft.LogEntry{{Index: 0, Term: 1}}),
+		"blob":              gobEncode(t, []byte("blob")),
 	}
-	keys := []string{"currentTerm", "votedFor", "lastSnapshotIndex", "lastSnapshotTerm", "log"}
+	keys := []string{"currentTerm", "votedFor", "lastSnapshotIndex", "lastSnapshotTerm", "blob"}
 	for _, key := range keys {
 		fs.Set(key, initial[key])
 	}
@@ -324,7 +328,7 @@ func TestFileStorage_SetWritesChangedValue(t *testing.T) {
 		"votedFor":          gobEncode(t, 2),
 		"lastSnapshotIndex": gobEncode(t, 5),
 		"lastSnapshotTerm":  gobEncode(t, 3),
-		"log":               gobEncode(t, []raft.LogEntry{{Index: 6, Term: 3}}),
+		"blob":              gobEncode(t, []byte("changed")),
 	}
 	expected := make(map[string][]byte, len(keys))
 	for key, value := range initial {
@@ -367,7 +371,7 @@ func TestFileStorage_CloneOnSet(t *testing.T) {
 	fs := NewFileStorage(dir)
 
 	original := []byte{1, 2, 3}
-	fs.Set("log", original)
+	fs.Set("k", original)
 	if got := fs.WriteCount(); got != 1 {
 		t.Fatalf("WriteCount = %d after first Set, want 1", got)
 	}
@@ -376,17 +380,17 @@ func TestFileStorage_CloneOnSet(t *testing.T) {
 	original[0] = 9
 	mutated := []byte{9, 2, 3}
 
-	if got := mustGet(t, NewFileStorage(dir), "log"); !bytes.Equal(got, []byte{1, 2, 3}) {
+	if got := mustGet(t, NewFileStorage(dir), "k"); !bytes.Equal(got, []byte{1, 2, 3}) {
 		t.Fatalf("disk value = %v after caller mutation, want [1 2 3]", got)
 	}
 
 	// Значение, совпадающее с мутированным буфером, отличается от лежащего на
 	// диске, поэтому запись обязана быть выполнена.
-	fs.Set("log", mutated)
+	fs.Set("k", mutated)
 	if got := fs.WriteCount(); got != 2 {
 		t.Fatalf("WriteCount = %d after Set of mutated value, want 2 (cache aliased caller buffer)", got)
 	}
-	if got := mustGet(t, NewFileStorage(dir), "log"); !bytes.Equal(got, mutated) {
+	if got := mustGet(t, NewFileStorage(dir), "k"); !bytes.Equal(got, mutated) {
 		t.Fatalf("disk value = %v, want %v", got, mutated)
 	}
 }
@@ -400,23 +404,23 @@ func TestFileStorage_CloneOnGet(t *testing.T) {
 	fs := NewFileStorage(dir)
 
 	original := []byte{1, 2, 3}
-	fs.Set("log", original)
+	fs.Set("k", original)
 
-	got, ok := fs.Get("log")
+	got, ok := fs.Get("k")
 	if !ok {
 		t.Fatal("key log not found")
 	}
 	got[0] = 9
 
-	if again := mustGet(t, fs, "log"); !bytes.Equal(again, []byte{1, 2, 3}) {
+	if again := mustGet(t, fs, "k"); !bytes.Equal(again, []byte{1, 2, 3}) {
 		t.Fatalf("cached value = %v after reader mutation, want [1 2 3]", again)
 	}
-	if onDisk := mustGet(t, NewFileStorage(dir), "log"); !bytes.Equal(onDisk, []byte{1, 2, 3}) {
+	if onDisk := mustGet(t, NewFileStorage(dir), "k"); !bytes.Equal(onDisk, []byte{1, 2, 3}) {
 		t.Fatalf("disk value = %v after reader mutation, want [1 2 3]", onDisk)
 	}
 
 	before := fs.WriteCount()
-	fs.Set("log", []byte{9, 2, 3})
+	fs.Set("k", []byte{9, 2, 3})
 	if got := fs.WriteCount() - before; got != 1 {
 		t.Fatalf("%d writes for value differing from cached, want 1 (cache spoiled by reader)", got)
 	}

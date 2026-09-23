@@ -3387,6 +3387,9 @@ func TestRace_TermIndexMapDispatchAndConflict(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	storage := store.NewMapStorage()
+	// Пустой журнал создаётся полной заменой, как после первого персиста:
+	// последующая замена суффикса не завершает процесс. Состояние достижимо.
+	storage.RewriteLog([]LogEntry{})
 	mock := &mockTransportConflict{replyTerm: 1, success: false, conflictTerm: 1}
 	cm := &ConsensusModule{
 		leaderState: leaderState{

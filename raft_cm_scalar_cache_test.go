@@ -244,7 +244,7 @@ func TestScalarCache_RestoreLeavesCacheEmpty(t *testing.T) {
 	storage := store.NewMapStorage()
 	storage.Set("currentTerm", gobEncode(t, 2))
 	storage.Set("votedFor", gobEncode(t, 0))
-	storage.Set("log", gobEncode(t, []LogEntry{{Index: 0, Term: 1}}))
+	storage.RewriteLog([]LogEntry{{Index: 0, Term: 1}})
 	cm := &ConsensusModule{storage: storage}
 	cm.initSnapshotConfig(nil)
 	cm.restoreFromStorage()
@@ -272,21 +272,35 @@ type recordedSet struct {
 	value []byte
 }
 
-// valueRecordingStorage — обёртка над Storage, фиксирующая каждую пару
-// (ключ, значение) в порядке вызовов Set. Значение клонируется на записи,
-// чтобы наблюдения не зависели от повторного использования буферов
-// вызывающим.
+// valueRecordingStorage — обёртка над LogStorage, фиксирующая каждую пару
+// (ключ, значение) в порядке вызовов Set и псевдоключ "log" на операцию
+// записи журнала. Значение клонируется на записи, чтобы наблюдения не
+// зависели от повторного использования буферов вызывающим.
 type valueRecordingStorage struct {
-	Storage
+	LogStorage
 	mu    sync.Mutex
 	calls []recordedSet
 }
 
 func (r *valueRecordingStorage) Set(key string, value []byte) {
+	r.record(key, value)
+	r.LogStorage.Set(key, value)
+}
+
+func (r *valueRecordingStorage) StoreLogEntries(fromIndex int, entries []LogEntry) LogWriteResult {
+	r.record("log", nil)
+	return r.LogStorage.StoreLogEntries(fromIndex, entries)
+}
+
+func (r *valueRecordingStorage) RewriteLog(entries []LogEntry) LogWriteResult {
+	r.record("log", nil)
+	return r.LogStorage.RewriteLog(entries)
+}
+
+func (r *valueRecordingStorage) record(key string, value []byte) {
 	r.mu.Lock()
 	r.calls = append(r.calls, recordedSet{key: key, value: bytes.Clone(value)})
 	r.mu.Unlock()
-	r.Storage.Set(key, value)
 }
 
 func (r *valueRecordingStorage) callsSnapshot() []recordedSet {
@@ -311,11 +325,12 @@ func assertRecordedSets(t *testing.T, got []recordedSet, want []recordedSet) {
 }
 
 // TestScalarCache_SetCalledOnEveryPersist проверяет контракт «кэш не
-// означает долговечности»: записывающий Storage видит прежние 4 Set на
-// каждом скалярном вызове и 5 Set в полном режиме, порядок ключей и
-// значения равны базе — в том числе на повторных попаданиях в кэш.
+// означает долговечности»: записывающий LogStorage видит прежние 4 Set на
+// каждом скалярном вызове и пятую операцию журнала в режиме полной замены,
+// порядок ключей и значения равны базе — в том числе на повторных
+// попаданиях в кэш.
 func TestScalarCache_SetCalledOnEveryPersist(t *testing.T) {
-	rec := &valueRecordingStorage{Storage: store.NewMapStorage()}
+	rec := &valueRecordingStorage{LogStorage: store.NewMapStorage()}
 	cm := &ConsensusModule{storage: rec}
 	cm.cmState.currentTerm = 1
 	cm.cmState.votedFor = -1
@@ -339,13 +354,13 @@ func TestScalarCache_SetCalledOnEveryPersist(t *testing.T) {
 	persistToStorageForTest(cm)
 	assertRecordedSets(t, rec.callsSnapshot(), scalarWant)
 
-	// Полный режим: журнал идёт последним, пять Set.
+	// Режим полной замены: журнал идёт последним, пятая операция.
 	cm.cmState.log = []LogEntry{{Index: 0, Term: 1, Type: LogCommand, Data: "k0=v0"}}
-	cm.cmState.logNeedsPersist = true
+	cm.markLogRewriteDirtyLocked()
 	rec.calls = nil
 	persistToStorageForTest(cm)
 	fullWant := slices.Clone(scalarWant)
-	fullWant = append(fullWant, recordedSet{key: "log", value: gobEncode(t, cm.cmState.log)})
+	fullWant = append(fullWant, recordedSet{key: "log"})
 	assertRecordedSets(t, rec.callsSnapshot(), fullWant)
 
 	// Изменённый скаляр на повторном вызове: значение Set — новое,
@@ -360,24 +375,30 @@ func TestScalarCache_SetCalledOnEveryPersist(t *testing.T) {
 
 // TestScalarCache_FileStorageWriteSequenceUnchanged проверяет, что
 // детерминированное число записей FileStorage при одинаковой
-// последовательности состояний не изменилось: первый полный персист — 5,
-// неизменённое состояние — 0, смена одного скаляра — 1, возврат
-// A→B→A — снова 1 (значение на диске меняется в обе стороны).
+// последовательности состояний не изменилось: первый персист — четыре
+// скалярных записи и одна запись журнала, неизменённое состояние — 0,
+// смена одного скаляра — 1, возврат A→B→A — снова 1 (значение на диске
+// меняется в обе стороны). Скалярные записи считает FileStorage, запись
+// журнала — матрица сохранений CM.
 func TestScalarCache_FileStorageWriteSequenceUnchanged(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	storage := store.NewFileStorage(t.TempDir())
-	cm := &ConsensusModule{storage: storage}
+	counter := &journalCountingStorage{LogStorage: storage}
+	cm := &ConsensusModule{storage: counter}
 	cm.cmState.currentTerm = 1
 	cm.cmState.votedFor = -1
 	cm.cmState.lastSnapshotIndex = -1
 	cm.cmState.lastSnapshotTerm = -1
 	cm.cmState.log = []LogEntry{{Index: 0, Term: 1}}
-	cm.cmState.logNeedsPersist = true
+	cm.markLogRewriteDirtyLocked()
 
 	persistToStorageForTest(cm)
-	if got := storage.WriteCount(); got != 5 {
-		t.Fatalf("первый полный персист: %d записей, want 5", got)
+	if got := storage.WriteCount(); got != 4 {
+		t.Fatalf("первый персист: %d скалярных записей, want 4", got)
+	}
+	if got := counter.journalWrites(); got != 1 {
+		t.Fatalf("первый персист: %d записей журнала, want 1", got)
 	}
 
 	before := storage.WriteCount()
