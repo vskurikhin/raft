@@ -185,12 +185,12 @@ func New(cfg *Config, readyChan <-chan any) *KVService {
 //     для создания TCP-транспорта.
 //   - id — идентификатор данного сервиса в кластере Raft.
 //   - peerIds — идентификаторы остальных узлов Raft в кластере.
-//   - storage — реализация интерфейса raft.Storage, используемая сервисом
+//   - storage — реализация интерфейса raft.LogStorage, используемая сервисом
 //     для долговременного хранения и сохранения своего состояния.
 //   - readyChan — канал уведомления, который должен быть закрыт после того,
 //     как кластер Raft будет готов к работе (все узлы запущены и соединены
 //     друг с другом).
-func NewKVService(address string, id int, peerIds []int, storage raft.Storage, readyChan <-chan any) *KVService {
+func NewKVService(address string, id int, peerIds []int, storage raft.LogStorage, readyChan <-chan any) *KVService {
 	// Нулевая структура TCPTimeouts означает использование значений по умолчанию для транспорта:
 	// конструктор подставляет вместо нулевых полей соответствующие константы из contract.
 	transport, err := transp.NewTCPTransport(address, transp.TCPTimeouts{}, 0)

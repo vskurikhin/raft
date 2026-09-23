@@ -6,7 +6,7 @@ import (
 )
 
 const (
-	// _statsPersistLineLimit — предельный размер тела строки PersistV1
+	// _statsPersistLineLimit — предельный размер тела строки PersistV2
 	// в байтах. Лимит относится только к этой строке: старую строку
 	// с парами соседей он не ограничивает.
 	_statsPersistLineLimit = 16 * 1024
@@ -22,7 +22,7 @@ const (
 
 	// _statsPersistOverflow — короткий маркер превышения предела строки;
 	// заменяет текст ошибки, если тот не помещается в документ.
-	_statsPersistOverflow = "persistV1 line exceeds 16 KiB limit"
+	_statsPersistOverflow = "persistV2 line exceeds 16 KiB limit"
 )
 
 // persistSource — источник вызова сохранения. Закрытый набор: одиннадцать
@@ -76,7 +76,7 @@ var persistSourceNames = [persistSourceCount]string{
 }
 
 // persistCell — итоги завершённых вызовов одного источника по двум режимам:
-// полному (logNeedsPersist на входе) и скалярному. Значения — целые счётчики
+// с операцией журнала и без неё (только скаляры). Значения — целые счётчики
 // и суммы наносекунд; ссылок на изменяемые данные нет.
 type persistCell struct {
 	logCalls        int64
@@ -94,38 +94,60 @@ type persistenceMetrics struct {
 	// матрицу не входит.
 	cells [persistSourceSlots]persistCell
 
-	// logLenSum, logLenMin, logLenMax — сумма, минимум и максимум размера
-	// журнала в полном режиме. logLenObserved отличает отсутствие
-	// наблюдений от минимума, равного нулю.
+	// logLenSum, logLenMin, logLenMax — сумма, минимум и максимум retained
+	// журнала в памяти при операции с журналом. logLenObserved отличает
+	// отсутствие наблюдений от минимума, равного нулю.
 	logLenSum      int64
 	logLenMin      int
 	logLenMax      int
 	logLenObserved bool
 
-	// logBytesSum — сумма числа байт уже закодированного журнала перед
-	// записью. Повторного кодирования ради статистики не выполняется.
-	logBytesSum int64
+	// logBytesWrittenSum — сумма байт, фактически записанных операциями
+	// журнала, из результата хранилища. Повторного кодирования ради
+	// статистики не выполняется.
+	logBytesWrittenSum int64
+
+	// logWrites — сумма числа логических записей операций журнала из
+	// результата хранилища. Это не число системных вызовов записи.
+	logWrites int64
+
+	// conflictSuffixReplacements — число фактически выполненных замен
+	// суффикса в пути ведомого (П2), когда заменялась хотя бы одна
+	// существующая запись, в отличие от чистого добавления. Счётчик
+	// растёт на мутацию, а не на сохранение, и не увеличивается повтором
+	// AppendEntries без изменения журнала.
+	conflictSuffixReplacements int64
+}
+
+// markConflictSuffixReplacementLocked увеличивает счётчик фактических замен
+// суффикса. Вызывается только из ветки, изменившей существующий журнал.
+// Требует удержания cm.mu — мьютекса владельца набора.
+func (m *persistenceMetrics) markConflictSuffixReplacementLocked() {
+	m.conflictSuffixReplacements++
 }
 
 // observe регистрирует один успешно завершённый вызов сохранения: источник,
-// режим, длительность от входа до последнего необходимого Set и — в полном
-// режиме — размер журнала и готовые байты кодирования. Незавершённый вызов
+// режим (была ли операция журнала), длительность от входа до успешного
+// возврата операции и — в режиме журнала — retained-размер журнала, а также
+// байты и число записей из результата хранилища. Незавершённый вызов
 // наблюдения не создаёт. Наблюдение прямого источника приспособлений
-// учитывается только собственной ячейкой: публикуемые размеры полного
+// учитывается только собственной ячейкой: публикуемые размеры журнального
 // сохранения остаются производственными.
 // Требует удержания cm.mu: писатели сериализованы вызывающим.
 func (m *persistenceMetrics) observe(
-	source persistSource, full bool, elapsed time.Duration, logLen, logBytes int,
+	source persistSource, journal bool, elapsed time.Duration,
+	logLen int, bytesWritten, writes uint64,
 ) {
 	cell := &m.cells[source]
-	if full {
+	if journal {
 		cell.logCalls++
 		cell.logElapsedNS += elapsed.Nanoseconds()
 		if source == persistSourceTest {
 			return
 		}
 		m.logLenSum += int64(logLen)
-		m.logBytesSum += int64(logBytes)
+		m.logBytesWrittenSum += int64(bytesWritten)
+		m.logWrites += int64(writes)
 		if !m.logLenObserved {
 			m.logLenObserved = true
 			m.logLenMin = logLen
@@ -143,12 +165,14 @@ func (m *persistenceMetrics) observe(
 // persistenceSnapshot — согласованная копия набора для одного выпуска
 // отчёта: только скаляры и массив ячеек, ссылок на изменяемые данные нет.
 type persistenceSnapshot struct {
-	cells          [persistSourceCount]persistCell
-	logLenSum      int64
-	logLenMin      int
-	logLenMax      int
-	logLenObserved bool
-	logBytesSum    int64
+	cells                      [persistSourceCount]persistCell
+	logLenSum                  int64
+	logLenMin                  int
+	logLenMax                  int
+	logLenObserved             bool
+	logBytesWrittenSum         int64
+	logWrites                  int64
+	conflictSuffixReplacements int64
 }
 
 // snapshot копирует набор в снимок отчёта; ячейка test исключается.
@@ -160,13 +184,15 @@ func (m *persistenceMetrics) snapshot() persistenceSnapshot {
 	snap.logLenMin = m.logLenMin
 	snap.logLenMax = m.logLenMax
 	snap.logLenObserved = m.logLenObserved
-	snap.logBytesSum = m.logBytesSum
+	snap.logBytesWrittenSum = m.logBytesWrittenSum
+	snap.logWrites = m.logWrites
+	snap.conflictSuffixReplacements = m.conflictSuffixReplacements
 	return snap
 }
 
-// statsPersistSourceV1 — счётчики одного источника в документе PersistV1:
-// число полных и скалярных вызовов и суммы их длительностей.
-type statsPersistSourceV1 struct {
+// statsPersistSourceV2 — счётчики одного источника в документе PersistV2:
+// число вызовов с операцией журнала и без неё и суммы их длительностей.
+type statsPersistSourceV2 struct {
 	Source          string `json:"Source"`
 	LogCalls        int64  `json:"LogCalls"`
 	LogElapsedNs    int64  `json:"LogElapsedNs"`
@@ -174,33 +200,36 @@ type statsPersistSourceV1 struct {
 	ScalarElapsedNs int64  `json:"ScalarElapsedNs"`
 }
 
-// statsPersistenceV1 — матрица сохранений CM: фиксированный порядок
+// statsPersistenceV2 — матрица сохранений CM: фиксированный порядок
 // одиннадцати источников, целые количества и наносекунды. Общие суммы
 // вычисляются из ячеек этой же матрицы, поэтому равенства точны в одном
-// снимке. LogLenMin/LogLenMax равны null, пока не было ни одного полного
-// сохранения: отсутствие наблюдения не подменяется нулём.
-type statsPersistenceV1 struct {
-	Sources         []statsPersistSourceV1 `json:"Sources"`
-	NPersist        int64                  `json:"NPersist"`
-	NLogPersist     int64                  `json:"NLogPersist"`
-	NScalarOnly     int64                  `json:"NScalarOnly"`
-	ElapsedNs       int64                  `json:"ElapsedNs"`
-	LogElapsedNs    int64                  `json:"LogElapsedNs"`
-	ScalarElapsedNs int64                  `json:"ScalarElapsedNs"`
-	LogLenSum       int64                  `json:"LogLenSum"`
-	LogLenMin       *int                   `json:"LogLenMin"`
-	LogLenMax       *int                   `json:"LogLenMax"`
-	LogBytesSum     int64                  `json:"LogBytesSum"`
+// снимке. LogLenMin/LogLenMax равны null, пока не было ни одной операции
+// с журналом: отсутствие наблюдения не подменяется нулём. Байты и число
+// записей журнала взяты из результата хранилища, а не из оценки.
+type statsPersistenceV2 struct {
+	Sources                    []statsPersistSourceV2 `json:"Sources"`
+	NPersist                   int64                  `json:"NPersist"`
+	NLogPersist                int64                  `json:"NLogPersist"`
+	NScalarOnly                int64                  `json:"NScalarOnly"`
+	ElapsedNs                  int64                  `json:"ElapsedNs"`
+	LogElapsedNs               int64                  `json:"LogElapsedNs"`
+	ScalarElapsedNs            int64                  `json:"ScalarElapsedNs"`
+	LogLenSum                  int64                  `json:"LogLenSum"`
+	LogLenMin                  *int                   `json:"LogLenMin"`
+	LogLenMax                  *int                   `json:"LogLenMax"`
+	LogBytesWrittenSum         int64                  `json:"LogBytesWrittenSum"`
+	LogWrites                  int64                  `json:"LogWrites"`
+	ConflictSuffixReplacements int64                  `json:"ConflictSuffixReplacements"`
 }
 
 // document собирает JSON-представление матрицы из снимка. Функция чистая:
 // работает с собственной копией и не читает живой CM.
-func (s *persistenceSnapshot) document() *statsPersistenceV1 {
-	sources := make([]statsPersistSourceV1, 0, persistSourceCount)
+func (s *persistenceSnapshot) document() *statsPersistenceV2 {
+	sources := make([]statsPersistSourceV2, 0, persistSourceCount)
 	var totalLog, totalScalar, elapsedLog, elapsedScalar int64
 	for i := range s.cells {
 		cell := s.cells[i]
-		sources = append(sources, statsPersistSourceV1{
+		sources = append(sources, statsPersistSourceV2{
 			Source:          persistSourceNames[i],
 			LogCalls:        cell.logCalls,
 			LogElapsedNs:    cell.logElapsedNS,
@@ -212,16 +241,18 @@ func (s *persistenceSnapshot) document() *statsPersistenceV1 {
 		elapsedLog += cell.logElapsedNS
 		elapsedScalar += cell.scalarElapsedNS
 	}
-	doc := &statsPersistenceV1{
-		Sources:         sources,
-		NPersist:        totalLog + totalScalar,
-		NLogPersist:     totalLog,
-		NScalarOnly:     totalScalar,
-		ElapsedNs:       elapsedLog + elapsedScalar,
-		LogElapsedNs:    elapsedLog,
-		ScalarElapsedNs: elapsedScalar,
-		LogLenSum:       s.logLenSum,
-		LogBytesSum:     s.logBytesSum,
+	doc := &statsPersistenceV2{
+		Sources:                    sources,
+		NPersist:                   totalLog + totalScalar,
+		NLogPersist:                totalLog,
+		NScalarOnly:                totalScalar,
+		ElapsedNs:                  elapsedLog + elapsedScalar,
+		LogElapsedNs:               elapsedLog,
+		ScalarElapsedNs:            elapsedScalar,
+		LogLenSum:                  s.logLenSum,
+		LogBytesWrittenSum:         s.logBytesWrittenSum,
+		LogWrites:                  s.logWrites,
+		ConflictSuffixReplacements: s.conflictSuffixReplacements,
 	}
 	if s.logLenObserved {
 		minLen, maxLen := s.logLenMin, s.logLenMax
@@ -231,12 +262,12 @@ func (s *persistenceSnapshot) document() *statsPersistenceV1 {
 	return doc
 }
 
-// statsPersistV1 — документ третьей строки периодического отчёта: машиночитаемая
+// statsPersistV2 — документ третьей строки периодического отчёта: машиночитаемая
 // сводка выпуска. Накопительные значения позволяют восстановить дельту через
 // пропущенную строку при неизменном Instance и известных границах; смена
 // Instance, повторный Seq и уменьшение сумм считаются дефектами ряда.
-type statsPersistV1 struct {
-	// Schema — версия схемы документа; первая версия — 1.
+type statsPersistV2 struct {
+	// Schema — версия схемы документа; для PersistV2 равна 2.
 	Schema int `json:"Schema"`
 	// Instance — идентификатор экземпляра CM: различает ряды одного узла
 	// после перезапуска и разные CM в процессе.
@@ -261,12 +292,13 @@ type statsPersistV1 struct {
 	// формируется всегда и публикуется как ok.
 	Persistence string `json:"Persistence"`
 	// Persist — матрица завершённых сохранений CM.
-	Persist *statsPersistenceV1 `json:"Persist"`
+	Persist *statsPersistenceV2 `json:"Persist"`
 	// Storage — готовность диагностики хранилища: full (точные записи и обе
 	// суммы Sync), write_count (только записи) или unavailable.
 	Storage string `json:"Storage"`
-	// StorageWrites — точное число успешных записей ключей хранилища;
-	// null, когда возможность недоступна.
+	// StorageWrites — число циклов сохранения: успешные записи ключей
+	// хранилища, дополненные числом успешных операций журнала; null, когда
+	// возможность недоступна.
 	StorageWrites *int64 `json:"StorageWrites"`
 	// StorageFileSyncNs, StorageDirSyncNs — суммы длительностей успешных
 	// синхронизаций файла и каталога; null при недоступности возможности.
@@ -284,7 +316,7 @@ type statsPersistV1 struct {
 	OutputError string `json:"OutputError"`
 }
 
-// persistReport формирует третью строку отчёта — JSON-документ PersistV1:
+// persistReport формирует третью строку отчёта — JSON-документ PersistV2:
 // версия схемы, экземпляр, номер выпуска, UTC и монотонный возраст CM,
 // роль/терм, моменты снимков CM/Storage, доступность групп метрик, матрица
 // сохранений, диагностика хранилища и липкая ошибка общего вывода.
@@ -307,21 +339,21 @@ func (s *statsSnapshot) persistReport(
 	doc.OutputError = _statsPersistOverflow
 	data, err = json.Marshal(doc)
 	if err != nil || len(data) > maxLen {
-		return `{"Schema":1,"OutputError":"persistV1 line exceeds 16 KiB limit"}`
+		return `{"Schema":2,"OutputError":"persistV2 line exceeds 16 KiB limit"}`
 	}
 	return string(data)
 }
 
-// persistDocument собирает документ PersistV1 из снимка CM и отдельного
+// persistDocument собирает документ PersistV2 из снимка CM и отдельного
 // диагностического снимка хранилища. Все поля — скаляры, строки и массивы
 // снимка; ссылок на изменяемые данные CM документ не содержит. Недоступная
 // возможность хранилища публикуется признаком и null, а не нулём; моменты
 // снимков CM и Storage независимы.
 func (s *statsSnapshot) persistDocument(
 	seq uint64, outputError string, storage storageDiagnostics,
-) statsPersistV1 {
-	doc := statsPersistV1{
-		Schema:       1,
+) statsPersistV2 {
+	doc := statsPersistV2{
+		Schema:       2,
 		Instance:     s.instance,
 		Seq:          seq,
 		Utc:          s.at.UTC().Format(time.RFC3339Nano),
@@ -341,7 +373,10 @@ func (s *statsSnapshot) persistDocument(
 		doc.StorageSnapshotNs = &at
 	}
 	if storage.writesOK {
-		writes := storage.writes
+		// Число циклов сохранения: записи ключей хранилища плюс успешные
+		// операции журнала из результатов store. Это не системные вызовы
+		// записи; нормализация хвоста входит в результат операции.
+		writes := storage.writes + s.persist.logWrites
 		doc.StorageWrites = &writes
 	}
 	if storage.fileSyncOK {

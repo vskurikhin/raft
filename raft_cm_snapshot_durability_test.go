@@ -22,16 +22,42 @@ var errStorageWriteAborted = errors.New("storage write aborted")
 type abortOnWriteStorage struct {
 	*store.MapStorage
 
+	// armed — отказ на любой записи: и скалярной, и журнальной.
 	armed atomic.Bool
-	hits  atomic.Int64
+	// journalArmed — отказ только на операциях журнала; скалярные записи
+	// при этом проходят. Позволяет проверить скалярный и журнальный отказы
+	// раздельно.
+	journalArmed atomic.Bool
+	hits         atomic.Int64
 }
 
 func (s *abortOnWriteStorage) Set(key string, value []byte) {
-	if s.armed.Load() {
+	s.maybeAbort(false)
+	s.MapStorage.Set(key, value)
+}
+
+// StoreLogEntries и RewriteLog переопределены явно: встраивание *MapStorage
+// продвигает эти методы, и без переопределения управляемая точка отказа не
+// срабатывала бы на пути записи журнала. Скалярный и журнальный отказы
+// проверяются раздельно.
+func (s *abortOnWriteStorage) StoreLogEntries(fromIndex int, entries []LogEntry) LogWriteResult {
+	s.maybeAbort(true)
+	return s.MapStorage.StoreLogEntries(fromIndex, entries)
+}
+
+func (s *abortOnWriteStorage) RewriteLog(entries []LogEntry) LogWriteResult {
+	s.maybeAbort(true)
+	return s.MapStorage.RewriteLog(entries)
+}
+
+// maybeAbort прерывает исполнение на записи после взведения. journal
+// указывает, что операция относится к журналу: для неё дополнительно
+// действует взведение journalArmed.
+func (s *abortOnWriteStorage) maybeAbort(journal bool) {
+	if s.armed.Load() || (journal && s.journalArmed.Load()) {
 		s.hits.Add(1)
 		panic(errStorageWriteAborted)
 	}
-	s.MapStorage.Set(key, value)
 }
 
 // newAbortOnWriteInstallSnapshotCM собирает ведомого с уже установленным
@@ -79,10 +105,11 @@ func runInstallSnapshotUntilAbort(
 }
 
 // TestInstallSnapshot_NotSuccessfulBeforePersist проверяет порядок
-// «персист → Success»: если запись постоянного состояния не завершилась,
-// ведомый не имеет права сообщить лидеру об успешной установке снимка.
-// Ответ об успехе, выставленный до персиста, означал бы, что лидер
-// перестанет досылать снимок, а ведомый после перезапуска его не найдёт.
+// «персист → Success» на отказе скалярной записи: если запись постоянного
+// состояния не завершилась, ведомый не имеет права сообщить лидеру об
+// успешной установке снимка. Ответ об успехе, выставленный до персиста,
+// означал бы, что лидер перестанет досылать снимок, а ведомый после
+// перезапуска его не найдёт.
 func TestInstallSnapshot_NotSuccessfulBeforePersist(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
@@ -98,6 +125,29 @@ func TestInstallSnapshot_NotSuccessfulBeforePersist(t *testing.T) {
 	}
 	if reply.Success {
 		t.Fatal("Success=true при незавершённой записи постоянного состояния: ответ выставлен до персиста")
+	}
+}
+
+// TestInstallSnapshot_NotSuccessfulBeforeJournalPersist проверяет тот же
+// порядок на отказе именно операции журнала: скаляры снимка записаны, но
+// полная замена журнала не завершилась — Success всё равно обязан быть
+// ложным. Переопределение обеих операций журнала не позволяет
+// promoted-методу обойти управляемую точку отказа.
+func TestInstallSnapshot_NotSuccessfulBeforeJournalPersist(t *testing.T) {
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
+
+	cm, storage := newAbortOnWriteInstallSnapshotCM()
+	data := installSnapshotRequestData(t, map[string]string{"k0": "v0"})
+	req := installSnapshotRequest(99, 12, 2, data) // новее имеющегося (10)
+
+	storage.journalArmed.Store(true)
+	reply := runInstallSnapshotUntilAbort(t, cm, req, data)
+
+	if got := storage.hits.Load(); got == 0 {
+		t.Fatal("операция журнала не была достигнута: скалярный и журнальный отказы не разделены")
+	}
+	if reply.Success {
+		t.Fatal("Success=true при незавершённой замене журнала: ответ выставлен до персиста")
 	}
 }
 
@@ -120,12 +170,10 @@ func TestInstallSnapshot_StateDurableOnSuccess(t *testing.T) {
 		t.Fatalf("InstallSnapshot: Success=false: %+v", reply)
 	}
 
-	logData, found := storage.Get("log")
-	if !found {
-		t.Fatal("ключ log отсутствует в хранилище при Success=true")
+	onDisk, err := storage.LoadLog()
+	if err != nil {
+		t.Fatalf("журнал отсутствует или не читается при Success=true: %v", err)
 	}
-	var onDisk []LogEntry
-	gobDecode(t, logData, &onDisk)
 	if len(onDisk) != 0 {
 		t.Fatalf("журнал в хранилище = %+v, want пустой (уплотнён по индексу снимка)", onDisk)
 	}
