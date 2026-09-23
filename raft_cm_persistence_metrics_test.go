@@ -13,7 +13,7 @@ import (
 )
 
 // -- Тесты матрицы сохранений CM, диагностического снимка хранилища и
-// -- документа PersistV1. Источники в этих тестах задаются напрямую: здесь
+// -- документа PersistV2. Источники в этих тестах задаются напрямую: здесь
 // -- проверяются арифметика, единицы и форма публикации, а не переходы
 // -- (переходы покрыты отдельным файлом). --
 
@@ -31,18 +31,18 @@ func persistenceCellOf(s persistenceSnapshot, source persistSource) persistCell 
 }
 
 // TestPersistenceMetrics_MatrixAndDocument проверяет арифметику матрицы и
-// документа PersistV1 на детерминированных значениях: равенство
+// документа PersistV2 на детерминированных значениях: равенство
 // N = N_log + N_scalar = сумме источников, суммы длительностей, размеры
-// полного сохранения, фиксированный порядок одиннадцати источников и
+// журнального сохранения, фиксированный порядок одиннадцати источников и
 // исключение тестового источника из публикации.
 func TestPersistenceMetrics_MatrixAndDocument(t *testing.T) {
 	cm := new(ConsensusModule)
-	cm.persistence.observe(persistSourceApply, true, 3*time.Millisecond, 100, 2048)
-	cm.persistence.observe(persistSourceApply, false, time.Millisecond, 0, 0)
-	cm.persistence.observe(persistSourceVote, false, 2*time.Millisecond, 0, 0)
+	cm.persistence.observe(persistSourceApply, true, 3*time.Millisecond, 100, 2048, 1)
+	cm.persistence.observe(persistSourceApply, false, time.Millisecond, 0, 0, 0)
+	cm.persistence.observe(persistSourceVote, false, 2*time.Millisecond, 0, 0, 0)
 	// Прямой вызов приспособления учитывается отдельной ячейкой и не должен
 	// попадать ни в матрицу, ни в общие суммы.
-	cm.persistence.observe(persistSourceTest, true, time.Second, 999, 999999)
+	cm.persistence.observe(persistSourceTest, true, time.Second, 999, 999999, 1)
 
 	snap := persistenceSnapshotOf(cm)
 
@@ -77,8 +77,8 @@ func TestPersistenceMetrics_MatrixAndDocument(t *testing.T) {
 	}
 
 	// Полное наблюдение одно: len(log) = 100, готовые байты кодирования 2048.
-	if doc.LogLenSum != 100 || doc.LogBytesSum != 2048 {
-		t.Fatalf("полное сохранение = (len sum %d, bytes sum %d), want (100, 2048)", doc.LogLenSum, doc.LogBytesSum)
+	if doc.LogLenSum != 100 || doc.LogBytesWrittenSum != 2048 {
+		t.Fatalf("полное сохранение = (len sum %d, bytes sum %d), want (100, 2048)", doc.LogLenSum, doc.LogBytesWrittenSum)
 	}
 	if doc.LogLenMin == nil || doc.LogLenMax == nil {
 		t.Fatal("LogLenMin/Max = null при наличии полного сохранения")
@@ -109,11 +109,11 @@ func TestPersistenceMetrics_MatrixAndDocument(t *testing.T) {
 	if err != nil {
 		t.Fatalf("json.Marshal матрицы: %v", err)
 	}
-	var decoded statsPersistenceV1
+	var decoded statsPersistenceV2
 	if err := json.Unmarshal(data, &decoded); err != nil {
 		t.Fatalf("json.Unmarshal матрицы: %v", err)
 	}
-	if decoded.NPersist != doc.NPersist || decoded.LogLenSum != doc.LogLenSum || decoded.LogBytesSum != doc.LogBytesSum {
+	if decoded.NPersist != doc.NPersist || decoded.LogLenSum != doc.LogLenSum || decoded.LogBytesWrittenSum != doc.LogBytesWrittenSum {
 		t.Fatalf("round-trip потерял поля: %+v -> %+v", *doc, decoded)
 	}
 	if len(decoded.Sources) != persistSourceCount || decoded.Sources[0].Source != "apply" {
@@ -126,13 +126,13 @@ func TestPersistenceMetrics_MatrixAndDocument(t *testing.T) {
 // публикуются как null в JSON, а суммы остаются нулевыми.
 func TestPersistenceMetrics_NoFullObservationHasNullMinMax(t *testing.T) {
 	cm := new(ConsensusModule)
-	cm.persistence.observe(persistSourceVote, false, time.Millisecond, 0, 0)
+	cm.persistence.observe(persistSourceVote, false, time.Millisecond, 0, 0, 0)
 
 	snap := persistenceSnapshotOf(cm)
 	doc := snap.document()
-	if doc.NLogPersist != 0 || doc.LogLenSum != 0 || doc.LogBytesSum != 0 {
+	if doc.NLogPersist != 0 || doc.LogLenSum != 0 || doc.LogBytesWrittenSum != 0 {
 		t.Fatalf("скалярный вызов дал полные величины: N_log=%d, len sum=%d, bytes sum=%d",
-			doc.NLogPersist, doc.LogLenSum, doc.LogBytesSum)
+			doc.NLogPersist, doc.LogLenSum, doc.LogBytesWrittenSum)
 	}
 	if doc.LogLenMin != nil || doc.LogLenMax != nil {
 		t.Fatal("LogLenMin/Max не равны null при отсутствии полных сохранений")
@@ -152,14 +152,14 @@ func TestPersistenceMetrics_NoFullObservationHasNullMinMax(t *testing.T) {
 func TestPersistenceMetrics_ObserveZeroAllocations(t *testing.T) {
 	var metrics persistenceMetrics
 	allocs := testing.AllocsPerRun(1000, func() {
-		metrics.observe(persistSourceApply, false, time.Microsecond, 0, 0)
+		metrics.observe(persistSourceApply, false, time.Microsecond, 0, 0, 0)
 	})
 	if allocs != 0 {
 		t.Fatalf("аллокаций на инкремент = %v, want 0", allocs)
 	}
 
 	allocs = testing.AllocsPerRun(1000, func() {
-		metrics.observe(persistSourceApply, true, time.Microsecond, 7, 128)
+		metrics.observe(persistSourceApply, true, time.Microsecond, 7, 128, 1)
 	})
 	if allocs != 0 {
 		t.Fatalf("аллокаций на полный инкремент = %v, want 0", allocs)
@@ -171,10 +171,10 @@ func TestPersistenceMetrics_ObserveZeroAllocations(t *testing.T) {
 // снятую копию, ни уже собранный из неё документ.
 func TestPersistenceSnapshot_NoSharedState(t *testing.T) {
 	cm := new(ConsensusModule)
-	cm.persistence.observe(persistSourceApply, true, time.Millisecond, 5, 64)
+	cm.persistence.observe(persistSourceApply, true, time.Millisecond, 5, 64, 1)
 
 	before := persistenceSnapshotOf(cm)
-	cm.persistence.observe(persistSourceApply, true, time.Millisecond, 50, 640)
+	cm.persistence.observe(persistSourceApply, true, time.Millisecond, 50, 640, 1)
 
 	doc := before.document()
 	if doc.NPersist != 1 || doc.LogLenSum != 5 || doc.NLogPersist != 1 {
@@ -186,9 +186,9 @@ func TestPersistenceSnapshot_NoSharedState(t *testing.T) {
 }
 
 // writeCountOnlyStorage — двойник без сумм Sync: реализует только подсчёт
-// фактических записей, как сторонняя реализация Storage.
+// фактических записей, как сторонняя реализация хранилища.
 type writeCountOnlyStorage struct {
-	Storage
+	LogStorage
 	writes int
 }
 
@@ -218,7 +218,7 @@ func TestStorageDiagnostics_AvailabilityGroups(t *testing.T) {
 	}
 
 	fs := store.NewFileStorage(t.TempDir())
-	fs.Set("log", []byte{1, 2, 3})
+	fs.Set("currentTerm", []byte{1, 2, 3})
 	d = takeStorageDiagnostics(fs)
 	if !d.available || d.group() != _statsStorageFull {
 		t.Fatalf("полная диагностика: available=%t, group=%q", d.available, d.group())
@@ -237,11 +237,11 @@ func TestPublishStats_PersistenceAndStorageDocuments(t *testing.T) {
 	cm := newStatsTestCM()
 	cm.storage = storage
 	storage.Set("currentTerm", []byte{1})
-	cm.persistence.observe(persistSourceApply, true, 2*time.Millisecond, 7, 128)
+	cm.persistence.observe(persistSourceApply, true, 2*time.Millisecond, 7, 128, 1)
 
 	var out, diag bytes.Buffer
 	cm.publishStats(&out, &diag)
-	doc := statsDecodePersistV1(t, statsThirdLineBody(t, out.String()))
+	doc := statsDecodePersistV2(t, statsThirdLineBody(t, out.String()))
 
 	if doc.Persistence != _statsGroupAvailable || doc.Persist == nil {
 		t.Fatalf("Persistence = %q, Persist = %v, want ok и матрицу", doc.Persistence, doc.Persist)
@@ -252,8 +252,12 @@ func TestPublishStats_PersistenceAndStorageDocuments(t *testing.T) {
 	if doc.Storage != _statsStorageFull {
 		t.Fatalf("Storage = %q, want %q", doc.Storage, _statsStorageFull)
 	}
-	if doc.StorageWrites == nil || *doc.StorageWrites != int64(storage.WriteCount()) {
-		t.Fatalf("StorageWrites = %v, WriteCount = %d", doc.StorageWrites, storage.WriteCount())
+	// StorageWrites — циклы сохранения: скалярные записи ключей хранилища
+	// плюс операция журнала, наблюдённая CM.
+	wantWrites := int64(storage.WriteCount()) + doc.Persist.LogWrites
+	if doc.StorageWrites == nil || *doc.StorageWrites != wantWrites {
+		t.Fatalf("StorageWrites = %v, want %d (WriteCount %d + LogWrites %d)",
+			doc.StorageWrites, wantWrites, storage.WriteCount(), doc.Persist.LogWrites)
 	}
 	if doc.StorageFileSyncNs == nil || doc.StorageDirSyncNs == nil {
 		t.Fatalf("суммы Sync = (%v, %v), want обе опубликованы", doc.StorageFileSyncNs, doc.StorageDirSyncNs)
@@ -273,7 +277,7 @@ func TestPublishStats_PersistenceAndStorageDocuments(t *testing.T) {
 	cmNo := newStatsTestCM()
 	var outNo bytes.Buffer
 	cmNo.publishStats(&outNo, io.Discard)
-	docNo := statsDecodePersistV1(t, statsThirdLineBody(t, outNo.String()))
+	docNo := statsDecodePersistV2(t, statsThirdLineBody(t, outNo.String()))
 	if docNo.Storage != _statsGroupUnavailable {
 		t.Fatalf("Storage без возможностей = %q, want %q", docNo.Storage, _statsGroupUnavailable)
 	}
@@ -286,7 +290,7 @@ func TestPublishStats_PersistenceAndStorageDocuments(t *testing.T) {
 	cmPart.storage = &writeCountOnlyStorage{writes: 3}
 	var outPart bytes.Buffer
 	cmPart.publishStats(&outPart, io.Discard)
-	docPart := statsDecodePersistV1(t, statsThirdLineBody(t, outPart.String()))
+	docPart := statsDecodePersistV2(t, statsThirdLineBody(t, outPart.String()))
 	if docPart.Storage != _statsStorageWriteCount {
 		t.Fatalf("Storage частичной возможности = %q, want %q", docPart.Storage, _statsStorageWriteCount)
 	}
@@ -302,7 +306,7 @@ func TestPublishStats_PersistenceAndStorageDocuments(t *testing.T) {
 // проверяет, что cm.mu свободен. Проверка детерминирована: публикация
 // вызывает возможность синхронно из горутины теста.
 type probePersistenceStats struct {
-	Storage
+	LogStorage
 	cm       *ConsensusModule
 	violated bool
 }
@@ -332,7 +336,7 @@ func TestPublishStats_StorageSnapshotOutsideCmMu(t *testing.T) {
 	if probe.violated {
 		t.Fatal("диагностический снимок хранилища снят при удержанном cm.mu")
 	}
-	doc := statsDecodePersistV1(t, statsThirdLineBody(t, out.String()))
+	doc := statsDecodePersistV2(t, statsThirdLineBody(t, out.String()))
 	if doc.StorageWrites == nil || *doc.StorageWrites != 1 {
 		t.Fatalf("публикация не использовала согласованный снимок возможности: %v", doc.StorageWrites)
 	}
@@ -355,7 +359,7 @@ func TestPersistenceCounters_DisabledStatsOutputStillRecords(t *testing.T) {
 	cm.cmState.lastSnapshotIndex = -1
 	cm.cmState.lastSnapshotTerm = -1
 	cm.cmState.log = []LogEntry{{Index: 0, Term: 1}}
-	cm.cmState.logNeedsPersist = true
+	cm.markLogRewriteDirtyLocked()
 
 	cm.mu.Lock()
 	cm.persistToStorageLocked(persistSourceApply)
@@ -366,14 +370,18 @@ func TestPersistenceCounters_DisabledStatsOutputStillRecords(t *testing.T) {
 	if cell.logCalls != 1 {
 		t.Fatalf("apply log = %d, want 1 при выключенном выводе", cell.logCalls)
 	}
-	if got := storage.WriteCount(); got != 5 {
-		t.Fatalf("WriteCount = %d, want 5 (полное сохранение)", got)
+	if got := storage.WriteCount(); got != 4 {
+		t.Fatalf("WriteCount = %d, want 4 (четыре скаляра)", got)
+	}
+	if got := journalWritesOf(cm); got != 1 {
+		t.Fatalf("journal writes = %d, want 1", got)
 	}
 	// Сбор сумм Sync принадлежит хранилищу и переключателем не управляется:
-	// диагностический снимок доступен и видит те же пять записей.
+	// диагностический снимок доступен и видит те же четыре скалярные записи;
+	// запись журнала хранит собственная матрица сохранений CM.
 	d := takeStorageDiagnostics(storage)
-	if !d.available || d.group() != _statsStorageFull || d.writes != 5 {
-		t.Fatalf("диагностика хранилища = %+v, want полную с пятью записями", d)
+	if !d.available || d.group() != _statsStorageFull || d.writes != 4 {
+		t.Fatalf("диагностика хранилища = %+v, want полную с четырьмя записями", d)
 	}
 
 	sink := &countingWriter{}
@@ -397,7 +405,7 @@ func TestPersistenceCounters_AbortedPersistNotObserved(t *testing.T) {
 	cm.cmState.lastSnapshotIndex = -1
 	cm.cmState.lastSnapshotTerm = -1
 	cm.cmState.log = []LogEntry{{Index: 0, Term: 1}}
-	cm.cmState.logNeedsPersist = true
+	cm.markLogRewriteDirtyLocked()
 
 	before := persistenceSnapshotOf(cm)
 	storage.armed.Store(true)

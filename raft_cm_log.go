@@ -113,7 +113,9 @@ func (cm *ConsensusModule) compactLogsLocked(compactIndex int) {
 	kept := make([]LogEntry, len(cm.cmState.log)-pos)
 	copy(kept, cm.cmState.log[pos:])
 	cm.cmState.log = kept
-	cm.cmState.logNeedsPersist = true
+	// Уплотнение удаляет префикс, что не выражается заменой суффикса:
+	// журнал переписывается целиком.
+	cm.markLogRewriteDirtyLocked()
 	// Уплотнение переписывает журнал, но не добавляет записей: период
 	// отмечается с нулём добавлений.
 	cm.dirty.mark(dirtyCauseCompact, 0)
@@ -191,6 +193,9 @@ func (cm *ConsensusModule) dispatchLogs(applyLogs []*logFuture) {
 func (cm *ConsensusModule) dispatchLogsLocked(applyLogs []*logFuture) {
 	term := cm.cmState.currentTerm
 	lastIndex := cm.cmState.lastLogIndex
+	// Первый изменённый индекс — начало пакета: суффикс сохранения
+	// начинается с первой добавленной записи.
+	firstNewIndex := lastIndex + 1
 	now := time.Now()
 	for _, f := range applyLogs {
 		f.dispatch = now
@@ -201,7 +206,7 @@ func (cm *ConsensusModule) dispatchLogsLocked(applyLogs []*logFuture) {
 		cm.cmState.log = append(cm.cmState.log, f.log)
 	}
 	cm.setLastLogLocked(lastIndex, term)
-	cm.cmState.logNeedsPersist = true
+	cm.markLogSuffixDirtyLocked(firstNewIndex)
 	// Добавления — длина фактически добавленного пакета, не разность
 	// индексов: замена суффикса считается по реально приписанному срезу.
 	cm.dirty.mark(dirtyCauseLeaderAppend, int64(len(applyLogs)))
