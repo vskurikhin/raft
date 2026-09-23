@@ -16,11 +16,11 @@ APPLY_BATCH_INTERVAL=50
 HEARTBEAT_TIMEOUT=45
 REELECTION_TIMEOUT=500
 TICKER_TIMEOUT=20
-CONCURRENCY=8
+CONCURRENCY=128
 DELETE_PERCENT=0
 DURATION=5m
 GET_PERCENT=75
-REQUEST_RATE=200
+REQUEST_RATE=500
 VALUE_SIZE=128
 VERIFY_PERCENT=33
 WEAK_GET_PERCENT=0
@@ -93,6 +93,7 @@ start-raft: stop-raft
 		echo "  >  $(PROJECTNAME) is available at $$http"; \
 		$(GOBIN)/$(PROJECTNAME)kv -number $$n \
 			-http-addr=":$$http" -rpc-addr=":$$rpc" -peers="$$peers" \
+			-max-pool=16 \
 			-apply-batch-interval=$(APPLY_BATCH_INTERVAL)ms \
 			-heartbeat-timeout=$(HEARTBEAT_TIMEOUT)ms \
 			-reelection-timeout=$(REELECTION_TIMEOUT)ms \
