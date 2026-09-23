@@ -129,6 +129,42 @@ func runLogStorageContract(t *testing.T, newStorage func(t *testing.T) contract.
 		requireSameEntries(t, after, before)
 	})
 
+	t.Run("вставка в существующий пустой журнал", func(t *testing.T) {
+		storage := newStorage(t)
+		storage.RewriteLog(nil)
+		entries := []contract.LogEntry{contractEntry(3, 1, contract.LogCommand, []byte{0x33})}
+		storage.StoreLogEntries(3, entries)
+		got, err := storage.LoadLog()
+		if err != nil {
+			t.Fatalf("LoadLog: %v", err)
+		}
+		requireSameEntries(t, got, entries)
+	})
+
+	t.Run("замена суффикса после снимка", func(t *testing.T) {
+		storage := newStorage(t)
+		base := []contract.LogEntry{
+			contractEntry(5, 2, contract.LogNoop, nil),
+			contractEntry(6, 2, contract.LogCommand, []byte{0x51}),
+		}
+		storage.RewriteLog(base)
+		next := []contract.LogEntry{contractEntry(7, 3, contract.LogCommand, []byte{0x71})}
+		storage.StoreLogEntries(7, next)
+		got, err := storage.LoadLog()
+		if err != nil {
+			t.Fatalf("LoadLog: %v", err)
+		}
+		requireSameEntries(t, got, append(append([]contract.LogEntry(nil), base...), next...))
+
+		// Чистое усечение до границы снимка: сохраняется запись с индексом 5.
+		storage.StoreLogEntries(6, nil)
+		got, err = storage.LoadLog()
+		if err != nil {
+			t.Fatalf("LoadLog после усечения: %v", err)
+		}
+		requireSameEntries(t, got, base[:1])
+	})
+
 	t.Run("владение входными Data", func(t *testing.T) {
 		storage := newStorage(t)
 		first := []byte{0x51, 0x52, 0x53}
@@ -171,6 +207,43 @@ func runLogStorageContract(t *testing.T, newStorage func(t *testing.T) contract.
 		want := []contract.LogEntry{contractEntry(0, 0, contract.LogCommand, []byte{0x71, 0x72, 0x73})}
 		requireSameEntries(t, again, want)
 	})
+
+	t.Run("владение вложенным графом Data", func(t *testing.T) {
+		registerLogNestedData()
+		storage := newStorage(t)
+		items := []int{1, 2}
+		blob := []byte{3, 4}
+		storage.RewriteLog([]contract.LogEntry{
+			contractEntry(0, 0, contract.LogCommand, logNestedData{Items: items, Blob: blob}),
+		})
+
+		// Мутация входа после возврата не меняет сохранённое значение.
+		items[0] = 9
+		blob[0] = 9
+		got, err := storage.LoadLog()
+		if err != nil {
+			t.Fatalf("LoadLog: %v", err)
+		}
+		first, ok := got[0].Data.(logNestedData)
+		if !ok {
+			t.Fatalf("Data = %T, want logNestedData", got[0].Data)
+		}
+		if first.Items[0] != 1 || first.Blob[0] != 3 {
+			t.Fatalf("сохранённое значение повреждено входом: %+v", first)
+		}
+
+		// Мутация результата не меняет хранилище.
+		first.Items[0] = 7
+		first.Blob[0] = 7
+		again, err := storage.LoadLog()
+		if err != nil {
+			t.Fatalf("повторный LoadLog: %v", err)
+		}
+		second := again[0].Data.(logNestedData)
+		if second.Items[0] != 1 || second.Blob[0] != 3 {
+			t.Fatalf("хранилище изменено результатом LoadLog: %+v", second)
+		}
+	})
 }
 
 // contractEntry собирает запись журнала для контрактных случаев.
@@ -206,18 +279,19 @@ func (s *contractTestStorage) StoreLogEntries(fromIndex int, entries []contract.
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.exists = true
-	if len(entries) == 0 {
-		if fromIndex < len(s.entries) {
-			s.entries = slices.Clone(s.entries[:fromIndex])
+	// Индексы абсолютные: сохраняется префикс записей с индексом ниже
+	// fromIndex, затем новые записи. Двойник не моделирует файл и границы
+	// отвечает только за логический эффект набора случаев.
+	kept := make([]contract.LogEntry, 0, len(s.entries)+len(entries))
+	for _, entry := range s.entries {
+		if entry.Index < fromIndex {
+			kept = append(kept, entry)
 		}
-		return contract.LogWriteResult{}
 	}
-	copied := cloneContractEntries(entries)
-	if fromIndex >= len(s.entries) {
-		s.entries = append(s.entries, copied...)
-	} else {
-		s.entries = append(s.entries[:fromIndex], copied...)
+	if len(entries) > 0 {
+		kept = append(kept, cloneContractEntries(entries)...)
 	}
+	s.entries = kept
 	return contract.LogWriteResult{}
 }
 
@@ -238,14 +312,19 @@ func (s *contractTestStorage) LoadLog() ([]contract.LogEntry, error) {
 	return cloneContractEntries(s.entries), nil
 }
 
-// cloneContractEntries копирует записи и их срезы Data, чтобы приспособление
-// не делило изменяемые значения с вызывающим.
+// cloneContractEntries копирует записи и их вложенные изменяемые значения,
+// чтобы приспособление не делило данные с вызывающим.
 func cloneContractEntries(entries []contract.LogEntry) []contract.LogEntry {
 	out := make([]contract.LogEntry, len(entries))
 	for i := range entries {
 		out[i] = entries[i]
-		if data, ok := entries[i].Data.([]byte); ok {
+		switch data := entries[i].Data.(type) {
+		case []byte:
 			out[i].Data = slices.Clone(data)
+		case logNestedData:
+			data.Items = slices.Clone(data.Items)
+			data.Blob = slices.Clone(data.Blob)
+			out[i].Data = data
 		}
 	}
 	return out
@@ -257,6 +336,23 @@ func cloneContractEntries(entries []contract.LogEntry) []contract.LogEntry {
 func TestLogStorageContractHelperSelfCheck(t *testing.T) {
 	runLogStorageContract(t, func(*testing.T) contract.LogStorage {
 		return newContractTestStorage()
+	})
+}
+
+// TestFileStorageLogStorageContract прогоняет общий набор контракта на
+// файловой реализации: каждый случай выполняется в собственном каталоге
+// данных.
+func TestFileStorageLogStorageContract(t *testing.T) {
+	runLogStorageContract(t, func(t *testing.T) contract.LogStorage {
+		return NewFileStorage(t.TempDir())
+	})
+}
+
+// TestMapStorageLogStorageContract прогоняет общий набор контракта на
+// реализации в памяти.
+func TestMapStorageLogStorageContract(t *testing.T) {
+	runLogStorageContract(t, func(*testing.T) contract.LogStorage {
+		return NewMapStorage()
 	})
 }
 

@@ -146,34 +146,79 @@ func encodeLogFileHeader() [logFileHeaderSize]byte {
 // encodeLogBatch собирает один полный пакет: заголовок, тело записей и
 // footer. Валидация записей выполняется до выделения и кодирования Data.
 func encodeLogBatch(entries []contract.LogEntry) ([]byte, error) {
-	if err := checkLogEntries(entries); err != nil {
-		return nil, err
-	}
-	body, err := encodeLogBody(entries)
+	encoded, err := encodeLogEntries(entries)
 	if err != nil {
 		return nil, err
 	}
+	return encodeLogBatchEncoded(encoded), nil
+}
+
+// encodeLogFile собирает новый файл журнала: заголовок и один пакет. Пустой
+// набор записей даёт валидный пустой журнал из заголовка и пустого пакета.
+func encodeLogFile(entries []contract.LogEntry) ([]byte, error) {
+	encoded, err := encodeLogEntries(entries)
+	if err != nil {
+		return nil, err
+	}
+	return encodeLogFileEncoded(encoded), nil
+}
+
+// encodedLogEntry — запись журнала с уже закодированной Data. Кэш
+// реализаций хранит такое представление и переиспользует его при
+// пересборке пакета без повторного кодирования Data.
+type encodedLogEntry struct {
+	index int
+	term  int
+	typ   contract.LogType
+	data  []byte
+}
+
+// encodeLogEntries проверяет записи и кодирует Data каждой из них отдельным
+// потоком gob. Валидация выполняется до выделения и кодирования.
+func encodeLogEntries(entries []contract.LogEntry) ([]encodedLogEntry, error) {
+	if err := checkLogEntries(entries); err != nil {
+		return nil, err
+	}
+	encoded := make([]encodedLogEntry, len(entries))
+	for i := range entries {
+		entry := &entries[i]
+		data, err := encodeLogData(entry.Data)
+		if err != nil {
+			return nil, fmt.Errorf("кодирование записи с индексом %d: %w", entry.Index, err)
+		}
+		encoded[i] = encodedLogEntry{
+			index: entry.Index,
+			term:  entry.Term,
+			typ:   entry.Type,
+			data:  data,
+		}
+	}
+	return encoded, nil
+}
+
+// encodeLogBatchEncoded собирает полный пакет из записей с готовой Data.
+// Вызывающий обязан заранее проверить записи: индексы идут подряд, тип и
+// длины допустимы.
+func encodeLogBatchEncoded(entries []encodedLogEntry) []byte {
+	body := encodeLogBodyEncoded(entries)
 	header := encodeLogBatchHeader(uint64(len(body)), uint64(len(entries)))
 	footer := encodeLogFooter(header[:], body)
 	packet := make([]byte, 0, logBatchHeaderSize+len(body)+logFooterSize)
 	packet = append(packet, header[:]...)
 	packet = append(packet, body...)
 	packet = append(packet, footer[:]...)
-	return packet, nil
+	return packet
 }
 
-// encodeLogFile собирает новый файл журнала: заголовок и один пакет. Пустой
-// набор записей даёт валидный пустой журнал из заголовка и пустого пакета.
-func encodeLogFile(entries []contract.LogEntry) ([]byte, error) {
+// encodeLogFileEncoded собирает файл журнала из заголовка и одного пакета
+// записей с готовой Data.
+func encodeLogFileEncoded(entries []encodedLogEntry) []byte {
 	header := encodeLogFileHeader()
-	packet, err := encodeLogBatch(entries)
-	if err != nil {
-		return nil, err
-	}
+	packet := encodeLogBatchEncoded(entries)
 	file := make([]byte, 0, len(header)+len(packet))
 	file = append(file, header[:]...)
 	file = append(file, packet...)
-	return file, nil
+	return file
 }
 
 // encodeLogBatchHeader собирает заголовок пакета: сигнатуру, нулевые
@@ -192,26 +237,26 @@ func encodeLogBatchHeader(bodyLength, entryCount uint64) [logBatchHeaderSize]byt
 	return header
 }
 
-// encodeLogBody собирает тело пакета: для каждой записи служебные поля и
-// отдельный поток gob с Data.
-func encodeLogBody(entries []contract.LogEntry) ([]byte, error) {
-	var body bytes.Buffer
+// encodeLogBodyEncoded собирает тело пакета из записей с готовой Data:
+// для каждой записи служебные поля и уже закодированный поток gob.
+func encodeLogBodyEncoded(entries []encodedLogEntry) []byte {
+	size := 0
+	for i := range entries {
+		size += logEntryHeaderSize + len(entries[i].data)
+	}
+	body := make([]byte, 0, size)
 	for i := range entries {
 		entry := &entries[i]
-		data, err := encodeLogData(entry.Data)
-		if err != nil {
-			return nil, fmt.Errorf("кодирование записи с индексом %d: %w", entry.Index, err)
-		}
 		var record [logEntryHeaderSize]byte
-		binary.BigEndian.PutUint64(record[0:8], uint64(entry.Index))
-		binary.BigEndian.PutUint64(record[8:16], uint64(entry.Term))
-		record[16] = byte(entry.Type)
+		binary.BigEndian.PutUint64(record[0:8], uint64(entry.index))
+		binary.BigEndian.PutUint64(record[8:16], uint64(entry.term))
+		record[16] = byte(entry.typ)
 		// Байты 17..23 — зарезервированное поле, остаётся нулевым.
-		binary.BigEndian.PutUint64(record[24:32], uint64(len(data)))
-		body.Write(record[:])
-		body.Write(data)
+		binary.BigEndian.PutUint64(record[24:32], uint64(len(entry.data)))
+		body = append(body, record[:]...)
+		body = append(body, entry.data...)
 	}
-	return body.Bytes(), nil
+	return body
 }
 
 // encodeLogFooter собирает footer пакета: CRC всего заголовка пакета и тела,
