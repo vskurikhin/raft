@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"math/rand"
 	"os"
 	"os/signal"
@@ -39,6 +40,16 @@ const (
 // errRequestRate — темп меньше одного тика в секунду не поддерживается.
 var errRequestRate = errors.New("invalid -request-rate: must be >= 1")
 
+// opKind — вид операции сценария нагрузки, выбираемый лестницей долей.
+type opKind int
+
+const (
+	opDelete opKind = iota
+	opWeakGet
+	opGet
+	opPut
+)
+
 var (
 	_keys []string
 
@@ -49,12 +60,22 @@ var (
 	_verifyOK  atomic.Uint64
 	_verifyBad atomic.Uint64
 
-	// _getDone, _putDone, _verifyDone — завершённые операции. Каждая выполненная
-	// операция увеличивает ровно один счётчик ровно один раз, включая пути
-	// ошибок.
-	_getDone    atomic.Uint64
-	_putDone    atomic.Uint64
-	_verifyDone atomic.Uint64
+	_weakGetOK       atomic.Uint64
+	_weakGetFail     atomic.Uint64
+	_deleteOK        atomic.Uint64
+	_deleteFail      atomic.Uint64
+	_deleteVerifyOK  atomic.Uint64
+	_deleteVerifyBad atomic.Uint64
+
+	// _getDone, _putDone, _verifyDone, _weakGetDone, _deleteDone,
+	// _deleteVerifyDone — завершённые операции. Каждая выполненная операция
+	// увеличивает ровно один счётчик ровно один раз, включая пути ошибок.
+	_getDone          atomic.Uint64
+	_putDone          atomic.Uint64
+	_verifyDone       atomic.Uint64
+	_weakGetDone      atomic.Uint64
+	_deleteDone       atomic.Uint64
+	_deleteVerifyDone atomic.Uint64
 
 	// _dropped — тики, пришедшие при исчерпанной одновременности: заданный
 	// темп не достигнут.
@@ -64,8 +85,14 @@ var (
 	// значение делает прогон непригодным как базовая линия.
 	_latencyDropped atomic.Uint64
 
-	_getLatency = newLatencyRecorder(_latencyPrealloc, 0)
-	_putLatency = newLatencyRecorder(_latencyPrealloc, 0)
+	_getLatency     = newLatencyRecorder(_latencyPrealloc, 0)
+	_putLatency     = newLatencyRecorder(_latencyPrealloc, 0)
+	_weakGetLatency = newLatencyRecorder(_latencyPrealloc, 0)
+	_deleteLatency  = newLatencyRecorder(_latencyPrealloc, 0)
+
+	// _rps накапливает посекундные значения скорости операций, печатаемые
+	// горутиной stats: ряд обязан совпадать со строками RPS= прогона.
+	_rps = newRpsSeries()
 
 	_values config.Values
 )
@@ -81,7 +108,7 @@ func init() {
 
 func main() {
 	if err := runLoad(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		_, _ = fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
@@ -132,37 +159,60 @@ func tickInterval(rate int) (time.Duration, error) {
 	return time.Second / time.Duration(rate), nil
 }
 
-// generate порождает операции по тикам тикера. Тик задаёт момент старта
-// запроса, сам запрос выполняется в отдельной горутине; одновременность
-// ограничена ёмкостью семафора. Тик при занятом семафоре учитывается
-// счётчиком _dropped. Возврат происходит после завершения всех начатых
-// запросов.
+// ticksDue возвращает число тиков, подлежащих выпуску к моменту elapsed
+// от старта: целую часть elapsed/interval. Тик с номером k (k ≥ 1) подлежит
+// выпуску при elapsed ≥ k·interval. Ноль возвращается при elapsed < 0 и при
+// interval ≤ 0; функция не паникует ни при каких аргументах.
+func ticksDue(elapsed, interval time.Duration) int {
+	if elapsed < 0 || interval <= 0 {
+		return 0
+	}
+	return int(elapsed / interval)
+}
+
+// generate порождает операции по тикам тикера. Расписание абсолютное: от
+// момента старта ведётся число подлежащих выпуску тиков, и на каждом
+// пробуждении тикера выпускаются все тики, чей срок наступил, — опоздание
+// пробуждения не теряет тики. Тик задаёт момент старта запроса, сам запрос
+// выполняется в отдельной горутине; одновременность ограничена ёмкостью
+// семафора. Тик при занятом семафоре учитывается счётчиком _dropped.
+// Возврат происходит после завершения всех начатых запросов.
 func generate(ctx context.Context, client *kvclient.KVClient, interval time.Duration, concurrency int) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	semaphore := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
 	defer wg.Wait()
+	start := time.Now()
+	fired := 0
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			select {
-			case semaphore <- struct{}{}:
-				wg.Add(1)
-				// Запрос выполняется с собственным сроком: начатая операция
-				// доводится до конца и после остановки генерации.
-				//nolint:contextcheck
-				go func() {
-					defer wg.Done()
-					defer func() { <-semaphore }()
-					reqCtx, cancel := context.WithTimeout(context.Background(), RequestTimeout)
-					defer cancel()
-					run(reqCtx, client)
-				}()
-			default:
-				_dropped.Add(1)
+			due := ticksDue(time.Since(start), interval)
+			for ; fired < due; fired++ {
+				// Отмена не ждёт окончания дозагона: контекст проверяется
+				// между тиками.
+				if ctx.Err() != nil {
+					return
+				}
+				select {
+				case semaphore <- struct{}{}:
+					wg.Add(1)
+					// Запрос выполняется с собственным сроком: начатая операция
+					// доводится до конца и после остановки генерации.
+					//nolint:contextcheck
+					go func() {
+						defer wg.Done()
+						defer func() { <-semaphore }()
+						reqCtx, cancel := context.WithTimeout(context.Background(), RequestTimeout)
+						defer cancel()
+						run(reqCtx, client)
+					}()
+				default:
+					_dropped.Add(1)
+				}
 			}
 		}
 	}
@@ -171,10 +221,71 @@ func generate(ctx context.Context, client *kvclient.KVClient, interval time.Dura
 // run выполняет одну операцию сценария нагрузки и учитывает её результат.
 func run(ctx context.Context, client *kvclient.KVClient) {
 	key := _keys[rand.Intn(len(_keys))]
-	if rand.Intn(100) < _values.GetPercent {
+	switch chooseOp(rand.Intn(100), _values.DeletePercent, _values.WeakGetPercent, _values.GetPercent) {
+	case opDelete:
+		del(ctx, client, key)
+	case opWeakGet:
+		weakGet(ctx, client, key)
+	case opGet:
 		get(ctx, client, key)
+	default:
+		put(ctx, client, key)
+	}
+}
+
+// chooseOp — лестница распределения операций. Полосы:
+// [0,d) DELETE; [d,d+w) WEAK-GET; [d+w,d+w+g) GET; остаток PUT.
+// При d+w+g > 100 усекается последняя достигнутая полоса
+// (при d>100 — DELETE, при d+w>100 — WEAK-GET, иначе GET),
+// последующие полосы и PUT пусты. Значения долей вне [0,100]
+// не поддерживаются: отрицательная доля сдвигает все
+// последующие границы вниз.
+func chooseOp(r, d, w, g int) opKind {
+	switch {
+	case r < d:
+		return opDelete
+	case r < d+w:
+		return opWeakGet
+	case r < d+w+g:
+		return opGet
+	default:
+		return opPut
+	}
+}
+
+// get выполняет сильное чтение через консенсус (как Put) и учитывает
+// его результат.
+func get(ctx context.Context, client *kvclient.KVClient, key string) {
+	start := time.Now()
+	_, _, err := client.ConsensusGet(ctx, key)
+	observe(_getLatency, time.Since(start))
+	_getDone.Add(1)
+	if err != nil {
+		_getFail.Add(1)
+		fmt.Printf("GET: %v\n", err)
 		return
 	}
+	_getOK.Add(1)
+}
+
+// weakGet выполняет слабое чтение (без записи в журнал) и учитывает его
+// результат.
+func weakGet(ctx context.Context, client *kvclient.KVClient, key string) {
+	start := time.Now()
+	_, _, err := client.WeakGet(ctx, key)
+	observe(_weakGetLatency, time.Since(start))
+	_weakGetDone.Add(1)
+	if err != nil {
+		_weakGetFail.Add(1)
+		fmt.Printf("WEAK GET: %v\n", err)
+		return
+	}
+	_weakGetOK.Add(1)
+}
+
+// put выполняет запись и учитывает её результат; после успешной записи с
+// вероятностью VerifyPercent перечитывает записанное значение.
+func put(ctx context.Context, client *kvclient.KVClient, key string) {
 	value := makeValue(key, _values.ValueSize)
 	start := time.Now()
 	_, _, err := client.Put(ctx, key, value)
@@ -191,27 +302,48 @@ func run(ctx context.Context, client *kvclient.KVClient) {
 	}
 }
 
-// get выполняет чтение и учитывает его результат.
-func get(ctx context.Context, client *kvclient.KVClient, key string) {
+// del выполняет удаление ключа и учитывает его результат; после успешного
+// удаления с вероятностью VerifyPercent перечитывает ключ.
+func del(ctx context.Context, client *kvclient.KVClient, key string) {
 	start := time.Now()
-	_, _, err := client.Get(ctx, key)
-	observe(_getLatency, time.Since(start))
-	_getDone.Add(1)
+	_, _, err := client.Delete(ctx, key)
+	observe(_deleteLatency, time.Since(start))
+	_deleteDone.Add(1)
 	if err != nil {
-		_getFail.Add(1)
-		fmt.Printf("GET: %v\n", err)
+		_deleteFail.Add(1)
+		fmt.Printf("DELETE: %v\n", err)
 		return
 	}
-	_getOK.Add(1)
+	_deleteOK.Add(1)
+	if rand.Intn(100) < _values.VerifyPercent {
+		verifyDelete(ctx, client, key)
+	}
 }
 
-// verify перечитывает записанное значение; время чтения учитывается как GET,
-// а сама операция — отдельным счётчиком. Расхождение значения не является
-// признаком ошибки сервиса: повторы клиента не идемпотентны.
+// verifyDelete перечитывает удалённый ключ слабым чтением; время чтения
+// учитывается как WEAK GET, а сама проверка — отдельным счётчиком.
+// Успех — ключ не найден без ошибки; наличие ключа после удаления требует
+// разбора и само по себе не означает отказа сервиса.
+func verifyDelete(ctx context.Context, client *kvclient.KVClient, key string) {
+	start := time.Now()
+	_, found, err := client.WeakGet(ctx, key)
+	observe(_weakGetLatency, time.Since(start))
+	_deleteVerifyDone.Add(1)
+	if !found && err == nil {
+		_deleteVerifyOK.Add(1)
+		return
+	}
+	_deleteVerifyBad.Add(1)
+}
+
+// verify перечитывает записанное значение слабым чтением; время
+// чтения учитывается как WEAK GET, а сама операция — отдельным
+// счётчиком. Расхождение значения не является признаком ошибки
+// сервиса: повторы клиента не идемпотентны.
 func verify(ctx context.Context, client *kvclient.KVClient, key, value string) {
 	start := time.Now()
-	got, found, err := client.Get(ctx, key)
-	observe(_getLatency, time.Since(start))
+	got, found, err := client.WeakGet(ctx, key)
+	observe(_weakGetLatency, time.Since(start))
 	_verifyDone.Add(1)
 	if err != nil || !found || got != value {
 		_verifyBad.Add(1)
@@ -247,9 +379,11 @@ func observe(recorder *latencyRecorder, elapsed time.Duration) {
 	}
 }
 
-// doneTotal — число завершённых операций всех видов.
+// doneTotal — число завершённых операций всех видов. Суммируются все шесть
+// счётчиков *Done: по одному на каждую выполненную операцию.
 func doneTotal() uint64 {
-	return _getDone.Load() + _putDone.Load() + _verifyDone.Load()
+	return _getDone.Load() + _putDone.Load() + _verifyDone.Load() +
+		_weakGetDone.Load() + _deleteDone.Load() + _deleteVerifyDone.Load()
 }
 
 // stats раз в секунду печатает достигнутую скорость и время ответа операций,
@@ -258,7 +392,7 @@ func stats(ctx context.Context) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	var prevDone uint64
-	var getOffset, putOffset int
+	var getOffset, putOffset, weakGetOffset, deleteOffset int
 	for {
 		select {
 		case <-ctx.Done():
@@ -267,22 +401,32 @@ func stats(ctx context.Context) {
 			done := doneTotal()
 			rps := done - prevDone
 			prevDone = done
+			_rps.record(rps)
 			getSamples, getTotal := _getLatency.from(getOffset)
 			putSamples, putTotal := _putLatency.from(putOffset)
+			weakGetSamples, weakGetTotal := _weakGetLatency.from(weakGetOffset)
+			deleteSamples, deleteTotal := _deleteLatency.from(deleteOffset)
 			getOffset, putOffset = getTotal, putTotal
-			recent := make([]time.Duration, 0, len(getSamples)+len(putSamples))
+			weakGetOffset, deleteOffset = weakGetTotal, deleteTotal
+			recent := make([]time.Duration, 0,
+				len(getSamples)+len(putSamples)+len(weakGetSamples)+len(deleteSamples))
 			recent = append(recent, getSamples...)
 			recent = append(recent, putSamples...)
+			recent = append(recent, weakGetSamples...)
+			recent = append(recent, deleteSamples...)
 			slices.Sort(recent)
 			slog.Info(fmt.Sprintf(
 				"RPS=%5d  p50=%7.2fms p80=%7.2fms p95=%7.2fms p99=%7.2fms"+
-					"  GET ok=%8d fail=%4d  PUT ok=%8d fail=%4d  VERIFY ok=%6d bad=%4d  _dropped=%6d",
+					"  GET ok=%8d fail=%4d  PUT ok=%8d fail=%4d  VERIFY ok=%6d bad=%4d"+
+					"  WEAK GET ok=%8d fail=%4d  DELETE ok=%8d fail=%4d  _dropped=%6d",
 				rps,
 				percentile(recent, 50), percentile(recent, 80),
 				percentile(recent, 95), percentile(recent, 99),
 				_getOK.Load(), _getFail.Load(),
 				_putOK.Load(), _putFail.Load(),
 				_verifyOK.Load(), _verifyBad.Load(),
+				_weakGetOK.Load(), _weakGetFail.Load(),
+				_deleteOK.Load(), _deleteFail.Load(),
 				_dropped.Load(),
 			))
 		}
@@ -294,22 +438,44 @@ func stats(ctx context.Context) {
 func summary() {
 	getSamples, _ := _getLatency.from(0)
 	putSamples, _ := _putLatency.from(0)
+	weakGetSamples, _ := _weakGetLatency.from(0)
+	deleteSamples, _ := _deleteLatency.from(0)
 	traceLevel := os.Getenv(_traceLogLevelEnv)
 	if traceLevel == "" {
 		traceLevel = "не задан"
 	}
+	d := _values.DeletePercent
+	w := _values.WeakGetPercent
+	g := _values.GetPercent
+	// Эффективные доли по формулам: каждая полоса не выходит за границы
+	// [0,100] с учётом уже занятых предыдущими полосами.
+	effectiveD := min(d, 100)
+	effectiveW := min(w, 100-effectiveD)
+	effectiveG := min(g, 100-effectiveD-effectiveW)
+	effectiveP := 100 - effectiveD - effectiveW - effectiveG
 	slog.Info(fmt.Sprintf(
-		"run: concurrency=%d request-rate=%d value-size=%d duration=%v %s=%s",
+		"run: concurrency=%d request-rate=%d value-size=%d duration=%v %s=%s"+
+			"  mix: delete=%d weak-get=%d get=%d put=%d (эффективные)",
 		_values.Concurrency, _values.RequestRate, _values.ValueSize,
 		_values.Duration, _traceLogLevelEnv, traceLevel,
+		effectiveD, effectiveW, effectiveG, effectiveP,
 	))
+	if d+w+g > 100 {
+		slog.Info("WARNING: сумма долей > 100 — последняя полоса усечена, PUT пуст")
+	}
 	slog.Info(fmt.Sprintf(
-		"done: get=%d put=%d verify=%d  GET ok=%d fail=%d  PUT ok=%d fail=%d"+
-			"  VERIFY ok=%d bad=%d  _dropped=%d _latencyDropped=%d",
+		"done: get=%d put=%d verify=%d weak-get=%d delete=%d delete-verify=%d"+
+			"  GET ok=%d fail=%d  PUT ok=%d fail=%d  VERIFY ok=%d bad=%d"+
+			"  WEAK GET ok=%d fail=%d  DELETE ok=%d fail=%d  DELETE-VERIFY ok=%d bad=%d"+
+			"  _dropped=%d _latencyDropped=%d",
 		_getDone.Load(), _putDone.Load(), _verifyDone.Load(),
+		_weakGetDone.Load(), _deleteDone.Load(), _deleteVerifyDone.Load(),
 		_getOK.Load(), _getFail.Load(),
 		_putOK.Load(), _putFail.Load(),
 		_verifyOK.Load(), _verifyBad.Load(),
+		_weakGetOK.Load(), _weakGetFail.Load(),
+		_deleteOK.Load(), _deleteFail.Load(),
+		_deleteVerifyOK.Load(), _deleteVerifyBad.Load(),
 		_dropped.Load(), _latencyDropped.Load(),
 	))
 	if bad := _verifyBad.Load(); bad > 0 {
@@ -321,8 +487,103 @@ func summary() {
 			bad,
 		))
 	}
+	if bad := _deleteVerifyBad.Load(); bad > 0 {
+		// Хеджированная формулировка: ключ прочитан после удаления — требует
+		// разбора; при DELETE_PERCENT>0 возможна гонка с параллельной записью
+		// того же ключа, поэтому расхождение не однозначно означает отказ.
+		slog.Info(fmt.Sprintf(
+			"_deleteVerifyBad=%d: key read after delete, needs review (parallel write may race at DELETE_PERCENT>0)",
+			bad,
+		))
+	}
 	slog.Info(latencyLine("GET", getSamples))
 	slog.Info(latencyLine("PUT", putSamples))
+	slog.Info(latencyLine("WEAK GET", weakGetSamples))
+	slog.Info(latencyLine("DELETE", deleteSamples))
+	// Первая секунда ряда исключается из статистики: стартовое окно
+	// установления соединений и несинхронного старта тикеров систематически
+	// занижает скорость, поэтому все шесть величин считаются по ряду
+	// без первого элемента.
+	series := _rps.snapshot()
+	if len(series) > 0 {
+		series = series[1:]
+	}
+	stats := computeRpsStats(series)
+	slog.Info(fmt.Sprintf(
+		"rps: seconds=%d mean=%.1f median=%.1f stddev=%.1f min=%d max=%d total=%d",
+		stats.seconds, stats.mean, stats.median, stats.stddev,
+		stats.min, stats.max, stats.total,
+	))
+	total := doneTotal()
+	var getShare, putShare, verifyShare, weakGetShare, deleteShare, deleteVerifyShare float64
+	if total > 0 {
+		getShare = 100 * float64(_getDone.Load()) / float64(total)
+		putShare = 100 * float64(_putDone.Load()) / float64(total)
+		verifyShare = 100 * float64(_verifyDone.Load()) / float64(total)
+		weakGetShare = 100 * float64(_weakGetDone.Load()) / float64(total)
+		deleteShare = 100 * float64(_deleteDone.Load()) / float64(total)
+		deleteVerifyShare = 100 * float64(_deleteVerifyDone.Load()) / float64(total)
+	}
+	slog.Info(fmt.Sprintf(
+		"ops: done=%d (get=%.1f%% put=%.1f%% verify=%.1f%% weak-get=%.1f%% delete=%.1f%% delete-verify=%.1f%%)",
+		total, getShare, putShare, verifyShare, weakGetShare, deleteShare, deleteVerifyShare,
+	))
+}
+
+// rpsStats — статистика посекундного ряда скорости операций: число секунд
+// ряда, среднее, медиана, выборочное стандартное отклонение, минимум,
+// максимум и сумма ряда.
+type rpsStats struct {
+	seconds int
+	mean    float64
+	median  float64
+	stddev  float64
+	min     uint64
+	max     uint64
+	total   uint64
+}
+
+// computeRpsStats вычисляет статистику посекундного ряда скорости операций.
+// Среднее — арифметическое; медиана — центральный элемент упорядоченного
+// ряда при нечётной длине и полусумма двух центральных при чётной;
+// стандартное отклонение — выборочное (делитель n−1), при n ≤ 1 равно нулю.
+// Пустой ряд даёт все нули.
+func computeRpsStats(values []uint64) rpsStats {
+	n := len(values)
+	if n == 0 {
+		return rpsStats{}
+	}
+	sorted := slices.Clone(values)
+	slices.Sort(sorted)
+	var total uint64
+	for _, value := range sorted {
+		total += value
+	}
+	mean := float64(total) / float64(n)
+	var median float64
+	if n%2 == 1 {
+		median = float64(sorted[n/2])
+	} else {
+		median = (float64(sorted[n/2-1]) + float64(sorted[n/2])) / 2
+	}
+	var stddev float64
+	if n > 1 {
+		var sumSquares float64
+		for _, value := range sorted {
+			diff := float64(value) - mean
+			sumSquares += diff * diff
+		}
+		stddev = math.Sqrt(sumSquares / float64(n-1))
+	}
+	return rpsStats{
+		seconds: n,
+		mean:    mean,
+		median:  median,
+		stddev:  stddev,
+		min:     sorted[0],
+		max:     sorted[n-1],
+		total:   total,
+	}
 }
 
 // latencyLine форматирует распределение времени ответа одного вида операций.
@@ -411,4 +672,35 @@ func (r *latencyRecorder) from(offset int) ([]time.Duration, int) {
 	tail := make([]time.Duration, total-offset)
 	copy(tail, r.samples[offset:])
 	return tail, total
+}
+
+// rpsSeries накапливает посекундные значения скорости операций за прогон.
+// Срез защищён мьютексом: единственный пишущий — горутина stats, единственный
+// читающий — summary после завершения прогона; мьютекс сохраняет единообразие
+// с накопителями времени ответа и защищает тесты, пишущие из нескольких
+// горутин.
+type rpsSeries struct {
+	mu     sync.Mutex
+	values []uint64
+}
+
+// newRpsSeries создаёт накопитель посекундного ряда скорости операций.
+func newRpsSeries() *rpsSeries {
+	return &rpsSeries{}
+}
+
+// record сохраняет очередное посекундное значение скорости операций.
+func (r *rpsSeries) record(value uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.values = append(r.values, value)
+}
+
+// snapshot возвращает копию накопленного ряда.
+func (r *rpsSeries) snapshot() []uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	values := make([]uint64, len(r.values))
+	copy(values, r.values)
+	return values
 }

@@ -5,13 +5,17 @@
 package redirect_test
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/fortytw2/leaktest"
 	"github.com/vskurikhin/raft"
+	"github.com/vskurikhin/raft/pkg/raft/store"
+	"github.com/vskurikhin/raft/pkg/raft/transp"
 )
 
 // traceLevel — порог трассировки бинарника. Задаётся явно: эмиттер
@@ -19,9 +23,20 @@ import (
 // а TraceConfig{} означает выключенную трассировку.
 const traceLevel = 1
 
+// traceTimeout — предельное время ожидания Flush/Shutdown в сценарии.
+const traceTimeout = 2 * time.Second
+
 func TestTraceRedirect(t *testing.T) {
-	// Порядок cleanup (LIFO): остановка CM → проверка leaktest.
+	// Порядок cleanup (LIFO): остановка CM → остановка писателя →
+	// проверка leaktest (обратен регистрации).
 	t.Cleanup(leaktest.CheckTimeout(t, raft.LeaktestBudget))
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), traceTimeout)
+		defer cancel()
+		if err := raft.ShutdownTrace(ctx); err != nil {
+			t.Errorf("ShutdownTrace: %v", err)
+		}
+	})
 
 	// err-path: вызов с недоступным путём ДО успешной конфигурации —
 	// ошибка I/O; окно конфигурации не расходуется.
@@ -61,8 +76,8 @@ func TestTraceRedirect(t *testing.T) {
 	}()
 	ready := make(chan any)
 	cm := raft.NewConsensusModule(
-		0, []int{}, raft.NewInmemTransport("trace-redirect"),
-		raft.NewMapStorage(), raft.NewCommitChannelFSM(commitCh), ready,
+		0, []int{}, transp.NewInmemTransport("trace-redirect"),
+		store.NewMapStorage(), raft.NewCommitChannelFSM(commitCh), ready,
 	)
 	close(ready)
 	t.Cleanup(func() {
@@ -81,6 +96,14 @@ func TestTraceRedirect(t *testing.T) {
 	// оставил порог непригодным для печати уровня 0 (иначе файл был бы
 	// пуст).
 	cm.Stop()
+
+	// Строка ставится в очередь асинхронно: границу записи задаёт
+	// Flush-маркер.
+	ctx, cancel := context.WithTimeout(context.Background(), traceTimeout)
+	defer cancel()
+	if err := raft.FlushTrace(ctx); err != nil {
+		t.Fatalf("FlushTrace: %v", err)
+	}
 
 	data, err := os.ReadFile(path)
 	if err != nil {

@@ -2,6 +2,8 @@ package raft
 
 import (
 	"testing"
+
+	"github.com/vskurikhin/raft/pkg/raft/store"
 )
 
 // Размер базового журнала ведомого во всех трёх формах бенчмарка и размер
@@ -25,7 +27,7 @@ const (
 // тестов обработчика и не содержит недостижимых сочетаний.
 func newAppendEntriesBenchCM(n int) *ConsensusModule {
 	cm := &ConsensusModule{}
-	cm.storage = NewMapStorage()
+	cm.storage = store.NewMapStorage()
 	cm.cmState.state = Follower
 	cm.cmState.currentTerm = 1
 	cm.cmState.votedFor = -1
@@ -43,6 +45,11 @@ func newAppendEntriesBenchCM(n int) *ConsensusModule {
 	cm.cmState.lastLogIndex = n
 	cm.cmState.lastLogTerm = 1
 	cm.cmState.termIndexMap = map[int]int{1: n}
+	// Хранилище приводится в соответствие памяти: журнал создаётся полной
+	// заменой, как после первого персиста. Состояние достижимо, и
+	// последующие замены суффикса не завершают процесс.
+	cm.storage.RewriteLog(cm.cmState.log)
+	cm.clearLogDirtyLocked()
 	return cm
 }
 

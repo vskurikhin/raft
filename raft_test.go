@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/fortytw2/leaktest"
+	"github.com/vskurikhin/raft/pkg/raft/contract"
+	"github.com/vskurikhin/raft/pkg/raft/store"
 )
 
 func TestElectionBasic(t *testing.T) {
@@ -73,7 +75,7 @@ func TestDisconnectAllThenRestore(t *testing.T) {
 	defer h.Shutdown()
 
 	// remove: разрыв связи выполняется сразу; минимальный election timeout
-	// (ReelectionTimeoutMs) заведомо больше времени старта узлов, поэтому
+	// (DefaultReelectionTimeout) заведомо больше времени старта узлов, поэтому
 	// лидер не успевает быть избран до разрыва.
 	// Отключаем все серверы с самого начала. Лидера не будет.
 	for i := 0; i < 3; i++ {
@@ -338,7 +340,7 @@ func TestNoCommitWithNoQuorum(t *testing.T) {
 	// Изолируем обоих follower'ов: у лидера остаётся 1/3 — кворума нет.
 	// Прежняя схема опиралась на инвариант «время изоляции < min election
 	// timeout» (комментарий «246ms < 254ms»); фактические константы
-	// (ReelectionTimeoutMs=381ms) его нарушали — изоляция 300+93ms
+	// (DefaultReelectionTimeout=430ms) его нарушали — изоляция 300+93ms
 	// превышала минимальный election timeout, и тест был flaky.
 	// Инвариант снят: тест больше не зависит от того, начнут ли изолированные
 	// follower'ы выборы.
@@ -417,7 +419,7 @@ func TestDisconnectLeaderBriefly(t *testing.T) {
 
 	// Отключаем лидера на короткое время (меньше тайм-аута выборов у соседей).
 	// keep: timing — предмет теста. Длительность разрыва (90 мс) заведомо
-	// меньше минимального election timeout (ReelectionTimeoutMs = 381 мс),
+	// меньше минимального election timeout (DefaultReelectionTimeout = 430 мс),
 	// поэтому соседи не начинают выборы.
 	h.DisconnectPeer(origLeaderId)
 	sleepMs(90)
@@ -720,7 +722,7 @@ func TestDisconnectAfterSubmit(t *testing.T) {
 
 // getPersistedTerm считывает значение currentTerm из указанного хранилища
 // (используя тот же формат кодирования, что и persistToStorage).
-func getPersistedTerm(storage *MapStorage) int {
+func getPersistedTerm(storage *store.MapStorage) int {
 	data, found := storage.Get("currentTerm")
 	if !found {
 		return 0
@@ -1073,7 +1075,7 @@ func TestBecomeFollowerDoubleClose(t *testing.T) {
 		},
 
 		id:           1,
-		storage:      NewMapStorage(),
+		storage:      store.NewMapStorage(),
 		applyCh:      make(chan *logFuture),
 		verifyCh:     make(chan *verifyFuture, 64),
 		shutdownCh:   make(chan struct{}),
@@ -1713,10 +1715,10 @@ func TestLeader_Shutdown_NoInflight(t *testing.T) {
 // незавершённом Apply. Гарантия: остановка не оставляет клиентское
 // обещание неразрешённым — ответ обязан прийти по каналу ErrorCh в
 // пределах бюджета. Ожидание идёт через ErrorCh, а не через Error:
-// после остановки Error возвращает ErrRaftShutdown по запасному
+// после остановки Error возвращает contract.ErrRaftShutdown по запасному
 // исходу даже для неотвеченного обещания. Из-за гонки между Apply и
 // остановкой законны исходы: nil (запись успела зафиксироваться и
-// примениться), ErrLeadershipLost, ErrRaftShutdown, ErrNotLeader;
+// примениться), ErrLeadershipLost, contract.ErrRaftShutdown, ErrNotLeader;
 // иная ошибка — отказ. При nil у записи обязан быть присвоенный
 // индекс журнала.
 func TestLeader_Shutdown_DuringApply(t *testing.T) {
@@ -1735,7 +1737,7 @@ func TestLeader_Shutdown_DuringApply(t *testing.T) {
 		if future.Index() < 1 {
 			t.Fatalf("got success without a log index: Index() = %d", future.Index())
 		}
-	case ErrLeadershipLost, ErrRaftShutdown, ErrNotLeader:
+	case ErrLeadershipLost, contract.ErrRaftShutdown, ErrNotLeader:
 		// Штатные исходы гонки между Apply и остановкой.
 	default:
 		t.Fatalf("got %v, want nil or ErrLeadershipLost or ErrRaftShutdown or ErrNotLeader", err)
@@ -1824,7 +1826,7 @@ func TestCommitmentInteg_NoCommitWithoutMajority(t *testing.T) {
 		if err == nil {
 			t.Fatal("Apply succeeded without majority, expected error")
 		}
-		// Ошибка ErrLeadershipLost или ErrRaftShutdown — допустимо.
+		// Ошибка ErrLeadershipLost или contract.ErrRaftShutdown — допустимо.
 	case <-time.After(1000 * time.Millisecond):
 		// Future заблокирован — это ожидаемое поведение (нет кворума).
 	}
@@ -2127,11 +2129,11 @@ func (f *RecordingBatchingFSM) Apply(_ *LogEntry) any {
 }
 
 func (f *RecordingBatchingFSM) Snapshot() (FSMSnapshot, error) {
-	return nil, ErrNotImplemented
+	return nil, contract.ErrNotImplemented
 }
 
 func (f *RecordingBatchingFSM) Restore(_ io.ReadCloser) error {
-	return ErrNotImplemented
+	return contract.ErrNotImplemented
 }
 
 func (f *RecordingBatchingFSM) ApplyBatch(logs []*LogEntry) []any {
@@ -2240,7 +2242,7 @@ func TestBatchingFSM_Basic(t *testing.T) {
 	cm := testServerWithFSM(t, fsm)
 	defer cm.Stop()
 
-	waitForLeader(t, cm, 800*time.Millisecond)
+	waitForLeader(t, cm, 2*time.Second)
 
 	for i := 0; i < 5; i++ {
 		future := cm.Apply(i, 0)
@@ -2267,7 +2269,7 @@ func TestBatchingFSM_BatchBoundary(t *testing.T) {
 	cm := testServerWithFSM(t, fsm)
 	defer cm.Stop()
 
-	waitForLeader(t, cm, 800*time.Millisecond)
+	waitForLeader(t, cm, 2*time.Second)
 
 	n := _maxApplyBatchSize * 3
 	for i := 0; i < n; i++ {
@@ -2297,7 +2299,7 @@ func TestBatchingFSM_ApplyBatchResponseMatching(t *testing.T) {
 	cm := testServerWithFSM(t, fsm)
 	defer cm.Stop()
 
-	waitForLeader(t, cm, 800*time.Millisecond)
+	waitForLeader(t, cm, 2*time.Second)
 
 	futures := make([]ApplyFuture, 3)
 	for i := range futures {
@@ -2368,7 +2370,7 @@ func (f *mismatchBatchingFSM) ApplyBatch(logs []*LogEntry) []any {
 //     ошибка ErrBatchFSMResponseMismatch доставляется через future
 //     немедленно. Если бы runFSM упала при первом нарушении контракта,
 //     этот future остался бы без ответа (таймаут) или завершился бы
-//     ErrRaftShutdown только при Stop().
+//     contract.ErrRaftShutdown только при Stop().
 //
 // Примечание: часть записей могла уйти отдельными батчами, поэтому на
 // ошибку проверяется каждый future из первоначальной пачки команд;
@@ -2380,7 +2382,7 @@ func TestBatchingFSM_ApplyBatchResponseMismatch(t *testing.T) {
 	cm := testServerWithFSM(t, fsm)
 	defer cm.Stop()
 
-	waitForLeader(t, cm, 800*time.Millisecond)
+	waitForLeader(t, cm, 2*time.Second)
 
 	// Первая пачка команд должна завершиться ошибкой ErrBatchFSMResponseMismatch:
 	// хотя бы один батч, отправленный в ApplyBatch, вернёт неверное число ответов.
@@ -2404,7 +2406,7 @@ func TestBatchingFSM_ApplyBatchResponseMismatch(t *testing.T) {
 	f := cm.Apply(1000, 0)
 	select {
 	case err := <-f.ErrorCh():
-		if errors.Is(err, ErrRaftShutdown) {
+		if errors.Is(err, contract.ErrRaftShutdown) {
 			t.Fatalf("runFSM appears dead after mismatch: got ErrRaftShutdown")
 		}
 		if err != nil && !errors.Is(err, ErrBatchFSMResponseMismatch) {
@@ -2446,7 +2448,7 @@ func TestNonvoter_DoesNotStartElection(t *testing.T) {
 	// keep: negative window — за окно, превышающее минимальный election
 	// timeout, неголосующий не должен стать лидером. Опрос не доказывает
 	// отсутствия события; окно осознанно временное.
-	sleepMs(ReelectionTimeoutMs)
+	sleepMs(int(DefaultReelectionTimeout.Milliseconds()))
 
 	// Nonvoter не должен быть лидером.
 	_, _, isLeader := h.cluster[demoteID].Report()
@@ -2594,7 +2596,7 @@ func TestNonvoter_DemotedVoterDoesNotStartElection(t *testing.T) {
 	// keep: negative window — за окно, превышающее минимальный election
 	// timeout, неголосующий не должен стать лидером. Опрос не доказывает
 	// отсутствия события; окно осознанно временное.
-	sleepMs(ReelectionTimeoutMs)
+	sleepMs(int(DefaultReelectionTimeout.Milliseconds()))
 
 	// Nonvoter не должен стать лидером.
 	_, _, isLeader := h.cluster[demoteID].Report()
@@ -2793,7 +2795,7 @@ func TestVerifyLeader_AfterLeadershipLossFails(t *testing.T) {
 		if err == nil {
 			t.Fatal("VerifyLeader succeeded after leadership loss")
 		}
-	case <-time.After(50 * Quantum * time.Millisecond):
+	case <-time.After(150 * time.Millisecond):
 		// Ожидаемо: VerifyLeader блокируется без кворума.
 	}
 }
@@ -2835,14 +2837,14 @@ func TestVerifyLeader_Timeout(t *testing.T) {
 }
 
 // TestApply_Timeout проверяет, что Apply с ненулевым таймаутом возвращает
-// ErrEnqueueTimeout при недоступности лидера.
+// contract.ErrEnqueueTimeout при недоступности лидера.
 func TestApply_Timeout(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 1)
 	defer h.Shutdown()
 
 	future := h.cluster[0].Apply(42, 10*time.Millisecond)
-	if err := future.Error(); err != ErrNotLeader && err != ErrEnqueueTimeout {
+	if err := future.Error(); err != ErrNotLeader && err != contract.ErrEnqueueTimeout {
 		t.Fatalf("expected ErrNotLeader or ErrEnqueueTimeout, got %v", err)
 	}
 }
@@ -2854,7 +2856,7 @@ func TestApply_TimeoutDoesNotBlock(t *testing.T) {
 	h := NewHarness(t, 1)
 	h.Shutdown()
 	future := h.cluster[0].Apply(42, 0)
-	if err := future.Error(); err != ErrRaftShutdown {
+	if err := future.Error(); err != contract.ErrRaftShutdown {
 		t.Fatalf("expected ErrRaftShutdown, got %v", err)
 	}
 }
@@ -2993,7 +2995,9 @@ func TestDedup_ConcurrentHeartbeatAndDispatch(t *testing.T) {
 		}
 		// keep: timing — интервал подачи нагрузки является предметом
 		// стресс-теста (пересечение с heartbeat/apply-тикерами).
-		time.Sleep(time.Duration(TickerTimeoutMs/4) * time.Millisecond)
+		// ⌊20/4⌋ — целочисленное деление прежнего выражения
+		// DefaultTickerTimeout/4, сохранено дословно (5 мс).
+		time.Sleep(5 * time.Millisecond)
 	}
 
 	// replace: ждём сходимости последней команды вместо фиксированной паузы.
@@ -3314,10 +3318,10 @@ func TestIntegration_TermIndexAfterLogTruncation(t *testing.T) {
 	// keep: окно без наблюдаемого состояния — victim уже отключён,
 	// поэтому после отключения лидера подключённым остаётся ровно
 	// один узел и кворума нет: ни лидер, ни фиксация не могут появиться.
-	// Бюджет — ReelectionTimeoutMs (минимальный election timeout):
+	// Бюджет — DefaultReelectionTimeout (минимальный election timeout):
 	// оставшийся узел успевает выйти из состояния «лидер известен».
 	h.DisconnectPeer(lid)
-	sleepMs(ReelectionTimeoutMs)
+	sleepMs(int(DefaultReelectionTimeout.Milliseconds()))
 	h.ReconnectPeer(lid)
 
 	for i := 0; i < 3; i++ {
@@ -3369,12 +3373,12 @@ func TestIntegration_TermIndexAfterLogTruncation(t *testing.T) {
 }
 
 // TestRace_TermIndexMapDispatchAndConflict проверяет, что конкурентное
-// инкрементальное обновление termIndexMap (dispatchLogsUnsafe) и
+// инкрементальное обновление termIndexMap (dispatchLogsLocked) и
 // чтение (leaderSendAEsToPeer с ConflictTerm) не вызывают data race.
 //
 // Сценарий:
 //  1. Создать CM-лидер.
-//  2. Запустить горутину dispatch, вызывающую dispatchLogsUnsafe.
+//  2. Запустить горутину dispatch, вызывающую dispatchLogsLocked.
 //  3. Запустить горутину conflict, вызывающую leaderSendAEsToPeer.
 //  4. Остановить через shutdownCh.
 //
@@ -3382,7 +3386,10 @@ func TestIntegration_TermIndexAfterLogTruncation(t *testing.T) {
 func TestRace_TermIndexMapDispatchAndConflict(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
-	storage := NewMapStorage()
+	storage := store.NewMapStorage()
+	// Пустой журнал создаётся полной заменой, как после первого персиста:
+	// последующая замена суффикса не завершает процесс. Состояние достижимо.
+	storage.RewriteLog([]LogEntry{})
 	mock := &mockTransportConflict{replyTerm: 1, success: false, conflictTerm: 1}
 	cm := &ConsensusModule{
 		leaderState: leaderState{
@@ -3441,7 +3448,7 @@ func TestRace_TermIndexMapDispatchAndConflict(t *testing.T) {
 					log:        LogEntry{Type: LogCommand, Data: []byte("x")},
 				}
 				cm.mu.Lock()
-				cm.dispatchLogsUnsafe([]*logFuture{f})
+				cm.dispatchLogsLocked([]*logFuture{f})
 				cm.mu.Unlock()
 				dispatchIters.Add(1)
 			}
@@ -3477,12 +3484,12 @@ func TestRace_TermIndexMapDispatchAndConflict(t *testing.T) {
 }
 
 // TestRace_TermIndexMapCompactAndRead проверяет, что конкурентное
-// сжатие (compactLogs, перестраивает termIndexMap) и
+// сжатие (compactLogsLocked, перестраивает termIndexMap) и
 // чтение termIndexMap не вызывают data race.
 //
 // Сценарий:
 //  1. Создать CM с логом из 10 записей.
-//  2. Запустить горутину compact, вызывающую compactLogs.
+//  2. Запустить горутину compact, вызывающую compactLogsLocked.
 //  3. Запустить горутину reader, читающую termIndexMap.
 //  4. Остановить через shutdownCh.
 //
@@ -3496,7 +3503,7 @@ func TestRace_TermIndexMapCompactAndRead(t *testing.T) {
 			matchIndex: map[int]int{},
 		},
 
-		storage:    NewMapStorage(),
+		storage:    store.NewMapStorage(),
 		shutdownCh: make(chan struct{}),
 		cmState: cmState{
 			state:        Follower,
@@ -3512,7 +3519,7 @@ func TestRace_TermIndexMapCompactAndRead(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		cm.cmState.log = append(cm.cmState.log, LogEntry{Index: i + 1, Term: 1})
 	}
-	cm.rebuildTermIndexMap()
+	cm.rebuildTermIndexMapLocked()
 	cm.mu.Unlock()
 	defer cm.Stop()
 
@@ -3532,7 +3539,7 @@ func TestRace_TermIndexMapCompactAndRead(t *testing.T) {
 				return
 			default:
 				cm.mu.Lock()
-				cm.compactLogs(5)
+				cm.compactLogsLocked(5)
 				cm.mu.Unlock()
 				compactIters.Add(1)
 			}

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/fortytw2/leaktest"
+	"github.com/vskurikhin/raft/pkg/raft/store"
 )
 
 // Тесты счётчиков verify-запросов: verifyCompleted (знаменатель доли
@@ -160,7 +161,7 @@ func TestVerifyCounters_MultiplePending(t *testing.T) {
 // Механизм: verify-запрос, поставленный в момент, когда соседу уже летит
 // AppendEntries, не получает голоса от этого AppendEntries (ответ имеет старую
 // эпоху) и без перерассылки ждал бы ближайшего пульса — до
-// HeartbeatTimeoutMs = 33 мс. Перерассылка в defer горутины репликации
+// DefaultHeartbeatTimeout = 33 мс. Перерассылка в defer горутины репликации
 // отправляет свежий AppendEntries с новой эпохой сразу после снятия флага,
 // не меняя ни одного правила кворума.
 
@@ -199,7 +200,7 @@ func newRedispatchLeaderCM(transport Transport) *ConsensusModule {
 		confChangeCh:       make(chan *configurationChangeFuture, 1),
 		verifyCh:           make(chan *verifyFuture, 64),
 		checkQuorumTimeout: time.Hour,
-		storage:            NewMapStorage(),
+		storage:            store.NewMapStorage(),
 		fsm:                NewCommitChannelFSM(make(chan CommitEntry)),
 		leaderState: leaderState{
 			nextIndex:              map[int]int{1: 1},
@@ -239,6 +240,10 @@ func newRedispatchLeaderCM(transport Transport) *ConsensusModule {
 	cm.leaderState.inflightAE[1].Store(false)
 	cm.leaderState.commitmentTracker = newCommitmentTracker(cm.id, 1, 0, cm.commitCh)
 	cm.leaderState.commitmentTracker.setConfiguration([]int{0, 1}, cm.lookupTermLocked)
+	// Хранилище приводится в соответствие памяти: журнал создаётся полной
+	// заменой, как после первого персиста. Состояние достижимо.
+	cm.storage.RewriteLog(cm.cmState.log)
+	cm.clearLogDirtyLocked()
 	return cm
 }
 
@@ -327,7 +332,7 @@ func waitFor(t *testing.T, desc string, budget time.Duration, cond func() bool) 
 
 // TestVerifyRedispatch_AC1_CompletesBeforeHeartbeat — главный тайминговый
 // критерий AC-1: VerifyLeader, поставленный в момент активной горутины
-// репликации соседа, завершается быстрее HeartbeatTimeoutMs благодаря
+// репликации соседа, завершается быстрее DefaultHeartbeatTimeout благодаря
 // немедленной перерассылке.
 //
 // Сценарий:
@@ -371,7 +376,7 @@ func TestVerifyRedispatch_AC1_CompletesBeforeHeartbeat(t *testing.T) {
 	})
 	// Детерминизм против пульса: фиксируем счётчик тиков в момент постановки
 	// запроса и дожидаемся, чтобы после неё прошёл полный тик пульса.
-	// Ближайший пульс после него будет на расстоянии ~HeartbeatTimeoutMs,
+	// Ближайший пульс после него будет на расстоянии ~DefaultHeartbeatTimeout,
 	// поэтому без перерассылки запрос завершился бы за ~33 мс (порог 20 мс
 	// нарушен), а перерассылка завершает его за микросекунды ещё до
 	// следующего пульса.
@@ -706,9 +711,15 @@ func TestVerifyRedispatch_AECounter(t *testing.T) {
 	if got := cm.counters.aeSentPerPeer[1]; got != 1 {
 		t.Fatalf("aeSentPerPeer[1] = %d, want 1", got)
 	}
-	rep := cm.countersReport()
+	// Строка счётчиков собирается из согласованного снимка: чтение
+	// защищённых полей под cm.mu, форматирование — вне блокировки.
+	// stats у этого CM не запущена, поэтому прямой снимок безопасен.
+	cm.mu.Lock()
+	snap := cm.countersSnapshotLocked()
+	cm.mu.Unlock()
+	rep := snap.report()
 	if !strings.Contains(rep, "AESent=1") {
-		t.Fatalf("countersReport не содержит AESent=1: %q", rep)
+		t.Fatalf("counters report не содержит AESent=1: %q", rep)
 	}
 }
 
@@ -1119,7 +1130,7 @@ func TestVerifyLeader_TwoNodes_FollowerDownNoQuorum(t *testing.T) {
 	select {
 	case err := <-future.ErrorCh():
 		t.Fatalf("VerifyLeader confirmed without follower ack (err=%v)", err)
-	case <-time.After(HeartbeatTimeoutMs * 5 * time.Millisecond):
+	case <-time.After(5 * DefaultHeartbeatTimeout):
 	}
 
 	h.ReconnectPeer(follower)
@@ -1156,7 +1167,7 @@ func TestVerifyLeader_FourNodes_OneFollowerNotEnough(t *testing.T) {
 	select {
 	case err := <-future.ErrorCh():
 		t.Fatalf("VerifyLeader confirmed with 2/4 votes (err=%v)", err)
-	case <-time.After(HeartbeatTimeoutMs * 5 * time.Millisecond):
+	case <-time.After(5 * DefaultHeartbeatTimeout):
 	}
 
 	// Подключить второго follower'а — 3/4 = кворум.
@@ -1241,7 +1252,7 @@ func TestVerifyLeader_NonvoterAckDoesNotVote(t *testing.T) {
 	select {
 	case err := <-future.ErrorCh():
 		t.Fatalf("VerifyLeader confirmed by nonvoter acks (err=%v)", err)
-	case <-time.After(HeartbeatTimeoutMs * 5 * time.Millisecond):
+	case <-time.After(5 * DefaultHeartbeatTimeout):
 	}
 }
 
@@ -1650,8 +1661,8 @@ func TestVerifyLeader_NoVoteOnFailureAndSnapshotPath(t *testing.T) {
 		// на снимок состояние репликации не изменяет: проверяется только
 		// отсутствие голоса.
 		mock := &mockTransportAE{replyTerm: 1, installReplyTermSet: true, installReplyTerm: 0}
-		store := NewInmemSnapshotStore()
-		sink, err := store.Create(3, 1, Configuration{}, 0)
+		stor := store.NewInmemSnapshot()
+		sink, err := stor.Create(3, 1, 0, Configuration{})
 		if err != nil {
 			t.Fatalf("Create failed: %v", err)
 		}
@@ -1663,7 +1674,7 @@ func TestVerifyLeader_NoVoteOnFailureAndSnapshotPath(t *testing.T) {
 		}
 		// prev = nextIndex-1 = 4 попадает в дыру между границей снимка (3)
 		// и первой записью журнала (5) — отправляется снимок.
-		cm, vf := newCM(mock, store, 3, 5, []LogEntry{{Index: 5, Term: 1}})
+		cm, vf := newCM(mock, stor, 3, 5, []LogEntry{{Index: 5, Term: 1}})
 
 		cm.leaderSendAEsToPeer(1, 1, 0, true)
 

@@ -5,13 +5,14 @@ import (
 	"time"
 
 	"github.com/fortytw2/leaktest"
+	"github.com/vskurikhin/raft/pkg/raft/store"
 )
 
 // newAEDurabilityCM собирает ведомого с постоянным хранилищем в каталоге dir
 // и сохраняет исходное состояние на диск, чтобы последующие записи можно было
 // считать от установившейся точки.
-func newAEDurabilityCM(dir string) (*ConsensusModule, *FileStorage) {
-	storage := NewFileStorage(dir)
+func newAEDurabilityCM(dir string) (*ConsensusModule, *store.FileStorage) {
+	storage := store.NewFileStorage(dir)
 	cm := &ConsensusModule{storage: storage}
 	cm.cmState.state = Follower
 	cm.cmState.currentTerm = 1
@@ -24,8 +25,10 @@ func newAEDurabilityCM(dir string) (*ConsensusModule, *FileStorage) {
 	cm.cmState.lastApplied = -1
 	cm.cmState.fsmAppliedIndex = -1
 	cm.cmState.termIndexMap = make(map[int]int)
-	cm.cmState.logNeedsPersist = true
-	cm.persistToStorage()
+	cm.markLogRewriteDirtyLocked()
+	cm.mu.Lock()
+	cm.persistToStorageLocked(persistSourceTest)
+	cm.mu.Unlock()
 	return cm, storage
 }
 
@@ -60,12 +63,10 @@ func aeArgs(prevLogIndex, prevLogTerm, leaderCommit int, entries []LogEntry) App
 // журнал, фактически лежащий на диске.
 func readLogFromDisk(t *testing.T, dir string) []LogEntry {
 	t.Helper()
-	data, ok := NewFileStorage(dir).Get("log")
-	if !ok {
-		t.Fatal("key log not found on disk")
+	log, err := store.NewFileStorage(dir).LoadLog()
+	if err != nil {
+		t.Fatalf("LoadLog: %v", err)
 	}
-	var log []LogEntry
-	gobDecode(t, data, &log)
 	return log
 }
 
@@ -152,7 +153,7 @@ func TestAppendEntries_HeartbeatNoWrites(t *testing.T) {
 	dir := t.TempDir()
 	cm, storage := newAEDurabilityCM(dir)
 
-	before := storage.writeCount()
+	before := storage.WriteCount()
 	var reply AppendEntriesReply
 	if err := cm.AppendEntries(aeArgs(-1, -1, -1, nil), &reply); err != nil {
 		t.Fatalf("AppendEntries: %v", err)
@@ -160,7 +161,7 @@ func TestAppendEntries_HeartbeatNoWrites(t *testing.T) {
 	if !reply.Success {
 		t.Fatal("reply.Success = false, want true")
 	}
-	if got := storage.writeCount() - before; got != 0 {
+	if got := storage.WriteCount() - before; got != 0 {
 		t.Fatalf("%d writes on heartbeat, want 0", got)
 	}
 }
@@ -172,12 +173,12 @@ func TestAppendEntries_SingleWriteWithCommitAdvance(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	dir := t.TempDir()
-	cm, storage := newAEDurabilityCM(dir)
+	cm, _ := newAEDurabilityCM(dir)
 	startAEDurabilityFSM(t, cm)
 	defer close(cm.shutdownCh)
 
 	entries := []LogEntry{{Index: 0, Term: 1, Type: LogCommand, Data: "k0=v0"}}
-	before := storage.writeCount()
+	beforeJournal := journalWritesOf(cm)
 	var reply AppendEntriesReply
 	if err := cm.AppendEntries(aeArgs(-1, -1, 0, entries), &reply); err != nil {
 		t.Fatalf("AppendEntries: %v", err)
@@ -185,7 +186,7 @@ func TestAppendEntries_SingleWriteWithCommitAdvance(t *testing.T) {
 	if !reply.Success {
 		t.Fatal("reply.Success = false, want true")
 	}
-	if got := storage.writeCount() - before; got != 1 {
-		t.Fatalf("%d writes on AppendEntries with commit advance, want 1", got)
+	if got := journalWritesOf(cm) - beforeJournal; got != 1 {
+		t.Fatalf("%d journal writes on AppendEntries with commit advance, want 1", got)
 	}
 }

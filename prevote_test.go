@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/fortytw2/leaktest"
+	"github.com/vskurikhin/raft/pkg/raft/contract"
+	"github.com/vskurikhin/raft/pkg/raft/store"
 )
 
 // --- Pre-Vote: защита от лишних выборов при сетевых сбоях (§4) ---
@@ -41,7 +43,7 @@ func TestPreVote_DisconnectedFollower_NoElection(t *testing.T) {
 	h.DisconnectPeer(otherID)
 
 	// keep: budgeted negative window — проверяется, что за целый
-	// worst-case election timeout (_maxElectionTimeout = 2*ReelectionTimeoutMs)
+	// worst-case election timeout (_maxElectionTimeout = 2*DefaultReelectionTimeout)
 	// отключённый узел НЕ увеличил term и не сменил лидера. Опрос
 	// не доказывает отсутствия события — окно осознанно временное;
 	// его уменьшение ослабило бы assert.
@@ -179,8 +181,8 @@ func TestPreVote_Disabled(t *testing.T) {
 
 	// Pre-Vote отключается на всех узлах кластера через опцию Harness
 	// ДО close(ready) — до старта фоновых горутин (никакой
-	// post-start мутации конфигурации). TickerTimeoutMs = 7*Quantum =
-	// 21ms — первый tick election timer не успевает сработать раньше.
+	// post-start мутации конфигурации). DefaultTickerTimeout = 20ms —
+	// первый tick election timer не успевает сработать раньше.
 	h := NewHarnessWithOptions(t, 3, DisablePreVote())
 	defer h.Shutdown()
 
@@ -251,7 +253,7 @@ func TestPreVote_CandidateRetry(t *testing.T) {
 	cm := &ConsensusModule{
 		id:         0,
 		transport:  &mockPreVoteGrant{peerTerm: 2},
-		storage:    NewMapStorage(),
+		storage:    store.NewMapStorage(),
 		shutdownCh: make(chan struct{}),
 		cmState: cmState{
 			state:              Candidate,
@@ -302,7 +304,7 @@ func newPreVoteTestCM(transport Transport, term int) *ConsensusModule {
 	cm := &ConsensusModule{
 		id:         0,
 		transport:  transport,
-		storage:    NewMapStorage(),
+		storage:    store.NewMapStorage(),
 		shutdownCh: make(chan struct{}),
 		cmState: cmState{
 			state:              Follower,
@@ -380,13 +382,13 @@ func (m *refusingPreVoteTransport) RequestVote(_ ServerID, _ RequestVoteArgs) (R
 }
 
 // notImplementedPreVoteTransport — транспорт, чей RequestPreVote возвращает
-// ErrNotImplemented: ошибка засчитывается как выданный голос.
+// contract.ErrNotImplemented: ошибка засчитывается как выданный голос.
 type notImplementedPreVoteTransport struct {
 	Transport
 }
 
 func (m *notImplementedPreVoteTransport) RequestPreVote(_ ServerID, _ RequestPreVoteArgs) (RequestPreVoteReply, error) {
-	return RequestPreVoteReply{}, ErrNotImplemented
+	return RequestPreVoteReply{}, contract.ErrNotImplemented
 }
 
 func (m *notImplementedPreVoteTransport) RequestVote(_ ServerID, _ RequestVoteArgs) (RequestVoteReply, error) {
@@ -397,7 +399,7 @@ func (m *notImplementedPreVoteTransport) RequestVote(_ ServerID, _ RequestVoteAr
 // pre-vote: транспорт блокирует RequestPreVote, ответы не приходят, и select
 // выходит по кейсу таймаута. Узел завершает в Follower с неизменённым
 // currentTerm (pre-vote терм не инкрементирует), а переход занимает не менее
-// ReelectionTimeoutMs — это отличает ветку таймаута от ветки потери.
+// DefaultReelectionTimeout — это отличает ветку таймаута от ветки потери.
 func TestPreVote_CollectTimeout_StepsDownToFollower(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
@@ -416,15 +418,15 @@ func TestPreVote_CollectTimeout_StepsDownToFollower(t *testing.T) {
 	if cm.cmState.currentTerm != 2 {
 		t.Fatalf("currentTerm = %d after pre-vote timeout, want 2 (pre-vote must not increment term)", cm.cmState.currentTerm)
 	}
-	if elapsed < time.Duration(ReelectionTimeoutMs)*time.Millisecond {
-		t.Fatalf("step-down via pre-vote timeout took %v, want >= %v", elapsed, time.Duration(ReelectionTimeoutMs)*time.Millisecond)
+	if elapsed < time.Duration(DefaultReelectionTimeout) {
+		t.Fatalf("step-down via pre-vote timeout took %v, want >= %v", elapsed, time.Duration(DefaultReelectionTimeout))
 	}
 }
 
 // TestPreVote_QuorumLost_StepsDownToFollower пинирует пост-select проверку
 // потери: транспорт отвечает отказом всем соседям, все ответы приходят,
 // votersResponded достигает totalVoters, и шаг вниз выполняет проверка потери,
-// а не кейс таймаута. Переход происходит строго быстрее ReelectionTimeoutMs —
+// а не кейс таймаута. Переход происходит строго быстрее DefaultReelectionTimeout —
 // без этой границы тест не отличает ветку потери от ветки таймаута.
 func TestPreVote_QuorumLost_StepsDownToFollower(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
@@ -442,13 +444,13 @@ func TestPreVote_QuorumLost_StepsDownToFollower(t *testing.T) {
 	if cm.cmState.currentTerm != 2 {
 		t.Fatalf("currentTerm = %d after pre-vote loss, want 2 (pre-vote must not increment term)", cm.cmState.currentTerm)
 	}
-	if elapsed >= time.Duration(ReelectionTimeoutMs)*time.Millisecond {
-		t.Fatalf("step-down via quorum loss took %v, want strictly faster than %v", elapsed, time.Duration(ReelectionTimeoutMs)*time.Millisecond)
+	if elapsed >= time.Duration(DefaultReelectionTimeout) {
+		t.Fatalf("step-down via quorum loss took %v, want strictly faster than %v", elapsed, time.Duration(DefaultReelectionTimeout))
 	}
 }
 
 // TestPreVote_ErrNotImplemented_Granted пинирует грант pre-vote при
-// ErrNotImplemented: транспорт, не поддерживающий PreVote, засчитывает голос
+// contract.ErrNotImplemented: транспорт, не поддерживающий PreVote, засчитывает голос
 // предоставленным. Узел переходит к выборам — состояние становится Candidate
 // (или Leader), currentTerm инкрементирован на 1.
 func TestPreVote_ErrNotImplemented_Granted(t *testing.T) {

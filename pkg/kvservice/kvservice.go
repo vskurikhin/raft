@@ -17,6 +17,7 @@ import (
 
 	"github.com/vskurikhin/raft"
 	"github.com/vskurikhin/raft/pkg/api"
+	"github.com/vskurikhin/raft/pkg/raft/transp"
 )
 
 // _traceKV — порог детализации отладочных сообщений KV-сервиса (traceLogf).
@@ -87,9 +88,9 @@ func SetTrace(cfg TraceConfig) error {
 	return nil
 }
 
-// _requestTimeout — таймаут для Apply-операций (PUT, CAS).
+// _requestTimeout — таймаут для Apply-операций (PUT, CAS, DELETE, GET).
 // Если за это время не удалось отправить команду в applyCh лидера,
-// возвращается ErrEnqueueTimeout.
+// возвращается contract.ErrEnqueueTimeout.
 const _requestTimeout = 10 * time.Second
 
 // _httpShutdownTimeout — тайм-аут плавной остановки HTTP-сервера
@@ -172,7 +173,7 @@ func New(cfg *Config, readyChan <-chan any) *KVService {
 	// KVService передаётся как FSM, поэтому Apply будет вызываться Raft'ом
 	// для каждой зафиксированной записи.
 	rs := raft.New(&cfg.Config, readyChan)
-	rs.Serve(cfg.RPCAddress)
+	rs.Serve()
 	kvs.rs = rs
 
 	return kvs
@@ -180,21 +181,28 @@ func New(cfg *Config, readyChan <-chan any) *KVService {
 
 // NewKVService создаёт новый экземпляр KVService.
 //
-//   - address - адрес, который будет слушать Raft сервер.
+//   - address - адрес, который будет слушать Raft сервер; используется
+//     для создания TCP-транспорта.
 //   - id — идентификатор данного сервиса в кластере Raft.
 //   - peerIds — идентификаторы остальных узлов Raft в кластере.
-//   - storage — реализация интерфейса raft.Storage, используемая сервисом
+//   - storage — реализация интерфейса raft.LogStorage, используемая сервисом
 //     для долговременного хранения и сохранения своего состояния.
 //   - readyChan — канал уведомления, который должен быть закрыт после того,
 //     как кластер Raft будет готов к работе (все узлы запущены и соединены
 //     друг с другом).
-func NewKVService(address string, id int, peerIds []int, storage raft.Storage, readyChan <-chan any) *KVService {
+func NewKVService(address string, id int, peerIds []int, storage raft.LogStorage, readyChan <-chan any) *KVService {
+	// Нулевая структура TCPTimeouts означает использование значений по умолчанию для транспорта:
+	// конструктор подставляет вместо нулевых полей соответствующие константы из contract.
+	transport, err := transp.NewTCPTransport(address, transp.TCPTimeouts{}, 0)
+	if err != nil {
+		log.Fatalf("kvservice: failed to create TCP transport on %s: %v", address, err)
+	}
 	return New(&Config{
 		Config: raft.Config{
-			RPCAddress: address,
-			ServerID:   id,
-			PeerIds:    peerIds,
-			Storage:    storage,
+			ServerID:  id,
+			PeerIds:   peerIds,
+			Storage:   storage,
+			Transport: transport,
 		},
 	}, readyChan,
 	)
@@ -217,6 +225,8 @@ func (kvs *KVService) Apply(log *raft.LogEntry) any {
 		cmd.ResultValue, cmd.ResultFound = kvs.ds.Put(cmd.Key, cmd.Value)
 	case CommandCAS:
 		cmd.ResultValue, cmd.ResultFound = kvs.ds.CAS(cmd.Key, cmd.CompareValue, cmd.Value)
+	case CommandDelete:
+		cmd.ResultValue, cmd.ResultFound = kvs.ds.Delete(cmd.Key)
 	default:
 		kvs.traceLogf("unknown command kind %v", cmd.Kind)
 		return nil
@@ -294,10 +304,12 @@ func (kvs *KVService) ServeHTTP(address string) error {
 		return fmt.Errorf("kvservice %d: ServeHTTP called with existing server", kvs.id)
 	}
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /verifyleader/", kvs.handleVerifyLeader)
+	mux.HandleFunc("GET /weak-get/{key...}", kvs.handleWeakGet)
+	mux.HandleFunc("POST /cas/", kvs.handleCAS)
+	mux.HandleFunc("POST /delete/", kvs.handleDelete)
 	mux.HandleFunc("POST /get/", kvs.handleGet)
 	mux.HandleFunc("POST /put/", kvs.handlePut)
-	mux.HandleFunc("POST /cas/", kvs.handleCAS)
-	mux.HandleFunc("POST /verifyleader/", kvs.handleVerifyLeader)
 
 	ln, err := net.Listen("tcp", address)
 	if err != nil {
@@ -379,7 +391,7 @@ func (kvs *KVService) ToggleHTTPResponsesEnabled(enable bool) {
 // и используются для моделирования различных сбоев.
 
 func (kvs *KVService) ConnectToRaftPeer(peerID int, addr net.Addr) error {
-	return kvs.rs.ConnectToPeerWithTimeout(peerID, addr, 2*raft.Quantum*time.Second)
+	return kvs.rs.ConnectToPeer(peerID, addr)
 }
 
 func (kvs *KVService) DisconnectFromAllRaftPeers() {
@@ -401,6 +413,10 @@ func (kvs *KVService) sendHTTPResponse(w http.ResponseWriter, v any) {
 }
 
 func (kvs *KVService) handleVerifyLeader(w http.ResponseWriter, _ *http.Request) {
+	// Вердикт о лидерстве актуален только на момент кворумного
+	// подтверждения ReadIndex — запрещаем хранение ответа кешами.
+	w.Header().Set("Cache-Control", "no-store")
+
 	// ReadIndex-проверка лидерства (Raft §8) без записи в журнал.
 	if err := kvs.rs.VerifyLeader().Error(); err != nil {
 		kvs.sendHTTPResponse(w, api.StatusResponse{RespStatus: api.StatusNotLeader})
@@ -409,66 +425,20 @@ func (kvs *KVService) handleVerifyLeader(w http.ResponseWriter, _ *http.Request)
 	kvs.sendHTTPResponse(w, api.StatusResponse{RespStatus: api.StatusOK})
 }
 
-func (kvs *KVService) handlePut(w http.ResponseWriter, req *http.Request) {
+func (kvs *KVService) handleWeakGet(w http.ResponseWriter, req *http.Request) {
 	start := time.Now()
-	pr := &api.PutRequest{}
+	gr := &api.GetRequest{Key: req.PathValue("key")}
 	defer func() {
 		elapsed := time.Since(start)
-		kvs.traceLogf("HTTP PUT %v took %v", pr, elapsed)
+		if _traceKV > 0 {
+			kvs.traceLogf("HTTP WEAK-GET %v took %v", gr, elapsed)
+		}
 	}()
 
-	if err := readRequestJSON(req, pr); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	cmd := Command{
-		Kind:  CommandPut,
-		Key:   pr.Key,
-		Value: pr.Value,
-		ID:    kvs.id,
-	}
-
-	future := kvs.rs.Apply(cmd, _requestTimeout)
-
-	select {
-	case err := <-future.ErrorCh():
-		if err != nil {
-			kvs.sendHTTPResponse(w, api.PutResponse{
-				RespStatus: api.StatusNotLeader,
-			})
-			return
-		}
-		cmdResp, ok := future.Response().(Command)
-		if !ok {
-			kvs.sendHTTPResponse(w, api.PutResponse{
-				RespStatus: api.StatusInvalid,
-			})
-			return
-		}
-		kvs.sendHTTPResponse(w, api.PutResponse{
-			RespStatus: api.StatusOK,
-			KeyFound:   cmdResp.ResultFound,
-			PrevValue:  cmdResp.ResultValue,
-		})
-
-	case <-req.Context().Done():
-		return
-	}
-}
-
-func (kvs *KVService) handleGet(w http.ResponseWriter, req *http.Request) {
-	start := time.Now()
-	gr := &api.GetRequest{}
-	defer func() {
-		elapsed := time.Since(start)
-		kvs.traceLogf("HTTP GET %v took %v", gr, elapsed)
-	}()
-
-	if err := readRequestJSON(req, gr); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
+	// GET семантически кешируем: значение слабого чтения актуально
+	// только на момент подтверждения лидерства — запрещаем хранение
+	// ответа промежуточными кешами.
+	w.Header().Set("Cache-Control", "no-store")
 
 	// ReadIndex: подтверждение лидерства без записи в raft-журнал (Raft §8).
 	future := kvs.rs.VerifyLeader()
@@ -498,7 +468,9 @@ func (kvs *KVService) handleCAS(w http.ResponseWriter, req *http.Request) {
 	cr := &api.CASRequest{}
 	defer func() {
 		elapsed := time.Since(start)
-		kvs.traceLogf("HTTP CAS %v took %v", cr, elapsed)
+		if _traceKV > 0 {
+			kvs.traceLogf("HTTP CAS %v took %v", cr, elapsed)
+		}
 	}()
 
 	if err := readRequestJSON(req, cr); err != nil {
@@ -532,6 +504,154 @@ func (kvs *KVService) handleCAS(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 		kvs.sendHTTPResponse(w, api.CASResponse{
+			RespStatus: api.StatusOK,
+			KeyFound:   cmdResp.ResultFound,
+			PrevValue:  cmdResp.ResultValue,
+		})
+
+	case <-req.Context().Done():
+		return
+	}
+}
+
+func (kvs *KVService) handleDelete(w http.ResponseWriter, req *http.Request) {
+	start := time.Now()
+	dr := &api.DeleteRequest{}
+	defer func() {
+		elapsed := time.Since(start)
+		if _traceKV > 0 {
+			kvs.traceLogf("HTTP DELETE %v took %v", dr, elapsed)
+		}
+	}()
+
+	if err := readRequestJSON(req, dr); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	cmd := Command{
+		Kind: CommandDelete,
+		Key:  dr.Key,
+		ID:   kvs.id,
+	}
+
+	future := kvs.rs.Apply(cmd, _requestTimeout)
+
+	select {
+	case err := <-future.ErrorCh():
+		if err != nil {
+			kvs.sendHTTPResponse(w, api.DeleteResponse{
+				RespStatus: api.StatusNotLeader,
+			})
+			return
+		}
+		cmdResp, ok := future.Response().(Command)
+		if !ok {
+			kvs.sendHTTPResponse(w, api.DeleteResponse{
+				RespStatus: api.StatusInvalid,
+			})
+			return
+		}
+		kvs.sendHTTPResponse(w, api.DeleteResponse{
+			RespStatus: api.StatusOK,
+			KeyFound:   cmdResp.ResultFound,
+			PrevValue:  cmdResp.ResultValue,
+		})
+
+	case <-req.Context().Done():
+		return
+	}
+}
+
+func (kvs *KVService) handleGet(w http.ResponseWriter, req *http.Request) {
+	start := time.Now()
+	gr := &api.GetRequest{}
+	defer func() {
+		elapsed := time.Since(start)
+		if _traceKV > 0 {
+			kvs.traceLogf("HTTP GET %v took %v", gr, elapsed)
+		}
+	}()
+
+	if err := readRequestJSON(req, gr); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	cmd := Command{
+		Kind: CommandGet,
+		Key:  gr.Key,
+		ID:   kvs.id,
+	}
+
+	future := kvs.rs.Apply(cmd, _requestTimeout)
+
+	select {
+	case err := <-future.ErrorCh():
+		if err != nil {
+			kvs.sendHTTPResponse(w, api.GetResponse{
+				RespStatus: api.StatusNotLeader,
+			})
+			return
+		}
+		cmdResp, ok := future.Response().(Command)
+		if !ok {
+			kvs.sendHTTPResponse(w, api.GetResponse{
+				RespStatus: api.StatusInvalid,
+			})
+			return
+		}
+		kvs.sendHTTPResponse(w, api.GetResponse{
+			RespStatus: api.StatusOK,
+			KeyFound:   cmdResp.ResultFound,
+			Value:      cmdResp.ResultValue,
+		})
+
+	case <-req.Context().Done():
+		return
+	}
+}
+
+func (kvs *KVService) handlePut(w http.ResponseWriter, req *http.Request) {
+	start := time.Now()
+	pr := &api.PutRequest{}
+	defer func() {
+		elapsed := time.Since(start)
+		if _traceKV > 0 {
+			kvs.traceLogf("HTTP PUT %v took %v", pr, elapsed)
+		}
+	}()
+
+	if err := readRequestJSON(req, pr); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	cmd := Command{
+		Kind:  CommandPut,
+		Key:   pr.Key,
+		Value: pr.Value,
+		ID:    kvs.id,
+	}
+
+	future := kvs.rs.Apply(cmd, _requestTimeout)
+
+	select {
+	case err := <-future.ErrorCh():
+		if err != nil {
+			kvs.sendHTTPResponse(w, api.PutResponse{
+				RespStatus: api.StatusNotLeader,
+			})
+			return
+		}
+		cmdResp, ok := future.Response().(Command)
+		if !ok {
+			kvs.sendHTTPResponse(w, api.PutResponse{
+				RespStatus: api.StatusInvalid,
+			})
+			return
+		}
+		kvs.sendHTTPResponse(w, api.PutResponse{
 			RespStatus: api.StatusOK,
 			KeyFound:   cmdResp.ResultFound,
 			PrevValue:  cmdResp.ResultValue,

@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"io"
 	"time"
+
+	"github.com/vskurikhin/raft/pkg/raft/contract"
 )
 
 // SetSnapshotConfig обновляет параметры снимков и сигнализирует
 // runSnapshots о необходимости проверить, нужно ли создать снимок.
-func (cm *ConsensusModule) SetSnapshotConfig(threshold int, interval time.Duration, trailing int) {
+func (cm *ConsensusModule) SetSnapshotConfig(threshold, trailing int, interval time.Duration) {
 	cm.mu.Lock()
 	cm.snapshotThreshold = threshold
 	cm.snapshotInterval = interval
@@ -48,7 +50,7 @@ func (cm *ConsensusModule) handleFsmSnapshot(req *reqSnapshotFuture) {
 		return
 	}
 	// Снимок с индексом, не превышающим lastSnapshotIndex, не добавляет
-	// информации: compactLogs с тем же аргументом ничего не сжимает,
+	// информации: compactLogsLocked с тем же аргументом ничего не сжимает,
 	// а повторение цикла «создать снимок → сжатие вхолостую» только
 	// нагружает хранилище. Защищает и монотонность lastSnapshotIndex.
 	if cm.cmState.fsmAppliedIndex <= cm.cmState.lastSnapshotIndex {
@@ -63,11 +65,12 @@ func (cm *ConsensusModule) handleFsmSnapshot(req *reqSnapshotFuture) {
 		// отстаёт от диспетчеризации. Ранее индекс брался из lastApplied,
 		// и снимок фиксировался с завышенным индексом.
 		cm.counters.snapshotIndexBehindDispatched.Add(1)
-		cm.traceLockedLogf(
-			_traceLevelPreVote,
-			"handleFsmSnapshot: FSM behind dispatch: fsmAppliedIndex=%d lastApplied=%d lastSnapshotIndex=%d",
-			cm.cmState.fsmAppliedIndex, cm.cmState.lastApplied, cm.cmState.lastSnapshotIndex,
-		)
+		if traceEnabled(_traceLevelPreVote) {
+			cm.traceLogfLocked(
+				"handleFsmSnapshot: FSM behind dispatch: fsmAppliedIndex=%d lastApplied=%d lastSnapshotIndex=%d",
+				cm.cmState.fsmAppliedIndex, cm.cmState.lastApplied, cm.cmState.lastSnapshotIndex,
+			)
+		}
 	}
 	cm.mu.Unlock()
 
@@ -98,9 +101,9 @@ func (cm *ConsensusModule) handleInstallSnapshot(rpc RPC, req *InstallSnapshotRe
 	var rpcErr error
 	defer func() {
 		if rpc.Reader != nil {
-			// Drain остатка данных снимка с лимитом, чтобы не зависнуть
-			// при повреждённом соединении. Лимит _maxSnapshotDataSize
-			// гарантирует завершение drain даже при некорректном DataSize.
+			// Выполняется поэтапное чтение (drain) оставшихся данных снимка с ограничением по объёму,
+			// чтобы исключить блокировку при повреждённом соединении. Лимит _maxSnapshotDataSize
+			// гарантирует завершение операции даже при ошибочном значении DataSize.
 			_, _ = io.CopyN(io.Discard, rpc.Reader, _maxSnapshotDataSize)
 		}
 		rpc.RespChan <- RPCResponse{Reply: resp, Error: rpcErr}
@@ -126,20 +129,21 @@ func (cm *ConsensusModule) handleInstallSnapshot(rpc RPC, req *InstallSnapshotRe
 	}
 
 	// Идемпотентность: если у узла уже есть снимок с LastLogIndex ≥ запрошенного,
-	// установка не требуется (no-op).
+	// повторная установка не требуется — операция не выполняет действий.
 	cm.mu.Lock()
 	stale := req.LastLogIndex <= cm.cmState.lastSnapshotIndex
 	if stale {
-		cm.counters.installSnapshotSkippedStale = incPeerCount(cm.counters.installSnapshotSkippedStale, req.LeaderID)
+		cm.counters.installSnapshotSkippedStale = incPeerCountLocked(cm.counters.installSnapshotSkippedStale, req.LeaderID)
 	}
 	lastSnapshotIndex := cm.cmState.lastSnapshotIndex
 	cm.mu.Unlock()
 	if stale {
-		cm.traceLogf(
-			_traceLevelPreVote,
-			"InstallSnapshot skipped as no-op: LastLogIndex=%d <= lastSnapshotIndex=%d (leaderID=%d)",
-			req.LastLogIndex, lastSnapshotIndex, req.LeaderID,
-		)
+		if traceEnabled(_traceLevelPreVote) {
+			cm.traceLogf(
+				"InstallSnapshot skipped as no-op: LastLogIndex=%d <= lastSnapshotIndex=%d (leaderID=%d)",
+				req.LastLogIndex, lastSnapshotIndex, req.LeaderID,
+			)
+		}
 		resp.Success = true
 		return
 	}
@@ -218,20 +222,26 @@ func (cm *ConsensusModule) installSnapshotStateLocked(meta *SnapshotMeta) {
 	} else {
 		cm.cmState.log = nil
 	}
-	cm.rebuildLastLog()
-	cm.rebuildTermIndexMap()
+	cm.rebuildLastLogLocked()
+	cm.rebuildTermIndexMapLocked()
 	// Проверка непрерывности границы снимка и журнала (защита от регрессий).
 	// При нарушении — только счётчик и трассировка, без паники и изменения Success.
 	if err := cm.checkSnapshotLogContinuity(); err != nil {
 		cm.counters.snapshotLogBoundaryViolation.Add(1)
-		cm.traceLockedLogf(
-			_traceLevelKeyEvents,
-			"handleInstallSnapshot: snapshot/log boundary violation: %v (lastLogIndex=%d, lastSnapshotIndex=%d)",
-			err, cm.cmState.lastLogIndex, cm.cmState.lastSnapshotIndex,
-		)
+		if traceEnabled(_traceLevelKeyEvents) {
+			cm.traceLogfLocked(
+				"handleInstallSnapshot: snapshot/log boundary violation: %v (lastLogIndex=%d, lastSnapshotIndex=%d)",
+				err, cm.cmState.lastLogIndex, cm.cmState.lastSnapshotIndex,
+			)
+		}
 	}
-	cm.cmState.logNeedsPersist = true
-	cm.persistToStorage()
+	// Установка снимка удаляет префикс либо очищает журнал: применяется
+	// полная замена.
+	cm.markLogRewriteDirtyLocked()
+	// Установка снимка переписывает журнал, но не добавляет записей:
+	// период отмечается с нулём добавлений.
+	cm.dirty.mark(dirtyCauseInstallSnapshot, 0)
+	cm.persistToStorageLocked(persistSourceInstallSnapshot)
 }
 
 // receiveAndSealSnapshot принимает тело снимка от лидера в приёмник
@@ -242,7 +252,7 @@ func (cm *ConsensusModule) installSnapshotStateLocked(meta *SnapshotMeta) {
 func (cm *ConsensusModule) receiveAndSealSnapshot(
 	rpc RPC, req *InstallSnapshotRequest, cfg Configuration,
 ) (sinkID string, err error) {
-	sink, err := cm.snapshotStore.Create(req.LastLogIndex, req.LastLogTerm, cfg, req.ConfigIndex)
+	sink, err := cm.snapshotStore.Create(req.LastLogIndex, req.LastLogTerm, req.ConfigIndex, cfg)
 	if err != nil {
 		return "", err
 	}
@@ -295,13 +305,17 @@ func (cm *ConsensusModule) runSnapshots() {
 				if err := cm.takeSnapshot(); err != nil {
 					// Ошибки создания снимка не должны быть тихими
 					// ретрай обеспечивает следующий цикл.
-					cm.traceLogf(_traceLevelKeyEvents, "runSnapshots: takeSnapshot failed: %v", err)
+					if traceEnabled(_traceLevelKeyEvents) {
+						cm.traceLogf("runSnapshots: takeSnapshot failed: %v", err)
+					}
 				}
 			}
 		case <-time.After(interval):
 			if cm.shouldSnapshot() {
 				if err := cm.takeSnapshot(); err != nil {
-					cm.traceLogf(_traceLevelKeyEvents, "runSnapshots: takeSnapshot failed: %v", err)
+					if traceEnabled(_traceLevelKeyEvents) {
+						cm.traceLogf("runSnapshots: takeSnapshot failed: %v", err)
+					}
 				}
 			}
 		case <-cm.shutdownCh:
@@ -321,7 +335,7 @@ func (cm *ConsensusModule) takeSnapshot() error {
 	select {
 	case cm.fsmSnapshotCh <- snapReq:
 	case <-cm.shutdownCh:
-		return ErrRaftShutdown
+		return contract.ErrRaftShutdown
 	case <-time.After(_defaultTakeSnapshotTimeout):
 		cm.mu.Lock()
 		applied := cm.cmState.fsmAppliedIndex
@@ -351,7 +365,7 @@ func (cm *ConsensusModule) takeSnapshot() error {
 	committedIndex := cm.cmState.configurations.committedIndex
 	cm.mu.Unlock()
 
-	sink, err := cm.snapshotStore.Create(snapReq.index, snapReq.term, committed, committedIndex)
+	sink, err := cm.snapshotStore.Create(snapReq.index, snapReq.term, committedIndex, committed)
 	if err != nil {
 		return fmt.Errorf("failed to create snapshot: %w", err)
 	}
@@ -371,8 +385,8 @@ func (cm *ConsensusModule) takeSnapshot() error {
 	cm.mu.Lock()
 	cm.cmState.lastSnapshotIndex = snapReq.index
 	cm.cmState.lastSnapshotTerm = snapReq.term
-	cm.compactLogs(snapReq.index - cm.trailingLogs)
-	cm.persistToStorage()
+	cm.compactLogsLocked(snapReq.index - cm.trailingLogs)
+	cm.persistToStorageLocked(persistSourceTakeSnapshot)
 	cm.mu.Unlock()
 
 	return nil

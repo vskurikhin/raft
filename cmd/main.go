@@ -8,16 +8,21 @@ import (
 	"maps"
 	"net/http"
 	"net/http/pprof"
+	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/vskurikhin/raft"
 	"github.com/vskurikhin/raft/internal/_init"
 	"github.com/vskurikhin/raft/internal/config"
 	"github.com/vskurikhin/raft/pkg/kvservice"
+	"github.com/vskurikhin/raft/pkg/raft/store"
+	"github.com/vskurikhin/raft/pkg/raft/transp"
 )
 
 const (
@@ -30,23 +35,48 @@ const (
 	_pprofReadHeaderTimeout = 5 * time.Second
 	// _pprofShutdownTimeout — предельное время остановки сервера профилирования.
 	_pprofShutdownTimeout = 5 * time.Second
+
+	// _traceShutdownTimeout — предельное время ожидания остановки
+	// писателя трассировки при завершении процесса.
+	_traceShutdownTimeout = 2 * time.Second
 )
 
 func main() {
+	// Остановка писателя идемпотентна: штатный возврат и panic в главной
+	// горутине используют один и тот же defer, ошибочный путь вызывает
+	// её явно до log.Fatal (os.Exit не выполняет defer).
+	defer shutdownTrace()
 	if err := run(); err != nil {
+		shutdownTrace()
+		//nolint:gocritic // остановка вызвана явно выше; defer остаётся для panic в главной горутине.
 		log.Fatal(err)
 	}
 }
 
-// run запускает узел с параметрами командной строки и блокируется
-// до завершения процесса.
+// run запускает узел с параметрами командной строки и блокируется до
+// получения сигнала завершения (SIGINT/SIGTERM) или ошибки запуска.
+// После сигнала выполняется существующая функция остановки узла.
 func run() error {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
 	stop, err := runWith(&_init.Values)
 	if err != nil {
 		return err
 	}
 	defer stop()
-	select {} // работа узла до завершения процесса
+	<-ctx.Done() // работа узла до сигнала завершения
+	return nil
+}
+
+// shutdownTrace останавливает писателя трассировки с отдельным предельным
+// временем. Контекст завершения независим от отменённого сигнального; при
+// выключенной трассировке вызов не выполняет работы.
+func shutdownTrace() {
+	ctx, cancel := context.WithTimeout(context.Background(), _traceShutdownTimeout)
+	defer cancel()
+	if err := raft.ShutdownTrace(ctx); err != nil {
+		log.Printf("warning: shutting down trace writer: %v", err)
+	}
 }
 
 var _wg sync.WaitGroup
@@ -68,7 +98,7 @@ func runWith(values *config.Values) (func(), error) {
 	// Постоянное хранилище снимков: сжатие усекает журнал на диске,
 	// поэтому снимок обязан переживать рестарт процесса. retain=2 —
 	// запас на случай повреждения последнего снимка.
-	snapshotStore, err := raft.NewFileSnapshotStore(dataDir, 2)
+	snapshotStore, err := store.NewFileSnapshot(dataDir, 2)
 	if err != nil {
 		stopPprof()
 		return nil, fmt.Errorf("failed to create file snapshot store in %s: %w", dataDir, err)
@@ -84,19 +114,50 @@ func runWith(values *config.Values) (func(), error) {
 	cfg := kvservice.Config{
 		HTTPAddress: values.HTTPAddress.String(),
 		Config: raft.Config{
-			PeerAddresses:     values.Peers,
-			PeerIds:           nums,
-			RPCAddress:        values.RPCAddress.String(),
-			ServerID:          values.Number,
-			SnapshotStore:     snapshotStore,
-			Storage:           raft.NewFileStorage(dataDir),
-			TCPRPCTimeout:     values.TCPRPCTimeout,
-			MaxPool:           maxPool,
-			SnapshotInterval:  values.SnapshotInterval,
-			SnapshotThreshold: values.SnapshotThreshold,
+			ApplyBatchInterval: values.ApplyBatchInterval,
+			DisableStatsOutput: !values.StatsOutput,
+			HeartbeatTimeout:   values.HeartbeatTimeout,
+			PeerAddresses:      values.Peers,
+			PeerIds:            nums,
+			ReelectionTimeout:  values.ReelectionTimeout,
+			ServerID:           values.Number,
+			SnapshotInterval:   values.SnapshotInterval,
+			SnapshotStore:      snapshotStore,
+			SnapshotThreshold:  values.SnapshotThreshold,
+			Storage:            store.NewFileStorage(dataDir),
+			TickerTimeout:      values.TickerTimeout,
 		},
 	}
+
+	// Инициализация транспорта откладывается до момента непосредственно перед
+	// вызовом kvservice.New, чтобы сократить период, в течение которого
+	// сетевой слушатель активен без готового потребителя.
+	// После успешного создания сервиса ответственность за транспорт переходит
+	// к Server (ownTransport = false). При возникновении ошибки транспорт
+	// корректно освобождается с помощью defer.
+	// Тайм‑ауты транспортного слоя вычисляются чистой функцией transportTimeouts
+	// на основе переданных значений. Окно RPC и время ожидания ответа потребителя
+	// соответствуют флагу -tcp-rpc-timeout. Нулевые поля автоматически заменяются
+	// значениями по умолчанию, заданными в конструкторе.
+	timeouts := transportTimeouts(values)
+	log.Printf("raftkv: TCP timeouts: connect=%v rpc=%v snapshot=%v response=%v",
+		timeouts.ConnectionTimeout, timeouts.GenericRPCTimeout,
+		timeouts.InstallSnapshotTimeout, timeouts.ResponseTimeout)
+	transport, err := transp.NewTCPTransport(values.RPCAddress.String(), timeouts, maxPool)
+	if err != nil {
+		stopPprof()
+		return nil, fmt.Errorf("failed to create TCP transport on %s: %w", values.RPCAddress, err)
+	}
+	ownTransport := true
+	defer func() {
+		if ownTransport {
+			transport.Close()
+		}
+	}()
+
+	cfg.Transport = transport
 	kvs := kvservice.New(&cfg, ready)
+	ownTransport = false
 	_wg.Add(len(nums) / 2)
 	for _, num := range nums {
 		go connect(num, kvs, values, nums)
@@ -120,8 +181,22 @@ func runWith(values *config.Values) (func(), error) {
 	}, nil
 }
 
+// transportTimeouts формирует тайм‑ауты TCP‑транспорта на основе флагов узла.
+// ResponseTimeout (ожидание ответа потребителя) конструктивно совпадает
+// с GenericRPCTimeout (окно обычного RPC): это две стороны единого окна обмена.
+// Отдельного флага для времени ответа не предусмотрено. Нулевые значения полей
+// трактуются как использование значений по умолчанию, заданных в конструкторе транспорта.
+func transportTimeouts(values *config.Values) transp.TCPTimeouts {
+	return transp.TCPTimeouts{
+		ConnectionTimeout:      values.TCPConnectTimeout,
+		GenericRPCTimeout:      values.TCPRPCTimeout,
+		InstallSnapshotTimeout: values.InstallSnapshotTimeout,
+		ResponseTimeout:        values.TCPRPCTimeout,
+	}
+}
+
 // startPprof поднимает отдельный HTTP-сервер профилирования и включает сбор
-// профилей блокировок и состязаний за мьютекс, если заданы соответствующие
+// профилей блокировок и конкуренции за мьютекс, если заданы соответствующие
 // параметры. При пустом адресе не создаётся ни слушающего сокета, ни
 // накладных расходов среды выполнения. Возвращает функцию остановки.
 func startPprof(values *config.Values) func() {
