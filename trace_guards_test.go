@@ -25,8 +25,8 @@ import (
 
 // AST-гейт guards: постоянная проверка производственных мест трассировки
 // консенсус-модуля и ссылочных аргументов. Проверяются:
-//   - 48 вызовов traceLogfLocked, 5 вызовов traceSprintfLocked и 22
-//     вызова traceLogf (всего 75 мест) обёрнуты положительной ветвью
+//   - 50 вызовов traceLogfLocked, 5 вызовов traceSprintfLocked и 22
+//     вызова traceLogf (всего 77 мест) обёрнуты положительной ветвью
 //     if traceEnabled(L) с единственным оператором; уровень и формат
 //     каждого места независимо сверяются с эталонным реестром;
 //   - тело (*ConsensusModule).traceLogf безусловно захватывает cm.mu,
@@ -55,12 +55,12 @@ import (
 
 const (
 	// guardWantLocked — число прикладных вызовов traceLogfLocked.
-	guardWantLocked = 48
+	guardWantLocked = 50
 	// guardWantSprintf — число вызовов traceSprintfLocked (ссылочные места).
 	guardWantSprintf = 5
 	// guardWantPlain — число вызовов traceLogf (обёртка, берущая cm.mu сама).
 	guardWantPlain = 22
-	// guardWantTotal — все прикладные места (48 + 5 + 22); тела трёх
+	// guardWantTotal — все прикладные места (50 + 5 + 22); тела трёх
 	// обёрток проверяются отдельными правилами, не этим счётчиком.
 	guardWantTotal = guardWantLocked + guardWantSprintf + guardWantPlain
 )
@@ -200,11 +200,12 @@ var guardBaselinePlaces = []guardBaselinePlace{
 	{"raft_cm_election.go", "(*ConsensusModule).runElectionTimer", "traceLogf", "_traceLevelLoops", "election timer started (%v), term=%d"},
 	{"raft_cm_election.go", "(*ConsensusModule).runElectionTimer", "traceLogfLocked", "_traceLevelLoops", "in election timer state=%s, bailing out"},
 	{"raft_cm_election.go", "(*ConsensusModule).runElectionTimer", "traceLogfLocked", "_traceLevelLoops", "in election timer term changed from %d to %d, bailing out"},
-	{"raft_cm_election.go", "(*ConsensusModule).runPreCandidate", "traceLogfLocked", "_traceLevelKeyEvents", "becomes PreCandidate; term=%d, len(log)=%d"},
+	{"raft_cm_election.go", "(*ConsensusModule).enterPreCandidateLocked", "traceLogfLocked", "_traceLevelKeyEvents", "becomes PreCandidate; term=%d, len(log)=%d"},
+	{"raft_cm_election.go", "(*ConsensusModule).runPreCandidate", "traceLogfLocked", "_traceLevelPreVote", "runPreCandidate: stale campaign for term %d (state=%s, term=%d), bailing out"},
 	{"raft_cm_election.go", "(*ConsensusModule).sendPreVoteToPeer", "traceLogf", "_traceLevelKeyEvents", "runPreCandidate: transport is nil, cannot send to %d"},
 	{"raft_cm_election.go", "(*ConsensusModule).sendPreVoteToPeer", "traceLogf", "_traceLevelPreVote", "sending RequestPreVote to %d: %+v"},
 	{"raft_cm_election.go", "(*ConsensusModule).sendPreVoteToPeer", "traceLogf", "_traceLevelPreVote", "RequestPreVote to %d failed: %v"},
-	{"raft_cm_election.go", "(*ConsensusModule).collectPreVoteReplies", "traceLogfLocked", "_traceLevelPreVote", "runPreCandidate: state changed to %s, bailing out"},
+	{"raft_cm_election.go", "(*ConsensusModule).collectPreVoteReplies", "traceLogfLocked", "_traceLevelPreVote", "runPreCandidate: campaign is stale (state=%s), bailing out"},
 	{"raft_cm_election.go", "(*ConsensusModule).collectPreVoteReplies", "traceLogfLocked", "_traceLevelPreVote", "runPreCandidate: found higher term %d"},
 	{"raft_cm_election.go", "(*ConsensusModule).collectPreVoteReplies", "traceLogf", "_traceLevelPreVote", "runPreCandidate: granted vote from peer, total=%d, needed=%d"},
 	{"raft_cm_election.go", "(*ConsensusModule).collectPreVoteReplies", "traceLogfLocked", "_traceLevelPreVote", "runPreCandidate: pre-vote timeout, returning to follower"},
@@ -261,6 +262,7 @@ var guardBaselinePlaces = []guardBaselinePlace{
 	{"raft_cm_rpc.go", "(*ConsensusModule).RequestPreVote", "traceLogfLocked", "_traceLevelPreVote", "RequestPreVote: %+v [currentTerm=%d, log index/term=(%d, %d)]"},
 	{"raft_cm_rpc.go", "(*ConsensusModule).RequestPreVote", "traceLogfLocked", "_traceLevelPreVote", "... RequestPreVote denied: not a voter"},
 	{"raft_cm_rpc.go", "(*ConsensusModule).RequestPreVote", "traceLogfLocked", "_traceLevelPreVote", "... RequestPreVote denied: older term"},
+	{"raft_cm_rpc.go", "(*ConsensusModule).RequestPreVote", "traceLogfLocked", "_traceLevelPreVote", "... RequestPreVote denied: current leader"},
 	{"raft_cm_rpc.go", "(*ConsensusModule).RequestPreVote", "traceLogfLocked", "_traceLevelPreVote", "... RequestPreVote denied: leader known"},
 	{"raft_cm_rpc.go", "(*ConsensusModule).RequestPreVote", "traceLogfLocked", "_traceLevelPreVote", "... RequestPreVote denied: log is more up-to-date"},
 	{"raft_cm_rpc.go", "(*ConsensusModule).RequestPreVote", "traceLogfLocked", "_traceLevelPreVote", "... RequestPreVote granted"},
@@ -1331,7 +1333,7 @@ func guardProbeNewMapAsync(_ *guardPackage, places []*guardPlace) (func(), bool)
 }
 
 // guardProbeSprintfDemoted понижает первое ссылочное место до
-// traceLogfLocked: ломаются и счёт 48/5/22, и запрет ссылок.
+// traceLogfLocked: ломаются и счёт 50/5/22, и запрет ссылок.
 func guardProbeSprintfDemoted(_ *guardPackage, places []*guardPlace) (func(), bool) {
 	for _, place := range places {
 		sel, ok := place.call.Fun.(*ast.SelectorExpr)

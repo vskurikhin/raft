@@ -281,13 +281,8 @@ func (cm *ConsensusModule) runElectionTimer() {
 			// Начать выборы (или Pre-Vote), если в течение времени ожидания мы
 			// не получили сообщение от лидера или не проголосовали за кого-либо.
 			if elapsed := time.Since(cm.cmState.electionResetEvent); elapsed >= timeoutDuration {
-				if cm.preVoteDisabled || cm.cmState.candidateFromLeadershipTransfer.Load() {
-					cm.startElectionLocked()
-					cm.mu.Unlock()
-					return
-				}
+				cm.startCampaignLocked()
 				cm.mu.Unlock()
-				cm.goSpawn(cm.runPreCandidate)
 				return
 			}
 			cm.mu.Unlock()
@@ -300,36 +295,73 @@ func (cm *ConsensusModule) runElectionTimer() {
 	}
 }
 
-// runPreCandidate выполняет предварительное голосование (§4 Pre-Vote).
+// preVoteCampaign — идентичность и снимок кампании предварительного
+// голосования на момент входа в PreCandidate: номер кампании, конфигурация и
+// предлагаемый терм выборов.
+type preVoteCampaign struct {
+	generation   uint64
+	cfg          Configuration
+	proposedTerm int
+}
+
+// preVoteCampaignCurrentLocked сообщает, вправе ли кампания c управлять
+// состоянием узла: узел остаётся PreCandidate, вошедшим в эту роль именно
+// кампанией c, в терме, из которого она начата. Отмена необратима: выход из
+// PreCandidate меняет роль, а повторный вход выдаёт новый номер.
 //
-// Узел переходит в PreCandidate (не увеличивая currentTerm), отправляет
-// RequestPreVote всем голосующим и собирает ответы. Если получен кворум
-// положительных ответов — вызывает startElectionLocked() для настоящих выборов.
-// Если кворум не получен или обнаружен более высокий term — возвращается
-// в Follower.
+// Требует удержания cm.mu.
+func (cm *ConsensusModule) preVoteCampaignCurrentLocked(c preVoteCampaign) bool {
+	return cm.cmState.state == PreCandidate &&
+		cm.cmState.preVoteGeneration == c.generation &&
+		cm.cmState.currentTerm+1 == c.proposedTerm
+}
+
+// startCampaignLocked исполняет решение истёкшего таймера выборов: выборы
+// без PreVote (PreVote отключён или идёт передача лидерства) либо переход
+// в PreCandidate с запуском кампании предварительного голосования.
 //
-// Вызов из состояния Candidate допускается: это retry-путь кандидата,
-// проигравшего реальные выборы (split vote, когда два кандидата в одном
-// терме голосуют каждый за себя и не набирают кворум). Таймер выборов
-// (runElectionTimer) передаёт управление сюда независимо от состояния, и
-// без перехода Candidate → PreCandidate такой кандидат навсегда остался бы
-// в Candidate: runPreCandidate выходил бы сразу, а горутина таймера уже
-// завершилась, поэтому новые выборы больше никогда не запускались бы
-// (livelock без лидера).
+// Переход в PreCandidate и выдача номера кампании выполняются в той же
+// критической секции, что и решение таймера, а сетевая работа — в отдельной
+// горутине после снятия блокировки. AppendEntries, смена терма или остановка,
+// пришедшие позже, выводят узел из PreCandidate и тем отменяют кампанию.
 //
-// Горутина завершается при:
-//   - получении кворума PreVote → вызов startElectionLocked()
-//   - истечении таймаута выборов без кворума → becomeFollowerLocked()
-//   - обнаружении более высокого терма от другого узла → becomeFollowerLocked()
-//
-// Вызывается из runElectionTimer(), когда preVoteDisabled == false.
-func (cm *ConsensusModule) runPreCandidate() {
-	cm.mu.Lock()
-	if cm.cmState.state != Follower && cm.cmState.state != PreCandidate && cm.cmState.state != Candidate {
-		cm.mu.Unlock()
+// Требует удержания cm.mu.
+func (cm *ConsensusModule) startCampaignLocked() {
+	if cm.preVoteDisabled || cm.cmState.candidateFromLeadershipTransfer.Load() {
+		cm.startElectionLocked()
 		return
 	}
+	campaign, ok := cm.enterPreCandidateLocked()
+	if !ok {
+		return
+	}
+	run := func() { cm.runPreCandidate(campaign) }
+	if hook := cm.preVoteWorkerHook; hook != nil {
+		cm.goSpawnLocked(func() { hook(campaign, run) })
+		return
+	}
+	cm.goSpawnLocked(run)
+}
+
+// enterPreCandidateLocked переводит узел в PreCandidate (не увеличивая
+// currentTerm), выдаёт новой кампании предварительного голосования номер и
+// возвращает её снимок. Одиночный голосующий узел сразу начинает выборы;
+// тогда, как и при недопустимой роли, возвращается ok == false.
+//
+// Вход из состояния Candidate допускается: это retry-путь кандидата,
+// проигравшего реальные выборы (split vote, когда два кандидата в одном
+// терме голосуют каждый за себя и не набирают кворум). Без перехода
+// Candidate → PreCandidate такой кандидат навсегда остался бы в Candidate:
+// горутина таймера уже завершилась, и новые выборы больше никогда не
+// запускались бы (livelock без лидера).
+//
+// Требует удержания cm.mu.
+func (cm *ConsensusModule) enterPreCandidateLocked() (campaign preVoteCampaign, ok bool) {
+	if cm.cmState.state != Follower && cm.cmState.state != PreCandidate && cm.cmState.state != Candidate {
+		return preVoteCampaign{}, false
+	}
 	cm.cmState.state = PreCandidate
+	cm.cmState.preVoteGeneration++
 	if traceEnabled(_traceLevelKeyEvents) {
 		cm.traceLogfLocked(
 			"becomes PreCandidate; term=%d, len(log)=%d",
@@ -338,18 +370,58 @@ func (cm *ConsensusModule) runPreCandidate() {
 	}
 
 	cfg := cm.cmState.configurations.latest
-	voters := voterIDs(cfg)
-	voterCount := len(voters)
 
 	// Одиночный узел: PreVote не нужен, сразу выборы.
-	if voterCount <= 1 {
+	if len(voterIDs(cfg)) <= 1 {
 		cm.startElectionLocked()
+		return preVoteCampaign{}, false
+	}
+	return preVoteCampaign{
+		generation:   cm.cmState.preVoteGeneration,
+		cfg:          cfg,
+		proposedTerm: cm.cmState.currentTerm + 1,
+	}, true
+}
+
+// runPreCandidate выполняет предварительное голосование (§4 Pre-Vote) узла,
+// уже переведённого в PreCandidate вызовом enterPreCandidateLocked.
+//
+// Отправляет RequestPreVote всем голосующим и собирает ответы. Если получен
+// кворум положительных ответов — вызывает startElectionLocked() для настоящих
+// выборов. Если кворум не получен или обнаружен более высокий term —
+// возвращается в Follower.
+//
+// Каждое решение принимается, только пока кампания актуальна
+// (preVoteCampaignCurrentLocked). Отменённая кампания не начинает рассылку,
+// не засчитывает ответы и не меняет роль и таймер узла: отменивший её переход
+// уже запустил новый таймер выборов (becomeFollowerLocked,
+// startElectionLocked) либо узел остановлен. Уже отправленный запрос не
+// отзывается; его ответ просто не учитывается.
+//
+// Горутина завершается при:
+//   - отмене кампании до рассылки → возврат без RPC
+//   - получении кворума PreVote → вызов startElectionLocked()
+//   - истечении таймаута выборов без кворума → becomeFollowerLocked()
+//   - обнаружении более высокого терма от другого узла → becomeFollowerLocked()
+//   - обнаружении отмены кампании → возврат без изменения состояния
+//
+// Запускается из startCampaignLocked, когда preVoteDisabled == false.
+// Самостоятельно захватывает и освобождает cm.mu.
+func (cm *ConsensusModule) runPreCandidate(c preVoteCampaign) {
+	cm.mu.Lock()
+	if !cm.preVoteCampaignCurrentLocked(c) {
+		if traceEnabled(_traceLevelPreVote) {
+			cm.traceLogfLocked(
+				"runPreCandidate: stale campaign for term %d (state=%s, term=%d), bailing out",
+				c.proposedTerm, cm.cmState.state, cm.cmState.currentTerm,
+			)
+		}
 		cm.mu.Unlock()
 		return
 	}
-
-	proposedTerm := cm.cmState.currentTerm + 1
 	cm.mu.Unlock()
+
+	voterCount := len(voterIDs(c.cfg))
 
 	// Канал для сбора ответов.
 	preVoteRespCh := make(chan *RequestPreVoteReply, voterCount-1)
@@ -357,7 +429,7 @@ func (cm *ConsensusModule) runPreCandidate() {
 	defer cancel()
 
 	// Отправить RequestPreVote параллельно всем голосующим (кроме себя).
-	for _, s := range cfg.ConfigServers {
+	for _, s := range c.cfg.ConfigServers {
 		peerID := int(s.ID)
 		if peerID == cm.id {
 			continue
@@ -366,39 +438,41 @@ func (cm *ConsensusModule) runPreCandidate() {
 			continue
 		}
 		cm.goSpawn(func() {
-			cm.sendPreVoteToPeer(ctx, peerID, proposedTerm, preVoteRespCh)
+			cm.sendPreVoteToPeer(ctx, peerID, c, preVoteRespCh)
 		})
 	}
 
-	cm.collectPreVoteReplies(voterCount, preVoteRespCh)
+	cm.collectPreVoteReplies(c, voterCount, preVoteRespCh)
 }
 
 // sendPreVoteToPeer отправляет RequestPreVote одному соседу и помещает его
 // ответ в канал ответов. В запросе идёт предлагаемый терм выборов;
-// собственный терм узла при этом не меняется. Если транспорт отсутствует или
+// собственный терм узла при этом не меняется. Если кампания уже отменена,
+// запрос не отправляется. Если кампания отменена, транспорт отсутствует или
 // вызов завершился ошибкой, в канал помещается синтетический ответ: отказ, а
 // при отсутствии поддержки предварительного голосования у транспорта — грант,
-// ради совместимости с соседями. Каждая отправка уступает отмене контекста,
+// ради совместимости с соседями. Сборщик ответов проверяет актуальность
+// кампании до учёта любого ответа, поэтому синтетический отказ отменённой
+// кампании лишь будит сборщик. Каждая отправка уступает отмене контекста,
 // поэтому горутина не зависает, когда сбор ответов уже завершён.
 //
-// Самостоятельно захватывает и освобождает cm.mu: под блокировкой снимаются
-// только последний индекс и терм журнала вместе с текущим термом; вызов
-// транспорта происходит без блокировки. Канал в сигнатуре — только для
-// отправки.
+// Самостоятельно захватывает и освобождает cm.mu: под блокировкой проверяется
+// актуальность кампании и снимаются последний индекс и терм журнала вместе с
+// текущим термом; вызов транспорта происходит без блокировки. Канал в
+// сигнатуре — только для отправки.
 func (cm *ConsensusModule) sendPreVoteToPeer(
 	ctx context.Context,
-	peerID, proposedTerm int,
+	peerID int,
+	c preVoteCampaign,
 	respCh chan<- *RequestPreVoteReply,
 ) {
 	cm.mu.Lock()
+	current := cm.preVoteCampaignCurrentLocked(c)
 	lastLogIndex, lastLogTerm := cm.lastLogIndexAndTermLocked()
 	savedTerm := cm.cmState.currentTerm
 	cm.mu.Unlock()
 
-	if cm.transport == nil {
-		if traceEnabled(_traceLevelKeyEvents) {
-			cm.traceLogf("runPreCandidate: transport is nil, cannot send to %d", peerID)
-		}
+	deny := func() {
 		select {
 		case respCh <- &RequestPreVoteReply{
 			RPCHeader:   RPCHeader{ProtocolVersion: ProtocolVersion, ServerID: cm.id},
@@ -407,6 +481,16 @@ func (cm *ConsensusModule) sendPreVoteToPeer(
 		}:
 		case <-ctx.Done():
 		}
+	}
+	if !current {
+		deny()
+		return
+	}
+	if cm.transport == nil {
+		if traceEnabled(_traceLevelKeyEvents) {
+			cm.traceLogf("runPreCandidate: transport is nil, cannot send to %d", peerID)
+		}
+		deny()
 		return
 	}
 
@@ -415,7 +499,7 @@ func (cm *ConsensusModule) sendPreVoteToPeer(
 			ProtocolVersion: ProtocolVersion,
 			ServerID:        cm.id,
 		},
-		Term:         proposedTerm,
+		Term:         c.proposedTerm,
 		LastLogIndex: lastLogIndex,
 		LastLogTerm:  lastLogTerm,
 	}
@@ -457,20 +541,23 @@ func (cm *ConsensusModule) sendPreVoteToPeer(
 }
 
 // collectPreVoteReplies собирает ответы соседей на предварительное голосование
-// и решает его исход. Голос за себя учтён заранее, каждый пришедший ответ
-// засчитывается до проверок роли и терма. Ответ с более высоким термом, как и
-// потеря роли, прекращает сбор. При наборе кворума узел выжидает случайную
-// паузу — чтобы несколько узлов не начали выборы лидера одновременно с
-// одинаковым термом — и, если он всё ещё кандидат предварительного
-// голосования, запускает выборы лидера. Истечение тайм-аута выборов и
-// исчерпание ответов без кворума возвращают узел в ведомые; остановка узла
-// прекращает сбор, не трогая состояния.
+// кампании c и решает его исход. Голос за себя учтён заранее. Каждый
+// пришедший ответ засчитывается, только если кампания ещё актуальна; ответ
+// отменённой кампании прекращает сбор без изменения состояния, даже если
+// в нём более высокий терм. Ответ с более высоким термом в актуальной
+// кампании возвращает узел в ведомые с этим термом. При наборе кворума узел
+// выжидает случайную паузу — чтобы несколько узлов не начали выборы лидера
+// одновременно с одинаковым термом — и, если кампания всё ещё актуальна,
+// запускает выборы лидера. Истечение тайм-аута выборов и исчерпание ответов
+// без кворума возвращают в ведомые только узел с актуальной кампанией;
+// остановка узла прекращает сбор, не трогая состояния.
 //
 // Самостоятельно захватывает и освобождает cm.mu. Канал в сигнатуре — только
 // для приёма.
 //
 //nolint:gocognit // проверки уровня механически повышают метрики, логика не меняется
 func (cm *ConsensusModule) collectPreVoteReplies(
+	c preVoteCampaign,
 	voterCount int,
 	respCh <-chan *RequestPreVoteReply,
 ) {
@@ -487,10 +574,10 @@ func (cm *ConsensusModule) collectPreVoteReplies(
 		case reply := <-respCh:
 			votersResponded++
 			cm.mu.Lock()
-			if cm.cmState.state != PreCandidate {
+			if !cm.preVoteCampaignCurrentLocked(c) {
 				if traceEnabled(_traceLevelPreVote) {
 					cm.traceLogfLocked(
-						"runPreCandidate: state changed to %s, bailing out",
+						"runPreCandidate: campaign is stale (state=%s), bailing out",
 						cm.cmState.state,
 					)
 				}
@@ -515,13 +602,13 @@ func (cm *ConsensusModule) collectPreVoteReplies(
 					)
 				}
 				if grantedVotes >= neededVotes {
-					cm.startElectionAfterPreVote(grantedVotes)
+					cm.startElectionAfterPreVote(c, grantedVotes)
 					return
 				}
 			}
 		case <-timeout:
 			cm.mu.Lock()
-			if cm.cmState.state == PreCandidate {
+			if cm.preVoteCampaignCurrentLocked(c) {
 				if traceEnabled(_traceLevelPreVote) {
 					cm.traceLogfLocked(
 						"runPreCandidate: pre-vote timeout, returning to follower",
@@ -538,7 +625,7 @@ func (cm *ConsensusModule) collectPreVoteReplies(
 		// После обработки всех ответов пересчитать необходимые голоса.
 		if votersResponded >= totalVoters && grantedVotes < neededVotes {
 			cm.mu.Lock()
-			if cm.cmState.state == PreCandidate {
+			if cm.preVoteCampaignCurrentLocked(c) {
 				if traceEnabled(_traceLevelPreVote) {
 					cm.traceLogfLocked(
 						"runPreCandidate: pre-vote lost (%d/%d), returning to follower",
@@ -553,20 +640,20 @@ func (cm *ConsensusModule) collectPreVoteReplies(
 	}
 }
 
-// startElectionAfterPreVote запускает выборы лидера после победы в
+// startElectionAfterPreVote запускает выборы лидера после победы кампании c в
 // предварительном голосовании. Перед переходом узел выжидает случайную паузу,
 // чтобы несколько узлов не начали выборы одновременно с одинаковым термом, и
-// начинает выборы, только если за время паузы он остался кандидатом
-// предварительного голосования.
+// начинает выборы, только если за время паузы кампания осталась актуальной.
 //
 // Самостоятельно захватывает и освобождает cm.mu: пауза выдерживается без
-// блокировки, под блокировкой выполняются перепроверка роли и запуск выборов.
-func (cm *ConsensusModule) startElectionAfterPreVote(grantedVotes int) {
+// блокировки, под блокировкой выполняются перепроверка кампании и запуск
+// выборов.
+func (cm *ConsensusModule) startElectionAfterPreVote(c preVoteCampaign, grantedVotes int) {
 	// Jitter перед выборами, чтобы одновременно несколько узлов
 	// не перешли в Candidate с одинаковым term (split vote).
 	time.Sleep(time.Duration(rand.Intn(_preVoteJitterMs)) * time.Millisecond)
 	cm.mu.Lock()
-	if cm.cmState.state == PreCandidate {
+	if cm.preVoteCampaignCurrentLocked(c) {
 		if traceEnabled(_traceLevelPreVote) {
 			cm.traceLogfLocked(
 				"runPreCandidate: won pre-vote with %d votes, starting election",

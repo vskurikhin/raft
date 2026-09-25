@@ -276,7 +276,7 @@ func TestPreVote_CandidateRetry(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		cm.runPreCandidate()
+		enterAndRunPreCandidate(cm)
 		close(done)
 	}()
 
@@ -326,6 +326,17 @@ func newPreVoteTestCM(transport Transport, term int) *ConsensusModule {
 	return cm
 }
 
+// enterAndRunPreCandidate повторяет передачу решения таймера выборов:
+// переход в PreCandidate под cm.mu, затем кампания без блокировки.
+func enterAndRunPreCandidate(cm *ConsensusModule) {
+	cm.mu.Lock()
+	campaign, ok := cm.enterPreCandidateLocked()
+	cm.mu.Unlock()
+	if ok {
+		cm.runPreCandidate(campaign)
+	}
+}
+
 // runPreCandidateOnce запускает runPreCandidate в отдельной горутине и ждёт
 // её завершения. Возвращает длительность перехода.
 func runPreCandidateOnce(t *testing.T, cm *ConsensusModule) time.Duration {
@@ -333,7 +344,7 @@ func runPreCandidateOnce(t *testing.T, cm *ConsensusModule) time.Duration {
 	done := make(chan struct{})
 	start := time.Now()
 	go func() {
-		cm.runPreCandidate()
+		enterAndRunPreCandidate(cm)
 		close(done)
 	}()
 	select {

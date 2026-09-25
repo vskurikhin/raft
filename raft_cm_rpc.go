@@ -413,8 +413,8 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 //   - Добавляет проверку: знает ли получатель о действующем лидере
 //
 // PreVote использует ту же log-safety проверку, что и RequestVote (§5.4.1).
-// Если получатель недавно получал heartbeat от лидера или отстаёт по логу —
-// PreVote отклоняется, чтобы предотвратить лишние выборы.
+// Если получатель — действующий лидер, недавно получал heartbeat от лидера
+// или его лог новее — PreVote отклоняется, чтобы предотвратить лишние выборы.
 func (cm *ConsensusModule) RequestPreVote(args RequestPreVoteArgs, reply *RequestPreVoteReply) error {
 	startTimeNow := time.Now()
 	defer func() { cm.latency.requestPreVote.observe(time.Since(startTimeNow)) }()
@@ -464,6 +464,17 @@ func (cm *ConsensusModule) RequestPreVote(args RequestPreVoteArgs, reply *Reques
 	if args.Term < cm.cmState.currentTerm {
 		if traceEnabled(_traceLevelPreVote) {
 			cm.traceLogfLocked("... RequestPreVote denied: older term")
+		}
+		return nil
+	}
+
+	// Действующий лидер не отдаёт предварительный голос. Его собственная
+	// отметка leaderLastContact ставится при вступлении в роль и не отражает
+	// текущей связи с кворумом; при потере кворума лидер сам шагает вниз
+	// (checkQuorum), и далее действуют обычные правила ведомого.
+	if cm.cmState.state == Leader {
+		if traceEnabled(_traceLevelPreVote) {
+			cm.traceLogfLocked("... RequestPreVote denied: current leader")
 		}
 		return nil
 	}

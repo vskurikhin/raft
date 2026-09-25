@@ -139,6 +139,14 @@ type ConsensusModule struct {
 	// По умолчанию false — Pre-Vote включён.
 	preVoteDisabled bool
 
+	// preVoteWorkerHook — точка управления порядком событий только для
+	// тестов. Если задана, горутина кампании предварительного голосования,
+	// запущенная решением таймера выборов, вызывает её вместо кампании,
+	// передавая снимок кампании и саму кампанию run; вызывать run или нет,
+	// решает тест. В рабочем узле всегда nil. Читается под cm.mu в
+	// startCampaignLocked; тест задаёт её под cm.mu.
+	preVoteWorkerHook func(campaign preVoteCampaign, run func())
+
 	// shutdownClosed — флаг, который становится true после установки state=Dead в методе Stop().
 	// Поле читается и изменяется только под блокировкой cm.mu.
 	// Он дублирует проверку state == Dead внутри goSpawnLocked: это необходимо, потому что
@@ -232,6 +240,15 @@ type cmState struct {
 	state              CMState
 	electionResetEvent time.Time
 	electionTimerDone  chan struct{}
+
+	// preVoteGeneration — номер последней кампании предварительного
+	// голосования. Увеличивается при каждом входе в PreCandidate
+	// (enterPreCandidateLocked) и больше нигде не меняется. Кампания
+	// управляет состоянием узла, пока узел остаётся PreCandidate с её
+	// номером: любой выход из PreCandidate отменяет кампанию, а повторный
+	// вход выдаёт новый номер, поэтому отменённая кампания актуальной уже
+	// не становится, даже если роль и терм совпали. Не сохраняется.
+	preVoteGeneration uint64
 
 	// lastApplied — максимальный индекс, диапазон до которого уже отправлен
 	// в очередь машины состояний (fsmMutateCh). Это отметка диспетчеризации,
