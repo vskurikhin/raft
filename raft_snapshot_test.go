@@ -769,22 +769,33 @@ func TestLogPosition_AfterCompact(t *testing.T) {
 	cm.mu.Unlock()
 }
 
-// Helper: waitForSingleLeader ждёт появления лидера в snapshotHarness.
+// waitForSingleLeader ждёт появления единственного лидера среди подключённых узлов.
 func (h *snapshotHarness) waitForSingleLeader() int {
-	for r := 0; r < 20; r++ {
+	h.t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		leaderID := -1
 		for i := 0; i < h.n; i++ {
 			if !h.connected[i] {
 				continue
 			}
 			_, _, isLeader := h.cluster[i].Report()
 			if isLeader {
-				return i
+				if leaderID >= 0 {
+					h.t.Fatalf("multiple connected leaders: %d and %d", leaderID, i)
+				}
+				leaderID = i
 			}
 		}
-		// poll-интервал condition-wait (не фиксированная пауза).
-		time.Sleep(2 * DefaultHeartbeatTimeout)
+		if leaderID >= 0 {
+			return leaderID
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return -1
+		}
+		time.Sleep(min(2*DefaultHeartbeatTimeout, remaining))
 	}
-	return -1
 }
 
 // TestSnapshot_MultipleSnapshots проверяет, что при множественных снимках
