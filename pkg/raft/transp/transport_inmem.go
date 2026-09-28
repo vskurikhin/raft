@@ -1,12 +1,14 @@
 package transp
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"sync"
 	"time"
 
 	"github.com/vskurikhin/raft/pkg/raft/contract"
+	"github.com/vskurikhin/raft/pkg/raft/protocol"
 )
 
 // InmemTransport — реализация Transport, работающая в оперативной памяти
@@ -25,9 +27,18 @@ type InmemTransport struct {
 	heartbeat  func(contract.RPC)
 	shutdownCh chan struct{}
 	timeout    time.Duration
+	// limits — профиль пределов, защитно проверяемый при отправке и при
+	// приёме. Неизменяем после конструктора.
+	limits contract.Limits
+	// rejections — отказы приёма по пределам этого транспорта.
+	rejections limitRejections
 }
 
-var _ contract.Transport = (*InmemTransport)(nil)
+var (
+	_ contract.Transport               = (*InmemTransport)(nil)
+	_ contract.LimitsProvider          = (*InmemTransport)(nil)
+	_ contract.TransportTimingProvider = (*InmemTransport)(nil)
+)
 
 // InmemTransportTimeout — тайм-аут одного RPC внутрипроцессного
 // транспорта (500 мс). Корневой тестовый харнесс выводит свои
@@ -37,16 +48,87 @@ var _ contract.Transport = (*InmemTransport)(nil)
 // точку значения и рассинхрон был исключён компилятором.
 const InmemTransportTimeout = 500 * time.Millisecond
 
-// NewInmemTransport создаёт новый InmemTransport с заданным локальным адресом.
+// NewInmemTransport создаёт новый InmemTransport с заданным локальным адресом
+// и профилем пределов по умолчанию (protocol.DefaultLimits).
 // Тайм-аут по умолчанию — 500ms.
 func NewInmemTransport(addr contract.ServerAddress) *InmemTransport {
+	return newInmemTransport(addr, protocol.DefaultLimits())
+}
+
+// NewInmemTransportWithLimits создаёт InmemTransport с заданным профилем
+// пределов. Целиком нулевой профиль заменяется профилем по умолчанию,
+// недопустимый или частично нулевой отвергается.
+func NewInmemTransportWithLimits(addr contract.ServerAddress, limits contract.Limits) (*InmemTransport, error) {
+	normalized, err := protocol.NormalizeLimits(limits)
+	if err != nil {
+		return nil, fmt.Errorf("raft: invalid in-memory transport limits: %w", err)
+	}
+	return newInmemTransport(addr, normalized), nil
+}
+
+func newInmemTransport(addr contract.ServerAddress, limits contract.Limits) *InmemTransport {
 	return &InmemTransport{
 		consumerCh: make(chan contract.RPC),
 		localAddr:  addr,
 		peers:      make(map[contract.ServerID]*InmemTransport),
 		shutdownCh: make(chan struct{}),
 		timeout:    InmemTransportTimeout,
+		limits:     limits,
 	}
+}
+
+// Limits возвращает действующий профиль пределов транспорта.
+func (t *InmemTransport) Limits() contract.Limits {
+	return t.limits
+}
+
+// TransportTiming возвращает сроки внутрипроцессного транспорта: окно
+// обмена InmemTransportTimeout на обеих сторонах, без установки соединения.
+// InProcess = true: сетевого обмена нет, сетевое условие временной модели
+// к транспорту не применяется.
+func (t *InmemTransport) TransportTiming() contract.TransportTiming {
+	return contract.TransportTiming{
+		BaseSend:  t.timeout,
+		BaseRecv:  t.timeout,
+		Dial:      0,
+		InProcess: true,
+	}
+}
+
+// checkAppendEntries защитно проверяет запрос по тому же профилю пределов,
+// что и сетевой формат: число записей не больше MaxEntries, сетевая длина
+// Data каждой записи — protocol.MeasureData — не больше MaxDataBytes.
+// Сетевой кадр не строится; Data обязана быть gob-кодируемой.
+func (t *InmemTransport) checkAppendEntries(args *contract.AppendEntriesArgs) error {
+	if uint64(len(args.Entries)) > t.limits.MaxEntries {
+		return fmt.Errorf("raft: %w: AppendEntries EntryCount %d exceeds MaxEntries %d",
+			protocol.ErrLimit, len(args.Entries), t.limits.MaxEntries)
+	}
+	for i := range args.Entries {
+		if _, err := protocol.MeasureData(args.Entries[i].Data, t.limits.MaxDataBytes); err != nil {
+			if errors.Is(err, protocol.ErrLimit) {
+				return fmt.Errorf("raft: AppendEntries entry index %d exceeds MaxDataBytes %d: %w",
+					args.Entries[i].Index, t.limits.MaxDataBytes, err)
+			}
+			return fmt.Errorf("raft: AppendEntries entry index %d: %w", args.Entries[i].Index, err)
+		}
+	}
+	return nil
+}
+
+// checkSnapshotConfiguration проверяет длину конфигурации снимка по C.
+func checkSnapshotConfiguration(req *contract.InstallSnapshotRequest, limits contract.Limits) error {
+	if uint64(len(req.Configuration)) > limits.MaxConfigurationBytes {
+		return fmt.Errorf("raft: %w: InstallSnapshot configuration %d bytes exceeds MaxConfigurationBytes %d",
+			protocol.ErrLimit, len(req.Configuration), limits.MaxConfigurationBytes)
+	}
+	return nil
+}
+
+// LimitRejections возвращает копию счётчика отказов приёма по пределам:
+// ключ "<параметр F/N/D/C>|<адрес отправителя>", значение — число отказов.
+func (t *InmemTransport) LimitRejections() map[string]uint64 {
+	return t.rejections.snapshot()
 }
 
 // Consumer возвращает небуферизированный канал входящих RPC.
@@ -73,9 +155,20 @@ func (t *InmemTransport) AppendEntries(
 		return zero, contract.ErrRaftShutdown
 	default:
 	}
+	if err := t.checkAppendEntries(&args); err != nil {
+		return zero, err
+	}
 	peer, err := t.getPeer(peerID)
 	if err != nil {
 		return zero, err
+	}
+	// Защитная проверка профиля получателя до доставки; при равных
+	// профилях повторное измерение не требуется.
+	if peer.limits != t.limits {
+		if err = peer.checkAppendEntries(&args); err != nil {
+			peer.rejections.record(string(t.localAddr), err)
+			return zero, fmt.Errorf("raft: receiver %s: %w", peer.localAddr, err)
+		}
 	}
 	respCh := make(chan contract.RPCResponse, 1)
 	select {
@@ -263,9 +356,16 @@ func (t *InmemTransport) InstallSnapshot(
 		return zero, contract.ErrRaftShutdown
 	default:
 	}
+	if err := checkSnapshotConfiguration(&req, t.limits); err != nil {
+		return zero, err
+	}
 	peer, err := t.getPeer(peerID)
 	if err != nil {
 		return zero, err
+	}
+	if err = checkSnapshotConfiguration(&req, peer.limits); err != nil {
+		peer.rejections.record(string(t.localAddr), err)
+		return zero, fmt.Errorf("raft: receiver %s: %w", peer.localAddr, err)
 	}
 	respCh := make(chan contract.RPCResponse, 1)
 	select {

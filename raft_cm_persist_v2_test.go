@@ -20,7 +20,7 @@ import (
 // маркерная ошибка с прежним смыслом «log not found», пустой созданный
 // журнал даёт пустой срез и nil.
 func TestLoadLogForRestore_MissingAndEmpty(t *testing.T) {
-	missing := &ConsensusModule{storage: store.NewMapStorage()}
+	missing := &ConsensusModule{limits: testLimits, storage: store.NewMapStorage()}
 	if _, err := missing.loadLogForRestore(); !errors.Is(err, contract.ErrLogNotFound) {
 		t.Fatalf("отсутствующий журнал: err = %v, want ErrLogNotFound", err)
 	} else if !strings.Contains(err.Error(), "log not found") {
@@ -29,7 +29,7 @@ func TestLoadLogForRestore_MissingAndEmpty(t *testing.T) {
 
 	empty := store.NewMapStorage()
 	empty.RewriteLog([]LogEntry{})
-	cm := &ConsensusModule{storage: empty}
+	cm := &ConsensusModule{limits: testLimits, storage: empty}
 	entries, err := cm.loadLogForRestore()
 	if err != nil {
 		t.Fatalf("существующий пустой журнал: неожиданная ошибка %v", err)
@@ -46,7 +46,7 @@ func TestPersistV2_JournalStatsFromStoreResult(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	storage := store.NewFileStorage(t.TempDir())
-	cm := &ConsensusModule{storage: storage}
+	cm := &ConsensusModule{limits: testLimits, storage: storage}
 	cm.cmState.currentTerm = 1
 	cm.cmState.votedFor = -1
 	cm.cmState.lastSnapshotIndex = -1
@@ -77,7 +77,7 @@ func TestPersistV2_JournalStatsFromStoreResult(t *testing.T) {
 // MapStorage логическая операция журнала учитывается, а дисковые счётчики
 // (байты и записи) остаются нулевыми: диска у хранилища нет.
 func TestPersistV2_MapStorageLogicalCallWithoutDisk(t *testing.T) {
-	cm := &ConsensusModule{storage: store.NewMapStorage()}
+	cm := &ConsensusModule{limits: testLimits, storage: store.NewMapStorage()}
 	cm.cmState.log = []LogEntry{{Index: 0, Term: 1}}
 	cm.markLogRewriteDirtyLocked()
 
@@ -278,7 +278,7 @@ func TestFreshNodeFirstPersistCreatesJournal(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	storage := store.NewFileStorage(t.TempDir())
-	cm := &ConsensusModule{storage: storage}
+	cm := &ConsensusModule{limits: testLimits, storage: storage}
 	cm.markLogRewriteDirtyLocked()
 
 	cm.mu.Lock()

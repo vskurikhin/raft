@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"math"
 	"time"
 
 	"github.com/vskurikhin/raft/pkg/raft/contract"
@@ -89,7 +90,7 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	if cm.cmState.state == Dead {
-		return nil
+		return contract.ErrRaftShutdown
 	}
 
 	if err := checkRPCHeader(&args); err != nil {
@@ -263,8 +264,13 @@ func (cm *ConsensusModule) appendMatchingEntriesLocked(
 		}
 	}
 
-	if args.LeaderCommit > cm.cmState.commitIndex {
-		cm.cmState.commitIndex = min(args.LeaderCommit, cm.cmState.lastLogIndex)
+	// Фиксация ведомого ограничена концом полученного пакета, а не концом
+	// собственного журнала: хвост ведомого за пределами пакета мог ещё не
+	// совпадать с журналом лидера, и его фиксация нарушила бы безопасность
+	// машины состояний. Индекс фиксации только растёт.
+	newCommit := followerCommitIndex(args.LeaderCommit, args.PrevLogIndex, len(args.Entries))
+	if newCommit > cm.cmState.commitIndex {
+		cm.cmState.commitIndex = newCommit
 		if traceEnabled(_traceLevelReplication) {
 			cm.traceLogfLocked("... setting commitIndex=%d", cm.cmState.commitIndex)
 		}
@@ -272,6 +278,17 @@ func (cm *ConsensusModule) appendMatchingEntriesLocked(
 		return cm.cmState.commitIndex, true
 	}
 	return 0, false
+}
+
+// followerCommitIndex — граница фиксации ведомого по одному запросу
+// AppendEntries: min(LeaderCommit, PrevLogIndex+len(Entries)). Сумма
+// проверяется на переполнение: при непредставимой сумме границей остаётся
+// LeaderCommit, который сам не больше MaxInt.
+func followerCommitIndex(leaderCommit, prevLogIndex, entries int) int {
+	if prevLogIndex > math.MaxInt-entries {
+		return leaderCommit
+	}
+	return min(leaderCommit, prevLogIndex+entries)
 }
 
 // buildConflictReplyLocked заполняет подсказку о конфликте, когда журнал не
@@ -320,7 +337,7 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	if cm.cmState.state == Dead {
-		return nil
+		return contract.ErrRaftShutdown
 	}
 
 	if err := checkRPCHeader(&args); err != nil {
@@ -422,7 +439,7 @@ func (cm *ConsensusModule) RequestPreVote(args RequestPreVoteArgs, reply *Reques
 	defer cm.mu.Unlock()
 
 	if cm.cmState.state == Dead {
-		return nil
+		return contract.ErrRaftShutdown
 	}
 
 	if err := checkRPCHeader(&args); err != nil {

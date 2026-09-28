@@ -41,6 +41,11 @@ type KVClient struct {
 	clientID int32
 }
 
+// ErrRequestTooLarge — сервис отверг запрос как превышающий его пределы
+// (HTTP 413 либо статус api.StatusTooLarge). Отказ терминальный: клиент
+// не переключается на другой адрес и не повторяет запрос.
+var ErrRequestTooLarge = errors.New("kvclient: request too large")
+
 var (
 	// errMethodNotAllowed — сервер ответил 405 на GET-запрос слабого
 	// чтения или проверки лидерства: метод маршрута не совпадает
@@ -95,22 +100,22 @@ func (c *KVClient) VerifyLeader(ctx context.Context) (int, error) {
 			}
 			// Метод маршрута одинаков для всех узлов кластера —
 			// повтор по другому адресу бессмыслен.
-			if errors.Is(err, errMethodNotAllowed) || errors.Is(err, errRouteMismatch) {
+			if errors.Is(err, errMethodNotAllowed) || errors.Is(err, errRouteMismatch) ||
+				errors.Is(err, ErrRequestTooLarge) {
 				return -1, err
 			}
 			c.nextLeader()
 			continue
 		}
 
-		switch sr.Status() {
-		case api.StatusOK:
+		// NotLeader — переход к следующему адресу; TooLarge, FailedCommit и
+		// неизвестный статус терминальны, как и для остальных запросов.
+		retry, err := c.handleStatus(sr.Status())
+		if err != nil {
+			return -1, err
+		}
+		if !retry {
 			return leader, nil
-		case api.StatusNotLeader:
-			c.nextLeader()
-			continue
-		default:
-			c.nextLeader()
-			continue
 		}
 	}
 }
@@ -192,7 +197,7 @@ func (c *KVClient) send(ctx context.Context, route string, req any, resp api.Res
 		c.clientLogf("sending %#v to %v", req, path)
 		if err := sendJSONRequest(reqCtx, path, req, resp); err != nil {
 			reqCtxCancel()
-			if ctx.Err() != nil {
+			if ctx.Err() != nil || errors.Is(err, ErrRequestTooLarge) {
 				return err
 			}
 			c.clientLogf("request failed: %v; switching to next address", err)
@@ -202,18 +207,30 @@ func (c *KVClient) send(ctx context.Context, route string, req any, resp api.Res
 		reqCtxCancel()
 		c.clientLogf("received response %#v", resp)
 
-		switch resp.Status() {
-		case api.StatusNotLeader:
-			c.clientLogf("not leader: will try next address")
-			c.nextLeader()
-			continue
-		case api.StatusOK:
-			return nil
-		case api.StatusFailedCommit:
-			return errors.New("commit failed; please retry")
-		default:
-			panic("unreachable")
+		retry, err := c.handleStatus(resp.Status())
+		if !retry {
+			return err
 		}
+	}
+}
+
+// handleStatus разбирает статус ответа: NotLeader — переход к следующему
+// адресу и повтор; OK — успех; FailedCommit, TooLarge и неизвестный статус —
+// терминальная ошибка без повтора.
+func (c *KVClient) handleStatus(status api.ResponseStatus) (retry bool, err error) {
+	switch status {
+	case api.StatusNotLeader:
+		c.clientLogf("not leader: will try next address")
+		c.nextLeader()
+		return true, nil
+	case api.StatusOK:
+		return false, nil
+	case api.StatusFailedCommit:
+		return false, errors.New("commit failed; please retry")
+	case api.StatusTooLarge:
+		return false, ErrRequestTooLarge
+	default:
+		return false, fmt.Errorf("kvclient: protocol error: unknown response status %d", int(status))
 	}
 }
 
@@ -232,7 +249,8 @@ func (c *KVClient) sendGet(ctx context.Context, route, key string, resp api.Resp
 			if ctx.Err() != nil {
 				return err
 			}
-			if errors.Is(err, errMethodNotAllowed) || errors.Is(err, errRouteMismatch) {
+			if errors.Is(err, errMethodNotAllowed) || errors.Is(err, errRouteMismatch) ||
+				errors.Is(err, ErrRequestTooLarge) {
 				return err
 			}
 			c.clientLogf("request failed: %v; switching to next address", err)
@@ -242,17 +260,9 @@ func (c *KVClient) sendGet(ctx context.Context, route, key string, resp api.Resp
 		reqCtxCancel()
 		c.clientLogf("received response %#v", resp)
 
-		switch resp.Status() {
-		case api.StatusNotLeader:
-			c.clientLogf("not leader: will try next address")
-			c.nextLeader()
-			continue
-		case api.StatusOK:
-			return nil
-		case api.StatusFailedCommit:
-			return errors.New("commit failed; please retry")
-		default:
-			panic("unreachable")
+		retry, err := c.handleStatus(resp.Status())
+		if !retry {
+			return err
 		}
 	}
 }
@@ -291,6 +301,9 @@ func sendJSONGetRequest(ctx context.Context, path string, respData any) error {
 	}()
 
 	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == http.StatusRequestEntityTooLarge {
+			return ErrRequestTooLarge
+		}
 		if resp.StatusCode == http.StatusMethodNotAllowed {
 			return errMethodNotAllowed
 		}
@@ -350,6 +363,11 @@ func sendJSONRequest(ctx context.Context, path string, reqData, respData any) er
 		}
 	}()
 
+	// HTTP 413 распознаётся по коду состояния независимо от тела ответа
+	// (JSON либо текст).
+	if resp.StatusCode == http.StatusRequestEntityTooLarge {
+		return ErrRequestTooLarge
+	}
 	dec := json.NewDecoder(resp.Body)
 	if err := dec.Decode(respData); err != nil {
 		return fmt.Errorf("JSON-decoding response data: %w", err)

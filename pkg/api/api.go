@@ -91,6 +91,11 @@ const (
 	StatusOK
 	StatusNotLeader
 	StatusFailedCommit
+	// StatusTooLarge — запрос превышает пределы узла: длина ключа, значения,
+	// значения сравнения, тела запроса или сетевая длина команды. Отказ
+	// терминальный: повтор на другом узле его не исправит. Сопровождается
+	// HTTP 413.
+	StatusTooLarge
 )
 
 // StatusResponse — минимальный ответ, содержащий только статус.
@@ -115,6 +120,8 @@ func (rs ResponseStatus) String() string {
 		return "NotLeader"
 	case StatusFailedCommit:
 		return "FailedCommit"
+	case StatusTooLarge:
+		return "TooLarge"
 	default:
 		return ""
 	}

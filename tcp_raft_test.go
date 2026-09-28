@@ -78,7 +78,13 @@ func newTCPHarness(t *testing.T, n int) *tcpHarness {
 		}
 
 		storage[i] = store.NewMapStorage()
-		cluster[i] = NewConsensusModule(
+		// Окно RPC транспорта 500 мс: временной профиль узла требует
+		// heartbeat + ticker + max RPC window < reelection base, то есть
+		// 33 + 20 + 500 = 553 < 600. База выборов 600 мс передаётся
+		// конструктору до запуска горутин; публичный NewConsensusModule
+		// использует умолчание 430 мс и такой профиль отверг бы.
+		cluster[i] = newConsensusModule(
+			cmConfig{timers: tcpHarnessTimers(600 * time.Millisecond)},
 			i, peerIds, transports[i],
 			storage[i], NoOpFSM{}, ready,
 		)
@@ -95,6 +101,14 @@ func newTCPHarness(t *testing.T, n int) *tcpHarness {
 		ready:      ready,
 		n:          n,
 	}
+}
+
+// tcpHarnessTimers — временные параметры по умолчанию с заданной базой
+// выборов для узлов на TCP-транспорте с увеличенным окном RPC.
+func tcpHarnessTimers(reelection time.Duration) *TimerConfig {
+	timers := defaultTimerConfig()
+	timers.Reelection = reelection
+	return &timers
 }
 
 // Close останавливает все живые узлы кластера и закрывает транспорты.

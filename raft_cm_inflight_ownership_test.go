@@ -33,6 +33,7 @@ import (
 // уменьшил бы nextIndex до 11 и matchIndex до 10 — тест падает.
 func TestApplyAESuccessLocked_MonotonicIndices(t *testing.T) {
 	cm := &ConsensusModule{
+		limits: testLimits,
 		leaderState: leaderState{
 			nextIndex:  map[int]int{1: 10},
 			matchIndex: map[int]int{1: 5},

@@ -61,12 +61,17 @@ func TestRunWithEmptyPeers(t *testing.T) {
 // тайм-аут и пул передаются аргументами NewTCPTransport в runWith, а
 // подстановка дефолтов транспорта покрыта тестами transport_tcp_test.go;
 // параметры снимков доказываются юнит-тестами server_test.go.
+//
+// Окно RPC 500 мс требует heartbeat + ticker + max RPC window < reelection
+// base: 33 + 20 + 500 = 553 < 600, поэтому база выборов задана явно
+// (600 мс проходит и диапазонную проверку ValidateTiming).
 func TestRunWithNonDefaultNodeFlags(t *testing.T) {
 	t.Cleanup(leaktest.CheckTimeout(t, raft.LeaktestBudget))
 
 	values := newTestValues(t)
 	values.Peers = map[int]net.Addr{}
 	values.TCPRPCTimeout = 500 * time.Millisecond
+	values.ReelectionTimeout = 600 * time.Millisecond
 	values.MaxPool = 8
 	values.SnapshotInterval = time.Second
 	values.SnapshotThreshold = 32

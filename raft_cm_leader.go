@@ -1,10 +1,12 @@
 package raft
 
 import (
+	"errors"
 	"sync/atomic"
 	"time"
 
 	"github.com/vskurikhin/raft/pkg/raft/contract"
+	"github.com/vskurikhin/raft/pkg/raft/protocol"
 )
 
 // _leadershipTransferPollInterval — период опроса nextIndex целевого
@@ -53,6 +55,11 @@ func (cm *ConsensusModule) AddVoter(id ServerID, addr ServerAddress) IndexFuture
 // (LogEntry.Data = command, без копирования); вызывающий не должен мутировать
 // переданную команду после вызова Apply — в противном случае изменение увидят
 // и журнал, и FSM, и любой потребитель, удержавший payload.
+//
+// Data команды обязана быть gob-кодируемой при любом транспорте и хранилище:
+// до постановки в очередь её сетевая длина измеряется protocol.MeasureData
+// вне cm.mu. Превышение MaxDataBytes — ErrCommandTooLarge, некодируемая
+// Data — ошибка кодирования; в обоих случаях запись в журнал не попадает.
 func (cm *ConsensusModule) Apply(command any, timeout time.Duration) ApplyFuture {
 	select {
 	case <-cm.shutdownCh:
@@ -68,19 +75,26 @@ func (cm *ConsensusModule) Apply(command any, timeout time.Duration) ApplyFuture
 	}
 	future.init(cm.shutdownCh)
 
-	cm.mu.Lock()
-	if cm.cmState.state != Leader {
-		cm.mu.Unlock()
-		return errorFuture{ErrNotLeader}
+	if err := cm.applyAdmissionError(); err != nil {
+		return errorFuture{err}
 	}
-	// Во время передачи лидерства Apply блокируется — клиент получает
-	// ErrLeadershipTransferInProgress. Это предотвращает ситуации, когда
-	// новые команды приходят после того, как таргет уже догнал журнал.
-	if atomic.LoadInt32(&cm.leaderState.leadershipTransferInProgress) != 0 {
-		cm.mu.Unlock()
-		return errorFuture{ErrLeadershipTransferInProgress}
+	// Измерение — кодирование Data: выполняется без cm.mu.
+	if err := measureCommand(command, cm.limits); err != nil {
+		if errors.Is(err, ErrCommandTooLarge) {
+			cm.countLimitRejection(limitDirectionPreflight, limitRejectionPeerLocal, limitParameterD)
+		}
+		return errorFuture{err}
 	}
-	cm.mu.Unlock()
+	// Роль и остановка перепроверяются после измерения: за время
+	// кодирования узел мог перестать быть лидером.
+	select {
+	case <-cm.shutdownCh:
+		return errorFuture{contract.ErrRaftShutdown}
+	default:
+	}
+	if err := cm.applyAdmissionError(); err != nil {
+		return errorFuture{err}
+	}
 
 	var timer <-chan time.Time
 	if timeout > 0 {
@@ -94,6 +108,24 @@ func (cm *ConsensusModule) Apply(command any, timeout time.Duration) ApplyFuture
 	case cm.applyCh <- future:
 		return future
 	}
+}
+
+// applyAdmissionError проверяет, может ли узел принять команду клиента:
+// только лидер вне передачи лидерства. Во время передачи лидерства Apply
+// блокируется — клиент получает ErrLeadershipTransferInProgress. Это
+// предотвращает ситуации, когда новые команды приходят после того, как
+// таргет уже догнал журнал.
+// Самостоятельно захватывает и освобождает cm.mu.
+func (cm *ConsensusModule) applyAdmissionError() error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	if cm.cmState.state != Leader {
+		return ErrNotLeader
+	}
+	if atomic.LoadInt32(&cm.leaderState.leadershipTransferInProgress) != 0 {
+		return ErrLeadershipTransferInProgress
+	}
+	return nil
 }
 
 // DemoteVoter понижает голосующего до неголосующего.
@@ -204,6 +236,10 @@ func (cm *ConsensusModule) VerifyLeader() Future {
 
 // appendConfigurationEntry записывает запись LogConfiguration в журнал лидера
 // и запускает репликацию. Вызывается из leaderLoop.
+//
+// Данные записи конфигурации кодируются и проверяются по пределам
+// (MaxConfigurationBytes и сетевая длина Data не больше MaxDataBytes) до
+// журнала и вне cm.mu; после проверки роль и терм перепроверяются.
 func (cm *ConsensusModule) appendConfigurationEntry(future *configurationChangeFuture) {
 	cm.mu.Lock()
 	nextCfg, err := nextConfiguration(
@@ -211,16 +247,29 @@ func (cm *ConsensusModule) appendConfigurationEntry(future *configurationChangeF
 		cm.cmState.configurations.committedIndex,
 		future.req,
 	)
+	term := cm.cmState.currentTerm
+	cm.mu.Unlock()
 	if err != nil {
-		cm.mu.Unlock()
 		future.respond(err)
 		return
 	}
 
 	data, err := EncodeConfiguration(nextCfg)
+	if err == nil {
+		var parameter string
+		if parameter, err = checkConfigurationData(data, cm.limits); err != nil && errors.Is(err, protocol.ErrLimit) {
+			cm.countLimitRejection(limitDirectionPreflight, limitRejectionPeerLocal, parameter)
+		}
+	}
 	if err != nil {
-		cm.mu.Unlock()
 		future.respond(err)
+		return
+	}
+
+	cm.mu.Lock()
+	if cm.cmState.state != Leader || cm.cmState.currentTerm != term {
+		cm.mu.Unlock()
+		future.respond(ErrNotLeader)
 		return
 	}
 

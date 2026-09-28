@@ -711,6 +711,14 @@ func (cm *ConsensusModule) timeoutNow(rpc RPC, req *TimeoutNowRequest) {
 		cm.traceLogf("received TimeoutNow from %d", req.ServerID)
 	}
 
+	// Версия протокола проверяется до любого изменения состояния: запрос
+	// несовместимой версии не останавливает таймер выборов и не начинает
+	// выборы.
+	if err := checkRPCHeader(req); err != nil {
+		rpc.RespChan <- RPCResponse{Error: err}
+		return
+	}
+
 	// Уже лидер — no-op.
 	cm.mu.Lock()
 	if cm.cmState.state == Leader {
@@ -726,14 +734,16 @@ func (cm *ConsensusModule) timeoutNow(rpc RPC, req *TimeoutNowRequest) {
 		return
 	}
 	// Если не лидер, проверяем только состояние Follower (Candidate/PreCandidate
-	// не могут получить TimeoutNow).
+	// не могут получить TimeoutNow). Терм снимается под cm.mu до Unlock:
+	// чтение cm.cmState.currentTerm вне критической секции — гонка данных.
 	if cm.cmState.state != Follower {
+		term := cm.cmState.currentTerm
 		cm.mu.Unlock()
 		rpc.RespChan <- RPCResponse{
 			Reply: &TimeoutNowResponse{
 				RPCHeader: RPCHeader{ProtocolVersion: ProtocolVersion, ServerID: cm.id},
 				Success:   false,
-				Term:      cm.cmState.currentTerm,
+				Term:      term,
 			},
 		}
 		return

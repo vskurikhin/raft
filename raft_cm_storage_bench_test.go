@@ -20,7 +20,7 @@ func (benchNoopFSM) Restore(io.ReadCloser) error { return nil }
 // newBenchCM собирает ConsensusModule с постоянным хранилищем в каталоге dir
 // прямой инициализацией структуры, без запуска горутин.
 func newBenchCM(dir string) *ConsensusModule {
-	cm := &ConsensusModule{storage: store.NewFileStorage(dir)}
+	cm := &ConsensusModule{limits: testLimits, storage: store.NewFileStorage(dir)}
 	cm.cmState.currentTerm = 1
 	cm.cmState.votedFor = -1
 	cm.cmState.lastSnapshotIndex = -1

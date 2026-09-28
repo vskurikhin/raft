@@ -165,7 +165,7 @@ func TestPersistCounters_FollowerTermScalarChangeWrites(t *testing.T) {
 func TestPersistCounters_CandidateFromLeadershipTransfer(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
-	cm := &ConsensusModule{}
+	cm := &ConsensusModule{limits: testLimits}
 	cm.id = 7
 	cm.storage = store.NewMapStorage()
 	cm.shutdownCh = make(chan struct{})
@@ -387,6 +387,7 @@ func TestPersistCounters_StartupRestore(t *testing.T) {
 	}
 
 	cm := &ConsensusModule{
+		limits:        testLimits,
 		storage:       store.NewMapStorage(),
 		snapshotStore: snapStore,
 		fsm:           newSnapshotTestFSM(),

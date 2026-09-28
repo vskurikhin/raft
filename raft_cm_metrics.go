@@ -232,6 +232,12 @@ type statsSnapshot struct {
 	counters statsCountersSnapshot
 	persist  persistenceSnapshot
 	dirty    dirtySnapshot
+	// limitRejections — копия счётчика отказов по пределам CM (отправка и
+	// preflight); отказы приёма транспорта добавляются при публикации.
+	limitRejections map[limitRejectionKey]int64
+	// limitRows — строки protocol_limit_rejections_total для публикации:
+	// заполняются вне cm.mu вместе с отказами приёма транспорта.
+	limitRows []statsLimitRejection
 }
 
 // takeStatsSnapshot снимает состояние отчёта за один захват cm.mu: роль,
@@ -255,6 +261,8 @@ func (cm *ConsensusModule) takeStatsSnapshot() statsSnapshot {
 		counters: cm.countersSnapshotLocked(),
 		persist:  cm.persistence.snapshot(),
 		dirty:    cm.dirty.snapshot(at),
+
+		limitRejections: cm.limitRejectionsLocked(),
 	}
 }
 
@@ -281,6 +289,7 @@ func (cm *ConsensusModule) publishStats(out, diag io.Writer) {
 		return
 	}
 	storage := takeStorageDiagnostics(cm.storage)
+	snap.limitRows = limitRejectionRows(snap.limitRejections, cm.transport)
 	cm.statsSeq++
 	prefix := tracelog.FormatPrefix(tracelog.Prefix{
 		Letter: stateLetter(snap.role),
@@ -377,6 +386,9 @@ type raftCounters struct {
 	// (отбракованный невозможный отказ), по пиру.
 	nextIndexRejectionIgnored map[int]int64
 
+	// limitRejections — отказы отправки AppendEntries по пределам сетевого
+	// формата: по соседу и параметру профиля (F/N/D/C). Защищено cm.mu.
+	limitRejections map[limitRejectionKey]int64
 	// snapshotLogBoundaryViolation — нарушения в runtime
 	// (пост-условие).
 	snapshotLogBoundaryViolation atomic.Int64

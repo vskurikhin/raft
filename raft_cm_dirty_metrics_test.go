@@ -521,7 +521,7 @@ func TestDirtyMetrics_DisabledOutputStillAccumulates(t *testing.T) {
 	storage.Set(_storageKeyLastSnapshotIndex, gobEncode(t, -1))
 	storage.Set(_storageKeyLastSnapshotTerm, gobEncode(t, -1))
 
-	cm := &ConsensusModule{storage: storage, disableStatsOutput: true}
+	cm := &ConsensusModule{limits: testLimits, storage: storage, disableStatsOutput: true}
 	cm.cmState.lastSnapshotIndex = -1
 	cm.cmState.lastSnapshotTerm = -1
 

@@ -27,7 +27,7 @@ import (
 func TestAppendEntries_ConflictIndexSnapshotBoundary(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
-	cm := &ConsensusModule{}
+	cm := &ConsensusModule{limits: testLimits}
 	cm.storage = store.NewMapStorage()
 	cm.cmState.state = Follower
 	cm.cmState.currentTerm = 1
@@ -64,7 +64,7 @@ func TestAppendEntries_ConflictIndexSnapshotBoundary(t *testing.T) {
 func TestAppendEntries_ConflictIndexSnapshotBoundaryCorrupted(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
-	cm := &ConsensusModule{}
+	cm := &ConsensusModule{limits: testLimits}
 	cm.storage = store.NewMapStorage()
 	cm.cmState.state = Follower
 	cm.cmState.currentTerm = 1
@@ -106,7 +106,7 @@ func TestAppendEntries_ConflictIndexSnapshotBoundaryCorrupted(t *testing.T) {
 func TestAppendEntries_StaleTermFollower_NoStateChange(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
-	cm := &ConsensusModule{}
+	cm := &ConsensusModule{limits: testLimits}
 	cm.id = 5
 	cm.storage = store.NewMapStorage()
 	cm.cmState.state = Follower
@@ -184,7 +184,7 @@ func TestAppendEntries_CandidateFromLeadershipTransfer_NoStepDown(t *testing.T) 
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			cm := &ConsensusModule{}
+			cm := &ConsensusModule{limits: testLimits}
 			cm.id = 7
 			cm.storage = store.NewMapStorage()
 			cm.shutdownCh = make(chan struct{})
@@ -254,7 +254,7 @@ func TestAppendEntries_CandidateFromLeadershipTransfer_NoStepDown(t *testing.T) 
 func TestAppendEntries_HigherTerm_StepsDownInHandler(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
-	cm := &ConsensusModule{}
+	cm := &ConsensusModule{limits: testLimits}
 	cm.id = 3
 	cm.storage = store.NewMapStorage()
 	cm.shutdownCh = make(chan struct{})

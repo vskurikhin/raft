@@ -21,7 +21,7 @@ import (
 func TestSendBatch_SkipsMissingPrefix(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
-	cm := &ConsensusModule{}
+	cm := &ConsensusModule{limits: testLimits}
 	cm.cmState.log = []LogEntry{{Index: 5, Term: 1, Type: LogCommand, Data: "k=v"}}
 	cm.cmState.lastLogIndex = 5
 	cm.cmState.lastLogTerm = 1
@@ -74,15 +74,17 @@ func TestSendBatch_CopyNotAliasedWithLog(t *testing.T) {
 	defer cm.Stop()
 	defer fsm.releaseApply()
 
-	// Первый AppendEntries (пустые Entries) продвигает commitIndex до k и через
-	// processLogs формирует батч [0..k], отправляемый в fsmMutateCh.
+	// Первый AppendEntries (пустые Entries) подтверждает префикс журнала до k
+	// (PrevLogIndex=k с совпадающим термом) и продвигает commitIndex до k —
+	// фиксация ведомого ограничена концом подтверждённого префикса; через
+	// processLogs формируется батч [0..k], отправляемый в fsmMutateCh.
 	var reply1 AppendEntriesReply
 	if err := cm.AppendEntries(AppendEntriesArgs{
 		RPCHeader:    RPCHeader{ProtocolVersion: ProtocolVersion, ServerID: 99},
 		Term:         1,
 		LeaderID:     99,
-		PrevLogIndex: -1,
-		PrevLogTerm:  0,
+		PrevLogIndex: k,
+		PrevLogTerm:  1,
 		LeaderCommit: k,
 	}, &reply1); err != nil {
 		t.Fatalf("первый AppendEntries: %v", err)
@@ -164,7 +166,7 @@ func TestFSMRetainedEntryImmutable(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	const k = 3
-	cm := &ConsensusModule{}
+	cm := &ConsensusModule{limits: testLimits}
 	cm.fsmMutateCh = make(chan []*commitTuple, _batchApplyBuffer)
 	cm.leaderState.inflight = make(map[int]*logFuture)
 	cm.cmState.log = []LogEntry{
@@ -401,7 +403,7 @@ func forceLeaderChange(t *testing.T, h *Harness) leaderObservation {
 // AppendEntries проходила без реаллокации backing array (требование к тесту 1).
 // fsm и запуск runFSM выполняет вызывающий.
 func newAliasTestCM(k int) *ConsensusModule {
-	cm := &ConsensusModule{}
+	cm := &ConsensusModule{limits: testLimits}
 	cm.storage = store.NewMapStorage()
 	cm.fsmMutateCh = make(chan []*commitTuple, _batchApplyBuffer)
 	cm.shutdownCh = make(chan struct{})

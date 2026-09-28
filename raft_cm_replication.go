@@ -1,8 +1,11 @@
 package raft
 
 import (
+	"errors"
 	"fmt"
 	"time"
+
+	"github.com/vskurikhin/raft/pkg/raft/protocol"
 )
 
 // replicationPlan — решение предотправочной фазы репликации на соседа.
@@ -68,8 +71,14 @@ func (cm *ConsensusModule) nextIndexArgsEntries(
 		pos := cm.logPositionLocked(ni)
 
 		// Defensive check: если позиция вне диапазона — логируем аномалию и возвращаем пустой срез.
+		// Пакет ограничен префиксом суффикса не длиннее MaxEntries записей:
+		// остаток уходит следующими пакетами по мере продвижения nextIndex.
 		if pos < len(cm.cmState.log) {
-			entries = append([]LogEntry{}, cm.cmState.log[pos:]...)
+			end := len(cm.cmState.log)
+			if maxEntries := cm.limits.MaxEntries; uint64(end-pos) > maxEntries {
+				end = pos + int(maxEntries)
+			}
+			entries = append([]LogEntry{}, cm.cmState.log[pos:end]...)
 		} else if traceEnabled(_traceLevelLoops) {
 			cm.traceLogfLocked(
 				"nextIndexArgsEntries: logPositionLocked(%d) out of range (len=%d)",
@@ -239,6 +248,9 @@ func (cm *ConsensusModule) leaderSendAEsToPeer(peerID, savedCurrentTerm int, dis
 
 	reply, err := cm.transport.AppendEntries(ServerID(peerID), args)
 	if err != nil {
+		if errors.Is(err, protocol.ErrLimit) {
+			cm.recordAELimitRejection(peerID, entries, err)
+		}
 		cm.incReplFailuresIfLeader(peerID, savedCurrentTerm)
 		return
 	}
@@ -685,7 +697,16 @@ func (cm *ConsensusModule) leaderSendSnapshot(peerID, term int) {
 	}
 	defer func() { _ = reader.Close() }()
 
-	cfgData, _ := EncodeConfiguration(meta.Configuration)
+	cfgData, err := EncodeConfiguration(meta.Configuration)
+	if err != nil {
+		// Ошибка кодирования конфигурации обнаруживается до открытия потока
+		// и отправки: RPC не выполняется.
+		if traceEnabled(_traceLevelKeyEvents) {
+			cm.traceLogf("leaderSendSnapshot: cannot encode configuration of snapshot %s for peer %d: %v",
+				snapshots[0].ID, peerID, err)
+		}
+		return
+	}
 
 	req := cm.newInstallSnapshotRequest(term, meta, cfgData)
 
@@ -701,6 +722,9 @@ func (cm *ConsensusModule) leaderSendSnapshot(peerID, term int) {
 
 	reply, err := cm.transport.InstallSnapshot(ServerID(peerID), req, reader)
 	if err != nil {
+		if errors.Is(err, protocol.ErrLimit) {
+			cm.countLimitRejection(limitDirectionSend, fmt.Sprint(peerID), limitParameterC)
+		}
 		// Задержка повторов активируется только транспортными ошибками
 		// для текущего лидерства.
 		cm.mu.Lock()

@@ -134,6 +134,10 @@ type KVService struct {
 	// atomic.Bool: пишется из тестовой горутины
 	// (ToggleHTTPResponsesEnabled), читается из HTTP-обработчиков.
 	httpResponsesEnabled atomic.Bool
+
+	// limits — нормализованные пределы полей и тела запроса. Неизменяемы
+	// после конструктора.
+	limits kvLimits
 }
 
 var _ raft.BatchingFSM = (*KVService)(nil)
@@ -145,6 +149,15 @@ type Config struct {
 	raft.Config
 
 	HTTPAddress string
+
+	// MaxKeyBytes — предел длины ключа после JSON-декодирования, байт.
+	// Ноль — умолчание 512; допустимо не больше 8192.
+	MaxKeyBytes int
+
+	// MaxValueBytes — предел длины Value и отдельно CompareValue после
+	// JSON-декодирования, байт. Ноль — умолчание 2048; допустимо не больше
+	// 16384.
+	MaxValueBytes int
 }
 
 // New создаёт новый экземпляр KVService с заданной конфигурацией cfg,
@@ -154,7 +167,17 @@ type Config struct {
 //
 // KVService реализует raft.FSM: зафиксированные записи журнала применяются
 // непосредственно к DataStore через метод Apply.
+//
+// Конфигурация (пределы полей, EncodedMaxKV(K,V) <= MaxDataBytes, профиль
+// узла с профилем сроков переданного транспорта) проверяется до регистрации
+// типов gob, отметки создания сервиса и запуска компонентов; при нарушении —
+// паника без побочных эффектов.
 func New(cfg *Config, readyChan <-chan any) *KVService {
+	limits, err := validateServiceConfig(cfg)
+	if err != nil {
+		panic(fmt.Sprintf("kvservice: New: %v", err))
+	}
+
 	gob.Register(Command{})
 
 	// Сторожевой флаг контракта трассировки: конфигурация SetTrace
@@ -165,6 +188,7 @@ func New(cfg *Config, readyChan <-chan any) *KVService {
 		id:         cfg.ServerID,
 		ds:         NewDataStore(),
 		serveErrCh: make(chan error, 1),
+		limits:     limits,
 	}
 	kvs.httpResponsesEnabled.Store(true)
 	cfg.Fsm = kvs
@@ -191,21 +215,32 @@ func New(cfg *Config, readyChan <-chan any) *KVService {
 //     как кластер Raft будет готов к работе (все узлы запущены и соединены
 //     друг с другом).
 func NewKVService(address string, id int, peerIds []int, storage raft.LogStorage, readyChan <-chan any) *KVService {
+	cfg := &Config{
+		Config: raft.Config{
+			ServerID: id,
+			PeerIds:  peerIds,
+			Storage:  storage,
+		},
+	}
 	// Нулевая структура TCPTimeouts означает использование значений по умолчанию для транспорта:
 	// конструктор подставляет вместо нулевых полей соответствующие константы из contract.
-	transport, err := transp.NewTCPTransport(address, transp.TCPTimeouts{}, 0)
+	// Конфигурация проверяется с профилем сроков планируемого транспорта до
+	// открытия слушателя.
+	_, timing := transp.NormalizeTCPTimeouts(transp.TCPTimeouts{})
+	if err := ValidateConfig(cfg, timing); err != nil {
+		panic(fmt.Sprintf("kvservice: NewKVService: %v", err))
+	}
+	transport, err := transp.NewTCPTransportWithLimits(address, transp.TCPTimeouts{}, 0, cfg.Limits)
 	if err != nil {
 		log.Fatalf("kvservice: failed to create TCP transport on %s: %v", address, err)
 	}
-	return New(&Config{
-		Config: raft.Config{
-			ServerID:  id,
-			PeerIds:   peerIds,
-			Storage:   storage,
-			Transport: transport,
-		},
-	}, readyChan,
-	)
+	cfg.Transport = transport
+	if _, err = validateServiceConfig(cfg); err != nil {
+		// Слушатель освобождается до отказа.
+		transport.Close()
+		panic(fmt.Sprintf("kvservice: NewKVService: %v (transport closed)", err))
+	}
+	return New(cfg, readyChan)
 }
 
 // Apply реализует raft.FSM. Вызывается Raft'ом для каждой зафиксированной
@@ -412,6 +447,55 @@ func (kvs *KVService) sendHTTPResponse(w http.ResponseWriter, v any) {
 	}
 }
 
+// sendTooLarge отвечает терминальным отказом по пределам: HTTP 413 и
+// StatusResponse{RespStatus: StatusTooLarge}.
+func (kvs *KVService) sendTooLarge(w http.ResponseWriter) {
+	if kvs.httpResponsesEnabled.Load() {
+		renderJSONStatus(w, http.StatusRequestEntityTooLarge, api.StatusResponse{RespStatus: api.StatusTooLarge})
+	}
+}
+
+// readRequest читает JSON-тело запроса с пределом тела сервиса. Превышение
+// предела — 413 TooLarge, прочие ошибки разбора — прежний 400. Возвращает
+// false, если ответ уже отправлен.
+func (kvs *KVService) readRequest(w http.ResponseWriter, req *http.Request, target any) bool {
+	err := readRequestJSON(w, req, target, kvs.limits.maxBodyBytes)
+	if err == nil {
+		return true
+	}
+	if isBodyTooLarge(err) {
+		kvs.sendTooLarge(w)
+		return false
+	}
+	http.Error(w, err.Error(), http.StatusBadRequest)
+	return false
+}
+
+// fieldsWithinLimits проверяет длины всех присутствующих входных полей до
+// построения команды: ключ — по MaxKeyBytes, каждое из значений — по
+// MaxValueBytes. Ничего не усекается.
+func (kvs *KVService) fieldsWithinLimits(key string, values ...string) bool {
+	if len(key) > kvs.limits.maxKeyBytes {
+		return false
+	}
+	for _, v := range values {
+		if len(v) > kvs.limits.maxValueBytes {
+			return false
+		}
+	}
+	return true
+}
+
+// applyFailed отвечает на ошибку Apply: превышение предела сетевой длины
+// команды — 413 TooLarge, остальные ошибки — прежний ответ notLeader.
+func (kvs *KVService) applyFailed(w http.ResponseWriter, err error, notLeader any) {
+	if errors.Is(err, raft.ErrCommandTooLarge) {
+		kvs.sendTooLarge(w)
+		return
+	}
+	kvs.sendHTTPResponse(w, notLeader)
+}
+
 func (kvs *KVService) handleVerifyLeader(w http.ResponseWriter, _ *http.Request) {
 	// Вердикт о лидерстве актуален только на момент кворумного
 	// подтверждения ReadIndex — запрещаем хранение ответа кешами.
@@ -439,6 +523,12 @@ func (kvs *KVService) handleWeakGet(w http.ResponseWriter, req *http.Request) {
 	// только на момент подтверждения лидерства — запрещаем хранение
 	// ответа промежуточными кешами.
 	w.Header().Set("Cache-Control", "no-store")
+
+	// Ключ проверяется после штатного URL-декодирования PathValue.
+	if !kvs.fieldsWithinLimits(gr.Key) {
+		kvs.sendTooLarge(w)
+		return
+	}
 
 	// ReadIndex: подтверждение лидерства без записи в raft-журнал (Raft §8).
 	future := kvs.rs.VerifyLeader()
@@ -473,8 +563,11 @@ func (kvs *KVService) handleCAS(w http.ResponseWriter, req *http.Request) {
 		}
 	}()
 
-	if err := readRequestJSON(req, cr); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if !kvs.readRequest(w, req, cr) {
+		return
+	}
+	if !kvs.fieldsWithinLimits(cr.Key, cr.CompareValue, cr.Value) {
+		kvs.sendTooLarge(w)
 		return
 	}
 
@@ -491,7 +584,7 @@ func (kvs *KVService) handleCAS(w http.ResponseWriter, req *http.Request) {
 	select {
 	case err := <-future.ErrorCh():
 		if err != nil {
-			kvs.sendHTTPResponse(w, api.CASResponse{
+			kvs.applyFailed(w, err, api.CASResponse{
 				RespStatus: api.StatusNotLeader,
 			})
 			return
@@ -524,8 +617,11 @@ func (kvs *KVService) handleDelete(w http.ResponseWriter, req *http.Request) {
 		}
 	}()
 
-	if err := readRequestJSON(req, dr); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if !kvs.readRequest(w, req, dr) {
+		return
+	}
+	if !kvs.fieldsWithinLimits(dr.Key) {
+		kvs.sendTooLarge(w)
 		return
 	}
 
@@ -540,7 +636,7 @@ func (kvs *KVService) handleDelete(w http.ResponseWriter, req *http.Request) {
 	select {
 	case err := <-future.ErrorCh():
 		if err != nil {
-			kvs.sendHTTPResponse(w, api.DeleteResponse{
+			kvs.applyFailed(w, err, api.DeleteResponse{
 				RespStatus: api.StatusNotLeader,
 			})
 			return
@@ -573,8 +669,11 @@ func (kvs *KVService) handleGet(w http.ResponseWriter, req *http.Request) {
 		}
 	}()
 
-	if err := readRequestJSON(req, gr); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if !kvs.readRequest(w, req, gr) {
+		return
+	}
+	if !kvs.fieldsWithinLimits(gr.Key) {
+		kvs.sendTooLarge(w)
 		return
 	}
 
@@ -589,7 +688,7 @@ func (kvs *KVService) handleGet(w http.ResponseWriter, req *http.Request) {
 	select {
 	case err := <-future.ErrorCh():
 		if err != nil {
-			kvs.sendHTTPResponse(w, api.GetResponse{
+			kvs.applyFailed(w, err, api.GetResponse{
 				RespStatus: api.StatusNotLeader,
 			})
 			return
@@ -622,8 +721,11 @@ func (kvs *KVService) handlePut(w http.ResponseWriter, req *http.Request) {
 		}
 	}()
 
-	if err := readRequestJSON(req, pr); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if !kvs.readRequest(w, req, pr) {
+		return
+	}
+	if !kvs.fieldsWithinLimits(pr.Key, pr.Value) {
+		kvs.sendTooLarge(w)
 		return
 	}
 
@@ -639,7 +741,7 @@ func (kvs *KVService) handlePut(w http.ResponseWriter, req *http.Request) {
 	select {
 	case err := <-future.ErrorCh():
 		if err != nil {
-			kvs.sendHTTPResponse(w, api.PutResponse{
+			kvs.applyFailed(w, err, api.PutResponse{
 				RespStatus: api.StatusNotLeader,
 			})
 			return

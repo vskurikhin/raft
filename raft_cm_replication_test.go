@@ -150,6 +150,7 @@ func (m *mockTransportAE) DecodePeer(_ string) ServerAddress {
 func TestLeaderSendAEs_Deduplication(t *testing.T) {
 	mock := &mockTransportAE{}
 	cm := &ConsensusModule{
+		limits: testLimits,
 		leaderState: leaderState{
 			nextIndex:              map[int]int{1: 0},
 			matchIndex:             map[int]int{1: -1},
@@ -233,6 +234,7 @@ func TestLeaderSendAEs_Deduplication(t *testing.T) {
 func TestInflightAE_DeferReset(t *testing.T) {
 	mock := &mockTransportAE{}
 	cm := &ConsensusModule{
+		limits: testLimits,
 		leaderState: leaderState{
 			nextIndex:              map[int]int{1: 0},
 			matchIndex:             map[int]int{1: -1},
@@ -298,6 +300,7 @@ func TestInflightAE_DeferResetOnSnapshotPath(t *testing.T) {
 
 	transport := &mockTransportAE{}
 	cm := &ConsensusModule{
+		limits: testLimits,
 		leaderState: leaderState{
 			nextIndex:        map[int]int{1: 3},
 			matchIndex:       map[int]int{1: -1},
@@ -382,6 +385,7 @@ func TestInflightAE_DeferResetOnSnapshotPath(t *testing.T) {
 func TestLeaderSendAEs_StateCheck(t *testing.T) {
 	mock := &mockTransportAE{}
 	cm := &ConsensusModule{
+		limits: testLimits,
 		leaderState: leaderState{
 			inflightAE:             map[int]*atomic.Bool{1: new(atomic.Bool)},
 			nextVerifyRedispatchAt: map[int]time.Time{},
@@ -413,6 +417,7 @@ func TestLeaderSendAEs_StateCheck(t *testing.T) {
 //  3. Вызвать leaderSendAEsToPeer — не должно быть panic.
 func TestInflightAE_NilSafe(t *testing.T) {
 	cm := &ConsensusModule{
+		limits: testLimits,
 		leaderState: leaderState{
 			nextIndex:  map[int]int{1: 0},
 			matchIndex: map[int]int{1: -1},
@@ -451,6 +456,7 @@ func TestInflightAE_NilSafe(t *testing.T) {
 //     пропущен без паники.
 func TestBecomeFollower_InflightAE_NilEntry(t *testing.T) {
 	cm := &ConsensusModule{
+		limits: testLimits,
 		leaderState: leaderState{
 			inflightAE: map[int]*atomic.Bool{
 				1: nil,              // peer вне конфигурации — элемент не инициализирован
@@ -540,6 +546,7 @@ func (m *mockSnapshotStoreCfg) Open(_ string) (*SnapshotMeta, io.ReadCloser, err
 func TestLeaderSendSnapshot_NilSnapshotStore(t *testing.T) {
 	transport := &mockTransportAE{}
 	cm := &ConsensusModule{
+		limits: testLimits,
 		leaderState: leaderState{
 			nextIndex:  map[int]int{1: -1},
 			matchIndex: map[int]int{1: -1},
@@ -573,6 +580,7 @@ func TestLeaderSendSnapshot_NilSnapshotStore(t *testing.T) {
 func TestLeaderSendSnapshot_NilMetaInList(t *testing.T) {
 	transport := &mockTransportAE{}
 	cm := &ConsensusModule{
+		limits: testLimits,
 		leaderState: leaderState{
 			nextIndex:  map[int]int{1: -1},
 			matchIndex: map[int]int{1: -1},
@@ -607,6 +615,7 @@ func TestLeaderSendSnapshot_NilMetaInList(t *testing.T) {
 func TestLeaderSendSnapshot_EmptyID(t *testing.T) {
 	transport := &mockTransportAE{}
 	cm := &ConsensusModule{
+		limits: testLimits,
 		leaderState: leaderState{
 			nextIndex:  map[int]int{1: -1},
 			matchIndex: map[int]int{1: -1},
@@ -646,6 +655,7 @@ func TestLeaderSendSnapshot_Success(t *testing.T) {
 	transport := &mockTransportAE{replyTerm: 1}
 	tracker := newCommitmentTracker(0, 1, -1, make(chan int, 1))
 	cm := &ConsensusModule{
+		limits: testLimits,
 		leaderState: leaderState{
 			nextIndex:         map[int]int{1: -1},
 			matchIndex:        map[int]int{1: -1},
@@ -700,6 +710,7 @@ func TestLeaderSendSnapshot_InconsistentSuccessReplyGuard(t *testing.T) {
 	transport := &mockTransportAE{replyTerm: 1}
 	tracker := newCommitmentTracker(0, 2, -1, make(chan int, 1))
 	cm := &ConsensusModule{
+		limits: testLimits,
 		leaderState: leaderState{
 			nextIndex:         map[int]int{1: 7},
 			matchIndex:        map[int]int{1: 3},
@@ -743,6 +754,7 @@ func TestLeaderSendSnapshot_SuccessNotLeader(t *testing.T) {
 	transport := &mockTransportAE{replyTerm: 1}
 	tracker := newCommitmentTracker(0, 1, -1, make(chan int, 1))
 	cm := &ConsensusModule{
+		limits: testLimits,
 		leaderState: leaderState{
 			nextIndex:         map[int]int{1: 7},
 			matchIndex:        map[int]int{1: 3},
@@ -793,6 +805,7 @@ func TestLeaderSendSnapshot_StaleTermReplyDoesNotResetFailures(t *testing.T) {
 	transport := &mockTransportAE{replyTerm: 1}
 	tracker := newCommitmentTracker(0, 3, -1, make(chan int, 1))
 	cm := &ConsensusModule{
+		limits: testLimits,
 		leaderState: leaderState{
 			nextIndex:         map[int]int{1: 0},
 			matchIndex:        map[int]int{1: -1},
@@ -837,6 +850,7 @@ func TestLeaderSendSnapshot_StaleTermReplyDoesNotResetFailures(t *testing.T) {
 // записями 9..10. Транспорт — mock с настраиваемым отказом.
 func newRejectionTestCM(transport *mockTransportAE) *ConsensusModule {
 	cm := &ConsensusModule{
+		limits: testLimits,
 		leaderState: leaderState{
 			nextIndex:              map[int]int{1: 10},
 			matchIndex:             map[int]int{1: 5},
@@ -965,6 +979,7 @@ func TestLeaderSendAEsToPeer_SnapshotPredicateBoundaries(t *testing.T) {
 				replyTerm: 1, installReplyTermSet: true, installReplyTerm: 0,
 			}
 			cm := &ConsensusModule{
+				limits: testLimits,
 				leaderState: leaderState{
 					nextIndex:              map[int]int{1: tt.nextIndex},
 					matchIndex:             map[int]int{1: -1},
@@ -1082,6 +1097,7 @@ func TestReplicationBackoffDelay_Clamp(t *testing.T) {
 func TestReplicationBackoff_LogicalRejectionsDoNotBackoff(t *testing.T) {
 	mock := &mockTransportAE{failReply: true, failConflictIndex: 0, failConflictTerm: -1, replyTerm: 1}
 	cm := &ConsensusModule{
+		limits: testLimits,
 		leaderState: leaderState{
 			nextIndex:              map[int]int{1: 0},
 			matchIndex:             map[int]int{1: -1},
@@ -1131,7 +1147,7 @@ func TestReplicationBackoff_LogicalRejectionsDoNotBackoff(t *testing.T) {
 func TestReplicationBackoff_LeaderStateReinitialized(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
-	cm := &ConsensusModule{}
+	cm := &ConsensusModule{limits: testLimits}
 	cm.storage = store.NewMapStorage()
 	// Пустой журнал создаётся полной заменой, как после первого персиста:
 	// noop вступления в лидерство заменяет суффикс достижимо.
@@ -1185,6 +1201,7 @@ func TestReplicationBackoff_LeaderStateReinitialized(t *testing.T) {
 func TestReplicationBackoff_SkipsTransportAndDoesNotRecordAttempt(t *testing.T) {
 	mock := &mockTransportAE{}
 	cm := &ConsensusModule{
+		limits: testLimits,
 		leaderState: leaderState{
 			nextIndex:              map[int]int{1: 1},
 			matchIndex:             map[int]int{1: 0},
@@ -1251,6 +1268,7 @@ func TestLeaderSendAEsToPeer_HigherTermStepsDown(t *testing.T) {
 
 	mock := &mockTransportAE{replyTerm: 5}
 	cm := &ConsensusModule{
+		limits: testLimits,
 		leaderState: leaderState{
 			nextIndex:              map[int]int{1: 1},
 			matchIndex:             map[int]int{1: 0},

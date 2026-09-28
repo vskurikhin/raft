@@ -353,7 +353,7 @@ func TestPersistenceCounters_DisabledStatsOutputStillRecords(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	storage := store.NewFileStorage(t.TempDir())
-	cm := &ConsensusModule{storage: storage, disableStatsOutput: true}
+	cm := &ConsensusModule{limits: testLimits, storage: storage, disableStatsOutput: true}
 	cm.cmState.currentTerm = 1
 	cm.cmState.votedFor = -1
 	cm.cmState.lastSnapshotIndex = -1
@@ -399,7 +399,7 @@ func TestPersistenceCounters_AbortedPersistNotObserved(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	storage := &abortOnWriteStorage{MapStorage: store.NewMapStorage()}
-	cm := &ConsensusModule{storage: storage}
+	cm := &ConsensusModule{limits: testLimits, storage: storage}
 	cm.cmState.currentTerm = 1
 	cm.cmState.votedFor = -1
 	cm.cmState.lastSnapshotIndex = -1

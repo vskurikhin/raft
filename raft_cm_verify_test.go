@@ -31,6 +31,7 @@ import (
 // vf.init выполняется вызывающим — счётчики завершаются через канал future.
 func newVerifyCounterCM(heartbeatTicks uint64, pending ...*verifyFuture) *ConsensusModule {
 	return &ConsensusModule{
+		limits:     testLimits,
 		id:         0,
 		shutdownCh: make(chan struct{}),
 		leaderState: leaderState{
@@ -191,6 +192,7 @@ func (t *verifyRedispatchTransport) AppendEntries(_ ServerID, _ AppendEntriesArg
 // processLogs по страховочному таймеру не вызывается).
 func newRedispatchLeaderCM(transport Transport) *ConsensusModule {
 	cm := &ConsensusModule{
+		limits:             testLimits,
 		id:                 0,
 		transport:          transport,
 		shutdownCh:         make(chan struct{}),
@@ -253,6 +255,7 @@ func newRedispatchLeaderCM(transport Transport) *ConsensusModule {
 // pendingVerify. Для AC-4 (нет самовоспроизводящейся рассылки).
 func newRedispatchReplicationCM(transport *mockTransportAE) *ConsensusModule {
 	cm := &ConsensusModule{
+		limits:     testLimits,
 		id:         0,
 		transport:  transport,
 		shutdownCh: make(chan struct{}),
@@ -421,7 +424,8 @@ func TestVerifyRedispatch_AC2_NonvoterDoesNotVote(t *testing.T) {
 
 	vf := newPendingVerify(0)
 	cm := &ConsensusModule{
-		id: 0,
+		limits: testLimits,
+		id:     0,
 		leaderState: leaderState{
 			pendingVerify: []*verifyFuture{vf},
 		},
@@ -465,7 +469,8 @@ func TestVerifyRedispatch_AC3_StaleEpochDoesNotVote(t *testing.T) {
 	newCM := func() (*ConsensusModule, *verifyFuture) {
 		vf := newPendingVerify(2) // запрос поставлен в раунде эпохи 2
 		cm := &ConsensusModule{
-			id: 0,
+			limits: testLimits,
+			id:     0,
 			leaderState: leaderState{
 				pendingVerify: []*verifyFuture{vf},
 			},
@@ -753,6 +758,7 @@ func (t *throttleTransport) AppendEntries(_ ServerID, _ AppendEntriesArgs) (Appe
 // inflightAE (лидер работающей системы всегда имеет свежую карту окна).
 func newThrottleCM(transport Transport, interval time.Duration) *ConsensusModule {
 	cm := &ConsensusModule{
+		limits:     testLimits,
 		id:         0,
 		transport:  transport,
 		shutdownCh: make(chan struct{}),
@@ -1300,7 +1306,8 @@ func TestVerifyLeader_EpochFilter(t *testing.T) {
 
 	newCM := func(transport Transport, epoch uint64) (*ConsensusModule, *verifyFuture) {
 		cm := &ConsensusModule{
-			id: 0,
+			limits: testLimits,
+			id:     0,
 			// Терм ответа совпадает с термом лидера: отправка выполняется
 			// в текущем терме, иначе успешный ответ к состоянию репликации
 			// не применяется и фильтр по раунду верификации не проверялся бы.
@@ -1434,6 +1441,7 @@ func TestVerifyLeader_MultiplePendingDifferentEpochs(t *testing.T) {
 
 	mock := &mockTransportAE{replyTerm: 1, gateBlockAfter: 2, gateCh: make(chan struct{})}
 	cm := &ConsensusModule{
+		limits:     testLimits,
 		id:         0,
 		transport:  mock,
 		commitCh:   make(chan int, 1),
@@ -1587,6 +1595,7 @@ func TestVerifyLeader_NoVoteOnFailureAndSnapshotPath(t *testing.T) {
 	// верификации: голос лидера уже учтён, для кворума нужен ещё один.
 	newCM := func(transport Transport, snapshotStore SnapshotStore, lastSnapshotIndex, nextIndex int, log []LogEntry) (*ConsensusModule, *verifyFuture) {
 		cm := &ConsensusModule{
+			limits:     testLimits,
 			id:         0,
 			transport:  transport,
 			commitCh:   make(chan int, 1),

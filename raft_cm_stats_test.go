@@ -43,7 +43,8 @@ const statsTestLatencyLine = "AE= 2.00ms, BatchingFSM= 0.00ms, Election= 0.00ms,
 // безопасен и единолично владеет seq и липкой ошибкой.
 func newStatsTestCM() *ConsensusModule {
 	return &ConsensusModule{
-		id: 2,
+		limits: testLimits,
+		id:     2,
 		cmState: cmState{
 			state:        Leader,
 			currentTerm:  7,

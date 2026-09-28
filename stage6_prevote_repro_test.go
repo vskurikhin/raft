@@ -971,6 +971,7 @@ func TestPreVote_CandidateRetryViaElectionTimer(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	cm := &ConsensusModule{
+		limits:            testLimits,
 		id:                0,
 		transport:         &mockPreVoteGrant{peerTerm: 2},
 		storage:           store.NewMapStorage(),

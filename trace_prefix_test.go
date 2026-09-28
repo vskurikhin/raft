@@ -90,7 +90,7 @@ func (c *traceTestClock) Now() time.Time {
 // только у лидера. Приспособление используется как источник ссылочных
 // аргументов общего пути постановки.
 func newTraceTestFollower() *ConsensusModule {
-	cm := &ConsensusModule{}
+	cm := &ConsensusModule{limits: testLimits}
 	cm.id = 7
 	cm.cmState.state = Follower
 	cm.cmState.currentTerm = 3

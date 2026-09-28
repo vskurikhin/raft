@@ -46,13 +46,15 @@ func startInmemHandler(t *testing.T, trans *InmemTransport, consume bool) func()
 				case *contract.AppendEntriesArgs:
 					rpc.RespChan <- contract.RPCResponse{
 						Reply: &contract.AppendEntriesReply{
-							Success: true,
-							Term:    cmd.Term,
+							RPCHeader: testRPCHeader,
+							Success:   true,
+							Term:      cmd.Term,
 						},
 					}
 				case *contract.RequestVoteArgs:
 					rpc.RespChan <- contract.RPCResponse{
 						Reply: &contract.RequestVoteReply{
+							RPCHeader:   testRPCHeader,
 							VoteGranted: true,
 							Term:        cmd.Term,
 						},
@@ -100,6 +102,7 @@ func TestInmemAppendEntriesSuccess(t *testing.T) {
 	defer startInmemHandler(t, t2, true)()
 
 	args := contract.AppendEntriesArgs{
+		RPCHeader:    testRPCHeader,
 		Term:         1,
 		LeaderID:     0,
 		PrevLogIndex: -1,
@@ -128,7 +131,7 @@ func TestInmemAppendEntriesDisconnectedPeer(t *testing.T) {
 	defer t2.Close()
 
 	// Не вызываем Connect()
-	args := contract.AppendEntriesArgs{Term: 1}
+	args := contract.AppendEntriesArgs{RPCHeader: testRPCHeader, Term: 1}
 	_, err := t1.AppendEntries(1, args)
 	if err != contract.ErrNotReachable {
 		t.Fatalf("want ErrNotReachable, got %v", err)
@@ -146,7 +149,7 @@ func TestInmemAppendEntriesAfterClose(t *testing.T) {
 
 	t1.Close() // закрываем t1
 
-	args := contract.AppendEntriesArgs{Term: 1}
+	args := contract.AppendEntriesArgs{RPCHeader: testRPCHeader, Term: 1}
 	_, err := t1.AppendEntries(1, args)
 	if err != contract.ErrRaftShutdown {
 		t.Fatalf("want ErrRaftShutdown, got %v", err)
@@ -161,7 +164,7 @@ func TestInmemAppendEntriesPeerClosed(t *testing.T) {
 
 	t2.Close() // закрываем peer
 
-	args := contract.AppendEntriesArgs{Term: 1}
+	args := contract.AppendEntriesArgs{RPCHeader: testRPCHeader, Term: 1}
 	_, err := t1.AppendEntries(1, args)
 	if err != contract.ErrRaftShutdown {
 		t.Fatalf("want ErrRaftShutdown, got %v", err)
@@ -188,7 +191,7 @@ func TestInmemAppendEntriesTimeout(t *testing.T) {
 		// Ничего не делаем — не отправляем ответ
 	}()
 
-	args := contract.AppendEntriesArgs{Term: 1}
+	args := contract.AppendEntriesArgs{RPCHeader: testRPCHeader, Term: 1}
 	_, err := t1.AppendEntries(1, args)
 	if err != contract.ErrEnqueueTimeout {
 		t.Fatalf("want ErrEnqueueTimeout, got %v", err)
@@ -203,6 +206,7 @@ func TestInmemRequestVoteSuccess(t *testing.T) {
 	defer startInmemHandler(t, t2, true)()
 
 	args := contract.RequestVoteArgs{
+		RPCHeader:    testRPCHeader,
 		Term:         2,
 		CandidateID:  0,
 		LastLogIndex: -1,
@@ -228,7 +232,7 @@ func TestInmemRequestVoteDisconnectedPeer(t *testing.T) {
 	defer t1.Close()
 	defer t2.Close()
 
-	args := contract.RequestVoteArgs{Term: 1}
+	args := contract.RequestVoteArgs{RPCHeader: testRPCHeader, Term: 1}
 	_, err := t1.RequestVote(1, args)
 	if err != contract.ErrNotReachable {
 		t.Fatalf("want ErrNotReachable, got %v", err)
@@ -246,7 +250,7 @@ func TestInmemRequestVoteAfterClose(t *testing.T) {
 
 	t1.Close()
 
-	args := contract.RequestVoteArgs{Term: 1}
+	args := contract.RequestVoteArgs{RPCHeader: testRPCHeader, Term: 1}
 	_, err := t1.RequestVote(1, args)
 	if err != contract.ErrRaftShutdown {
 		t.Fatalf("want ErrRaftShutdown, got %v", err)
@@ -261,7 +265,7 @@ func TestInmemRequestVotePeerClosed(t *testing.T) {
 
 	t2.Close()
 
-	args := contract.RequestVoteArgs{Term: 1}
+	args := contract.RequestVoteArgs{RPCHeader: testRPCHeader, Term: 1}
 	_, err := t1.RequestVote(1, args)
 	if err != contract.ErrRaftShutdown {
 		t.Fatalf("want ErrRaftShutdown, got %v", err)
@@ -299,7 +303,7 @@ func TestInmemDisconnect(t *testing.T) {
 	}
 
 	// Убедимся, что после Disconnect отправка не работает
-	args := contract.AppendEntriesArgs{Term: 1}
+	args := contract.AppendEntriesArgs{RPCHeader: testRPCHeader, Term: 1}
 	_, err := t1.AppendEntries(1, args)
 	if err != contract.ErrNotReachable {
 		t.Fatalf("want ErrNotReachable, got %v", err)
@@ -356,7 +360,7 @@ func TestInmemConnectThenSend(t *testing.T) {
 	defer startInmemHandler(t, t2, true)()
 
 	// После Connect — отправка работает
-	args := contract.AppendEntriesArgs{Term: 1}
+	args := contract.AppendEntriesArgs{RPCHeader: testRPCHeader, Term: 1}
 	reply, err := t1.AppendEntries(1, args)
 	if err != nil {
 		t.Fatalf("AppendEntries after Connect failed: %v", err)
@@ -386,7 +390,7 @@ func TestInmemClose(t *testing.T) {
 
 	t1.Close()
 
-	args := contract.AppendEntriesArgs{Term: 1}
+	args := contract.AppendEntriesArgs{RPCHeader: testRPCHeader, Term: 1}
 	_, err := t1.AppendEntries(1, args)
 	if err != contract.ErrRaftShutdown {
 		t.Fatalf("want ErrRaftShutdown, got %v", err)
@@ -412,7 +416,7 @@ func TestInmemCloseConsumerDrain(t *testing.T) {
 	// Но мы не ждём — закрываем t2 и проверяем, что Close дренирует consumerCh.
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := t1.AppendEntries(1, contract.AppendEntriesArgs{Term: 1})
+		_, err := t1.AppendEntries(1, contract.AppendEntriesArgs{RPCHeader: testRPCHeader, Term: 1})
 		errCh <- err
 	}()
 
@@ -444,13 +448,13 @@ func TestInmemStubsReturnNotImplemented(t *testing.T) {
 	trans := NewInmemTransport("test")
 	defer trans.Close()
 	t.Run("TimeoutNow", func(t *testing.T) {
-		_, err := trans.TimeoutNow(1, contract.TimeoutNowRequest{})
+		_, err := trans.TimeoutNow(1, contract.TimeoutNowRequest{RPCHeader: testRPCHeader})
 		if err != contract.ErrNotReachable {
 			t.Fatalf("want ErrNotReachable, got %v", err)
 		}
 	})
 	t.Run("InstallSnapshot", func(t *testing.T) {
-		_, err := trans.InstallSnapshot(1, contract.InstallSnapshotRequest{}, nil)
+		_, err := trans.InstallSnapshot(1, contract.InstallSnapshotRequest{RPCHeader: testRPCHeader}, nil)
 		// InstallSnapshot теперь реализован — peer не подключён, ошибка contract.ErrNotReachable.
 		if err != contract.ErrNotReachable {
 			t.Fatalf("want ErrNotReachable, got %v", err)
@@ -507,7 +511,7 @@ func TestInmemConcurrentSend(t *testing.T) {
 			} else {
 				peer = 2
 			}
-			args := contract.AppendEntriesArgs{Term: 1, LeaderID: 0}
+			args := contract.AppendEntriesArgs{RPCHeader: testRPCHeader, Term: 1, LeaderID: 0}
 			reply, err := t0.AppendEntries(peer, args)
 			if err != nil {
 				t.Errorf("AppendEntries to peer %d failed: %v", peer, err)
@@ -551,8 +555,9 @@ func TestInmemManyRoundTrips(t *testing.T) {
 
 	for i := 0; i < 100; i++ {
 		args := contract.AppendEntriesArgs{
-			Term:     i + 1,
-			LeaderID: 0,
+			RPCHeader: testRPCHeader,
+			Term:      i + 1,
+			LeaderID:  0,
 		}
 		reply, err := t1.AppendEntries(1, args)
 		if err != nil {
@@ -628,7 +633,7 @@ func TestInmemDisconnectPeerCallsSideEffect(t *testing.T) {
 	// Проверяем через startInmemHandler
 	defer startInmemHandler(t, t1, true)()
 
-	args := contract.AppendEntriesArgs{Term: 1}
+	args := contract.AppendEntriesArgs{RPCHeader: testRPCHeader, Term: 1}
 	reply, err := t2.AppendEntries(0, args)
 	if err != nil {
 		t.Fatalf("AppendEntries from t2 to t1 failed after t1 disconnected: %v", err)
@@ -656,7 +661,7 @@ func TestInmemAppendEntriesError(t *testing.T) {
 	}()
 	defer close(done)
 
-	_, err := t1.AppendEntries(1, contract.AppendEntriesArgs{Term: 1})
+	_, err := t1.AppendEntries(1, contract.AppendEntriesArgs{RPCHeader: testRPCHeader, Term: 1})
 	if err == nil || err.Error() != "raft: test error" {
 		t.Fatalf("want 'raft: test error', got %v", err)
 	}
@@ -679,7 +684,7 @@ func TestInmemRequestVoteError(t *testing.T) {
 	}()
 	defer close(done)
 
-	_, err := t1.RequestVote(1, contract.RequestVoteArgs{Term: 1})
+	_, err := t1.RequestVote(1, contract.RequestVoteArgs{RPCHeader: testRPCHeader, Term: 1})
 	if err != contract.ErrRaftShutdown {
 		t.Fatalf("want ErrRaftShutdown, got %v", err)
 	}
@@ -695,7 +700,7 @@ func TestInmemCloseWithPendingRPC(t *testing.T) {
 	// Отправляем RPC без обработчика — он зависнет в consumerCh
 	errCh := make(chan error, 1)
 	go func() {
-		_, err := t1.AppendEntries(1, contract.AppendEntriesArgs{Term: 1})
+		_, err := t1.AppendEntries(1, contract.AppendEntriesArgs{RPCHeader: testRPCHeader, Term: 1})
 		errCh <- err
 	}()
 
@@ -736,6 +741,7 @@ func TestInmemAppendEntriesWithEntries(t *testing.T) {
 			}
 			rpc.RespChan <- contract.RPCResponse{
 				Reply: &contract.AppendEntriesReply{
+					RPCHeader:     testRPCHeader,
 					Success:       true,
 					Term:          cmd.Term,
 					ConflictIndex: cmd.PrevLogIndex + len(cmd.Entries),
@@ -748,6 +754,7 @@ func TestInmemAppendEntriesWithEntries(t *testing.T) {
 
 	entries := []raft.LogEntry{{Index: 0, Term: 1, Data: "cmd1"}}
 	args := contract.AppendEntriesArgs{
+		RPCHeader:    testRPCHeader,
 		Term:         1,
 		LeaderID:     0,
 		PrevLogIndex: -1,

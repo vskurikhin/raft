@@ -19,12 +19,20 @@ type TimeoutNowRequest struct {
 	RPCHeader
 }
 
+func (r *TimeoutNowRequest) GetRPCHeader() RPCHeader {
+	return r.RPCHeader
+}
+
 // TimeoutNowResponse — ответ на TimeoutNowRequest.
 type TimeoutNowResponse struct {
 	RPCHeader
 
 	Success bool
 	Term    int
+}
+
+func (r *TimeoutNowResponse) GetRPCHeader() RPCHeader {
+	return r.RPCHeader
 }
 
 // InstallSnapshotRequest — запрос на установку снимка от лидера.

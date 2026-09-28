@@ -20,7 +20,7 @@ import (
 func TestRebuildLastLog_EmptyLogWithoutSnapshot(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
-	cm := &ConsensusModule{}
+	cm := &ConsensusModule{limits: testLimits}
 	cm.cmState.log = nil
 	cm.cmState.lastSnapshotIndex = -1
 	cm.cmState.lastSnapshotTerm = -1
@@ -40,7 +40,7 @@ func TestRebuildLastLog_EmptyLogWithoutSnapshot(t *testing.T) {
 func TestRebuildLastLog_EmptyLogWithSnapshot(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
-	cm := &ConsensusModule{}
+	cm := &ConsensusModule{limits: testLimits}
 	cm.cmState.log = nil
 	cm.cmState.lastSnapshotIndex = 10
 	cm.cmState.lastSnapshotTerm = 2
@@ -59,7 +59,7 @@ func TestRebuildLastLog_EmptyLogWithSnapshot(t *testing.T) {
 func TestRebuildLastLog_NonEmptyLog(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
-	cm := &ConsensusModule{}
+	cm := &ConsensusModule{limits: testLimits}
 	cm.cmState.log = []LogEntry{
 		{Index: 5, Term: 1},
 		{Index: 7, Term: 3},
@@ -86,7 +86,7 @@ func TestRebuildLastLog_NonEmptyLog(t *testing.T) {
 func TestRebuildLastLog_AppendEntriesCallSite(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
-	cm := &ConsensusModule{}
+	cm := &ConsensusModule{limits: testLimits}
 	cm.storage = store.NewMapStorage()
 	cm.cmState.state = Follower
 	cm.cmState.currentTerm = 1
@@ -140,7 +140,7 @@ func TestRebuildLastLog_RestoreFromStorageCallSite(t *testing.T) {
 	storage.Set("votedFor", gobEncode(t, -1))
 	storage.RewriteLog([]LogEntry{})
 
-	cm := &ConsensusModule{storage: storage}
+	cm := &ConsensusModule{limits: testLimits, storage: storage}
 	// Конструктор устанавливает lastSnapshotIndex = -1 до restoreFromStorage.
 	cm.cmState.lastSnapshotIndex = -1
 	cm.cmState.lastSnapshotTerm = -1
@@ -170,7 +170,7 @@ func TestRebuildLastLog_RestoreFromStorageNonEmptyLog(t *testing.T) {
 		{Index: 1, Term: 1},
 	})
 
-	cm := &ConsensusModule{storage: storage}
+	cm := &ConsensusModule{limits: testLimits, storage: storage}
 	cm.cmState.lastSnapshotIndex = -1
 	cm.cmState.lastSnapshotTerm = -1
 

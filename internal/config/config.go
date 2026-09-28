@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/vskurikhin/raft"
+	"github.com/vskurikhin/raft/pkg/raft/contract"
+	"github.com/vskurikhin/raft/pkg/raft/protocol"
 )
 
 const (
@@ -25,6 +27,29 @@ const (
 // на один адрес соседа у узла raftkv. Значение по умолчанию транспорта
 // в пакете raft другое и равно 2.
 const DefaultMaxPool = 4
+
+// Пределы входных полей KV и сетевой длины Data узла: значения флагов по
+// умолчанию и допустимые диапазоны, байт.
+const (
+	// DefaultMaxKeyBytes — предел длины ключа по умолчанию.
+	DefaultMaxKeyBytes = 512
+	// MaxKeyBytesLimit — верхняя граница флага -max-key-bytes.
+	MaxKeyBytesLimit = 8192
+	// DefaultMaxValueBytes — предел длины значения по умолчанию.
+	DefaultMaxValueBytes = 2048
+	// MaxValueBytesLimit — верхняя граница флага -max-value-bytes.
+	MaxValueBytesLimit = 16384
+)
+
+// frameEntriesOverhead — заголовок кадра и фиксированная часть тела
+// AppendEntries; entryHeaderBytes — служебная часть одной записи журнала;
+// singleEntryOverhead — AppendEntries с одной записью без Data. Величины
+// раскладки сетевого формата для вывода MaxEntries из MaxDataBytes.
+const (
+	frameEntriesOverhead = 88
+	entryHeaderBytes     = 32
+	singleEntryOverhead  = frameEntriesOverhead + entryHeaderBytes
+)
 
 type Values struct {
 	HTTPAddress net.Addr
@@ -44,6 +69,16 @@ type Values struct {
 	// MaxPool — максимальное количество соединений в пуле на один адрес
 	// соседа; ноль заменяется на DefaultMaxPool при сборке конфигурации узла.
 	MaxPool int
+	// MaxKeyBytes — предел длины ключа KV, байт. Ноль — защитное значение:
+	// применяется умолчание сервиса.
+	MaxKeyBytes int
+	// MaxValueBytes — предел длины значения KV (Value и CompareValue
+	// отдельно), байт. Ноль — защитное значение: применяется умолчание сервиса.
+	MaxValueBytes int
+	// MaxDataBytes — предел сетевой длины Data записи журнала (D), байт;
+	// MaxEntries выводится из него. Ноль — защитное значение: применяется
+	// профиль пределов по умолчанию.
+	MaxDataBytes int
 	// ReelectionTimeout — база тайм-аута выборов. Ноль — защитное значение:
 	// применяется raft.DefaultReelectionTimeout (430 мс). База должна быть
 	// строго больше окна проверки кворума 400 мс.
@@ -112,6 +147,7 @@ func ParseFlags() Values {
 	statsOutputFlag := addStatsOutputFlag(fs)
 	tcpConnectTimeoutFlag, tcpRPCTimeoutFlag, installSnapshotTimeoutFlag := addTransportFlags(fs)
 	traceCMLogFileFlag, traceKVLogFileFlag, traceLogLevelFlag := addTraceFlags(fs)
+	maxKeyBytesFlag, maxValueBytesFlag, maxDataBytesFlag := addLimitFlags(fs)
 
 	args := make([]string, 0, len(os.Args)-1)
 	for _, arg := range os.Args[1:] {
@@ -155,12 +191,17 @@ func ParseFlags() Values {
 
 	checkTimingFlags(heartbeatTimeoutFlag, tickerTimeoutFlag, reelectionTimeoutFlag, applyBatchIntervalFlag)
 
+	checkLimitFlags(*maxKeyBytesFlag, *maxValueBytesFlag, *maxDataBytesFlag)
+
 	return Values{
 		ApplyBatchInterval:     *applyBatchIntervalFlag,
 		DataDir:                *dataDirFlag,
 		HTTPAddress:            httpAddress,
 		HeartbeatTimeout:       *heartbeatTimeoutFlag,
 		MaxPool:                *maxPoolFlag,
+		MaxKeyBytes:            *maxKeyBytesFlag,
+		MaxValueBytes:          *maxValueBytesFlag,
+		MaxDataBytes:           *maxDataBytesFlag,
 		Number:                 *numberFlag,
 		Peers:                  peers,
 		RPCAddress:             rpcAddress,
@@ -328,6 +369,74 @@ func addTransportFlags(fs *flag.FlagSet) (connect, rpc, snapshot *time.Duration)
 				"(max with responseTimeout), including small snapshots below "+
 				"256KiB (default 310ms)",
 		)
+}
+
+// addLimitFlags регистрирует флаги пределов KV-полей и сетевой длины Data.
+func addLimitFlags(fs *flag.FlagSet) (maxKeyBytes, maxValueBytes, maxDataBytes *int) {
+	defaultData := protocol.DefaultLimits().MaxDataBytes
+	return fs.Int(
+			"max-key-bytes", DefaultMaxKeyBytes,
+			fmt.Sprintf("Maximum key length in bytes after JSON decoding (1..%d)", MaxKeyBytesLimit),
+		), fs.Int(
+			"max-value-bytes", DefaultMaxValueBytes,
+			fmt.Sprintf("Maximum Value and CompareValue length in bytes after JSON decoding, each (1..%d)",
+				MaxValueBytesLimit),
+		), fs.Int(
+			"max-data-bytes", int(defaultData),
+			"Maximum network length of one log entry Data in bytes (D); the maximum number "+
+				"of entries per AppendEntries is derived as floor((F-88)/(32+D)); must cover "+
+				"EncodedMaxKV(max-key-bytes, max-value-bytes)",
+		)
+}
+
+// checkLimitFlags — проверка флагов пределов с немедленным отказом процесса.
+func checkLimitFlags(maxKeyBytes, maxValueBytes, maxDataBytes int) {
+	if err := ValidateLimitFlags(maxKeyBytes, maxValueBytes, maxDataBytes); err != nil {
+		log.Fatalf("invalid limit flags: %v", err)
+	}
+}
+
+// ValidateLimitFlags проверяет явные значения флагов пределов: ключ
+// 1..8192, значение 1..16384, Data 1..F−120. Ноль и отрицательные значения
+// отвергаются — явный ноль не означает отсутствия предела.
+func ValidateLimitFlags(maxKeyBytes, maxValueBytes, maxDataBytes int) error {
+	var errs []error
+	if maxKeyBytes < 1 || maxKeyBytes > MaxKeyBytesLimit {
+		errs = append(errs, fmt.Errorf("-max-key-bytes must be between 1 and %d, got %d",
+			MaxKeyBytesLimit, maxKeyBytes))
+	}
+	if maxValueBytes < 1 || maxValueBytes > MaxValueBytesLimit {
+		errs = append(errs, fmt.Errorf("-max-value-bytes must be between 1 and %d, got %d",
+			MaxValueBytesLimit, maxValueBytes))
+	}
+	if _, err := DeriveLimits(maxDataBytes); err != nil {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
+
+// DeriveLimits строит профиль пределов узла из утверждённых F и C профиля
+// по умолчанию и предела Data maxDataBytes: MaxEntries = N_eff =
+// floor((F−88)/(32+D)). Допустимо 1 <= D <= F−120; полученный профиль
+// проверяется Limits.Validate.
+func DeriveLimits(maxDataBytes int) (contract.Limits, error) {
+	defaults := protocol.DefaultLimits()
+	upper := defaults.MaxFrameBytes - singleEntryOverhead
+	if maxDataBytes < 1 || uint64(maxDataBytes) > upper {
+		return contract.Limits{}, fmt.Errorf("-max-data-bytes must be between 1 and %d, got %d",
+			upper, maxDataBytes)
+	}
+	data := uint64(maxDataBytes)
+	limits := contract.Limits{
+		MaxFrameBytes:         defaults.MaxFrameBytes,
+		MaxEntries:            (defaults.MaxFrameBytes - frameEntriesOverhead) / (entryHeaderBytes + data),
+		MaxDataBytes:          data,
+		MaxConfigurationBytes: defaults.MaxConfigurationBytes,
+	}
+	if err := limits.Validate(); err != nil {
+		return contract.Limits{}, fmt.Errorf("-max-data-bytes %d: %w", maxDataBytes, err)
+	}
+	return limits, nil
 }
 
 func addTraceFlags(fs *flag.FlagSet) (traceCMLogFileFlag, traceKVLogFileFlag *string, traceLogLevelFlag *int) {

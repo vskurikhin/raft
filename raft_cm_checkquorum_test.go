@@ -485,6 +485,7 @@ func TestCheckQuorum_BusyLeaderNoFalseStepDown(t *testing.T) {
 func TestCheckQuorum_ContactRecordedOnFailedAEReply(t *testing.T) {
 	tracker := newCommitmentTracker(0, 1, -1, make(chan int, 1))
 	cm := &ConsensusModule{
+		limits: testLimits,
 		leaderState: leaderState{
 			nextIndex:         map[int]int{1: 5},
 			matchIndex:        map[int]int{1: -1},
@@ -519,6 +520,7 @@ func TestCheckQuorum_ContactRecordedOnSnapshotReply(t *testing.T) {
 	transport := &mockTransportAE{replyTerm: 1}
 	tracker := newCommitmentTracker(0, 1, -1, make(chan int, 1))
 	cm := &ConsensusModule{
+		limits: testLimits,
 		leaderState: leaderState{
 			nextIndex:         map[int]int{1: -1},
 			matchIndex:        map[int]int{1: -1},

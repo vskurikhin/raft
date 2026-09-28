@@ -26,7 +26,7 @@ const (
 // и путь processLogs не входит. Приспособление повторяет поля ведомого из
 // тестов обработчика и не содержит недостижимых сочетаний.
 func newAppendEntriesBenchCM(n int) *ConsensusModule {
-	cm := &ConsensusModule{}
+	cm := &ConsensusModule{limits: testLimits}
 	cm.storage = store.NewMapStorage()
 	cm.cmState.state = Follower
 	cm.cmState.currentTerm = 1

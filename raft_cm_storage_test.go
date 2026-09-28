@@ -190,6 +190,7 @@ func TestRestoreFromSnapshotStore_EmptyStoreNoSnapshots(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	cm := &ConsensusModule{
+		limits:        testLimits,
 		fsm:           newSnapshotTestFSM(),
 		snapshotStore: store.NewInmemSnapshot(),
 	}
@@ -217,6 +218,7 @@ func TestRestoreFromSnapshotStore_FailFastGap(t *testing.T) {
 
 	// 1. Пустой store + lastSnapshotIndex >= 0 → ошибка.
 	cm := &ConsensusModule{
+		limits:        testLimits,
 		fsm:           newSnapshotTestFSM(),
 		snapshotStore: store.NewInmemSnapshot(),
 	}
@@ -236,6 +238,7 @@ func TestRestoreFromSnapshotStore_FailFastGap(t *testing.T) {
 	}
 	_ = sink.Close()
 	cm = &ConsensusModule{
+		limits:        testLimits,
 		fsm:           newSnapshotTestFSM(),
 		snapshotStore: stor,
 	}
@@ -248,7 +251,7 @@ func TestRestoreFromSnapshotStore_FailFastGap(t *testing.T) {
 	}
 
 	// 3. Дыра между снимком и логом → ошибка.
-	cm = &ConsensusModule{}
+	cm = &ConsensusModule{limits: testLimits}
 	cm.cmState.log = []LogEntry{{Index: 100, Term: 1}}
 	cm.cmState.lastSnapshotIndex = 5
 	cm.cmState.lastLogIndex = 100
@@ -259,7 +262,7 @@ func TestRestoreFromSnapshotStore_FailFastGap(t *testing.T) {
 
 	// 4. Безусловный инвариант при пустом журнале (ревью HIGH-1):
 	// len(log) == 0, lastLogIndex = -1, lastSnapshotIndex = 5 → ошибка.
-	cm = &ConsensusModule{}
+	cm = &ConsensusModule{limits: testLimits}
 	cm.cmState.lastSnapshotIndex = 5
 	cm.cmState.lastLogIndex = -1
 	cm.cmState.lastLogTerm = -1
@@ -551,7 +554,7 @@ func TestPersistToStorage_LogWrittenLast(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	rec := &recordingStorage{LogStorage: store.NewMapStorage()}
-	cm := &ConsensusModule{storage: rec}
+	cm := &ConsensusModule{limits: testLimits, storage: rec}
 	cm.cmState.log = []LogEntry{{Index: 5, Term: 1}}
 	cm.markLogRewriteDirtyLocked()
 
@@ -604,7 +607,7 @@ func TestPersistToStorage_KeyOrderWithSkippedWrites(t *testing.T) {
 		LogStorage: rec,
 		allowed:    map[string]bool{"currentTerm": true, "log": true},
 	}
-	cm := &ConsensusModule{storage: skipping}
+	cm := &ConsensusModule{limits: testLimits, storage: skipping}
 	cm.cmState.log = []LogEntry{{Index: 5, Term: 1}}
 	cm.markLogRewriteDirtyLocked()
 
@@ -626,7 +629,7 @@ func TestPersistToStorage_NoWritesWhenUnchanged(t *testing.T) {
 
 	storage := store.NewFileStorage(t.TempDir())
 	counter := &journalCountingStorage{LogStorage: storage}
-	cm := &ConsensusModule{storage: counter}
+	cm := &ConsensusModule{limits: testLimits, storage: counter}
 	cm.cmState.currentTerm = 1
 	cm.cmState.votedFor = -1
 	cm.cmState.lastSnapshotIndex = -1
@@ -673,21 +676,21 @@ func TestCheckSnapshotKeysConsistency(t *testing.T) {
 	storage.Set("currentTerm", gobEncode(t, 1))
 	storage.Set("votedFor", gobEncode(t, 0))
 	storage.RewriteLog([]LogEntry{{Index: 5, Term: 1}})
-	cm := &ConsensusModule{storage: storage}
+	cm := &ConsensusModule{limits: testLimits, storage: storage}
 	cm.cmState.log = []LogEntry{{Index: 5, Term: 1}}
 	if err := cm.checkSnapshotKeysConsistency(); err == nil {
 		t.Fatal("compacted log without snapshot keys: want error, got nil")
 	}
 
 	// Полный лог (Index от 0) без снимок-ключей → старт разрешён.
-	cm = &ConsensusModule{storage: storage}
+	cm = &ConsensusModule{limits: testLimits, storage: storage}
 	cm.cmState.log = []LogEntry{{Index: 0, Term: 1}}
 	if err := cm.checkSnapshotKeysConsistency(); err != nil {
 		t.Fatalf("full log without snapshot keys: %v, want nil", err)
 	}
 
 	// Пустой лог → старт разрешён.
-	cm = &ConsensusModule{storage: storage}
+	cm = &ConsensusModule{limits: testLimits, storage: storage}
 	if err := cm.checkSnapshotKeysConsistency(); err != nil {
 		t.Fatalf("empty log: %v, want nil", err)
 	}
@@ -723,6 +726,7 @@ func TestRestoreFromSnapshotStore_RestoresConfiguration(t *testing.T) {
 			t.Fatalf("Close failed: %v", err)
 		}
 		cm := &ConsensusModule{
+			limits:        testLimits,
 			fsm:           newSnapshotTestFSM(),
 			snapshotStore: snapStore,
 			storage:       store.NewMapStorage(),

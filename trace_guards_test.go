@@ -25,8 +25,8 @@ import (
 
 // AST-гейт guards: постоянная проверка производственных мест трассировки
 // консенсус-модуля и ссылочных аргументов. Проверяются:
-//   - 50 вызовов traceLogfLocked, 5 вызовов traceSprintfLocked и 22
-//     вызова traceLogf (всего 77 мест) обёрнуты положительной ветвью
+//   - 51 вызов traceLogfLocked, 5 вызовов traceSprintfLocked и 23
+//     вызова traceLogf (всего 79 мест) обёрнуты положительной ветвью
 //     if traceEnabled(L) с единственным оператором; уровень и формат
 //     каждого места независимо сверяются с эталонным реестром;
 //   - тело (*ConsensusModule).traceLogf безусловно захватывает cm.mu,
@@ -55,12 +55,12 @@ import (
 
 const (
 	// guardWantLocked — число прикладных вызовов traceLogfLocked.
-	guardWantLocked = 50
+	guardWantLocked = 51
 	// guardWantSprintf — число вызовов traceSprintfLocked (ссылочные места).
 	guardWantSprintf = 5
 	// guardWantPlain — число вызовов traceLogf (обёртка, берущая cm.mu сама).
-	guardWantPlain = 22
-	// guardWantTotal — все прикладные места (50 + 5 + 22); тела трёх
+	guardWantPlain = 23
+	// guardWantTotal — все прикладные места (51 + 5 + 23); тела трёх
 	// обёрток проверяются отдельными правилами, не этим счётчиком.
 	guardWantTotal = guardWantLocked + guardWantSprintf + guardWantPlain
 )
@@ -172,7 +172,7 @@ type guardBaselinePlace struct {
 	format string
 }
 
-// guardBaselinePlaces — эталонный реестр уровней и форматов 75 прикладных
+// guardBaselinePlaces — эталонный реестр уровней и форматов 77 прикладных
 // мест. Составлен по снимку трассировки до введения охранных проверок
 // (исходная ревизия d9f83d6) и перенесён в тест для независимой сверки:
 // уровни и форматы не снимаются с текущего дерева. Внутренняя делегация
@@ -242,6 +242,10 @@ var guardBaselinePlaces = []guardBaselinePlace{
 	{"raft_cm_replication.go", "(*ConsensusModule).leaderSendSnapshot", "traceLogf", "_traceLevelPreVote", "leaderSendSnapshot: snapshots[0] is nil"},
 	{"raft_cm_replication.go", "(*ConsensusModule).leaderSendSnapshot", "traceLogf", "_traceLevelPreVote", "leaderSendSnapshot: snapshots[0].ID is empty"},
 	{"raft_cm_replication.go", "(*ConsensusModule).leaderSendSnapshot", "traceLogf", "_traceLevelKeyEvents", "leaderSendSnapshot: cannot open snapshot %s for peer %d: %v"},
+	{"raft_cm_replication.go", "(*ConsensusModule).leaderSendSnapshot", "traceLogf", "_traceLevelKeyEvents", "leaderSendSnapshot: cannot encode configuration of snapshot %s for peer %d: %v"},
+
+	// raft_cm_limits.go
+	{"raft_cm_limits.go", "(*ConsensusModule).recordAELimitRejection", "traceLogfLocked", "_traceLevelKeyEvents", "limit rejection: direction=send peer=%d parameter=%s limit=%s actual=%d index=%d: %v"},
 
 	// raft_cm_rpc.go
 	{"raft_cm_rpc.go", "(*ConsensusModule).handleRPC", "traceLogf", "_traceLevelReplication", "handleRPC: %T"},
@@ -616,7 +620,7 @@ func checkGuardPlaces(places []*guardPlace) []string {
 		}
 	}
 	if len(places) != guardWantTotal {
-		errs = append(errs, fmt.Sprintf("всего мест %d, ожидалось %d (75 прикладных мест)", len(places), guardWantTotal))
+		errs = append(errs, fmt.Sprintf("всего мест %d, ожидалось %d (77 прикладных мест)", len(places), guardWantTotal))
 	}
 	if locked != guardWantLocked {
 		errs = append(errs, fmt.Sprintf("traceLogfLocked: %d мест, ожидалось %d", locked, guardWantLocked))

@@ -107,7 +107,7 @@ func hookedShare(t *testing.T, hooked time.Duration) float64 {
 	minTimeout := time.Duration(DefaultReelectionTimeout)
 	maxTimeout := 2 * DefaultReelectionTimeout
 
-	cm := &ConsensusModule{}
+	cm := &ConsensusModule{limits: testLimits}
 	exact := 0
 	for i := 0; i < hookSamples; i++ {
 		got := cm.electionTimeout()
@@ -154,6 +154,7 @@ func (t *recordingVoteTransport) RequestVote(peerID ServerID, args RequestVoteAr
 // перестановка параметров осталась бы незамеченной.
 func newRequestVoteFromPeerTestCM(transport Transport, term, lastLogIndex, lastLogTerm int) *ConsensusModule {
 	cm := &ConsensusModule{
+		limits:     testLimits,
 		id:         0,
 		transport:  transport,
 		storage:    store.NewMapStorage(),

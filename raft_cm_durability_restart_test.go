@@ -126,7 +126,7 @@ func TestRestartSnapshotKeyGapFullLog(t *testing.T) {
 		dropScalarKey: "lastSnapshotTerm",
 		dropJournal:   true,
 	}
-	cm := &ConsensusModule{storage: storage}
+	cm := &ConsensusModule{limits: testLimits, storage: storage}
 	cm.cmState.currentTerm = 1
 	cm.cmState.votedFor = -1
 	cm.cmState.lastSnapshotIndex = snapIndex
@@ -201,7 +201,7 @@ func TestRestartNewSnapshotKeysFullLogKept(t *testing.T) {
 	// Сбой после записи обоих снимок-ключей и до полной замены журнала:
 	// журнал остаётся прежним полным файлом.
 	storage := &dropWriteStorage{inner: inner, dropJournal: true}
-	cm := &ConsensusModule{storage: storage}
+	cm := &ConsensusModule{limits: testLimits, storage: storage}
 	cm.cmState.currentTerm = 1
 	cm.cmState.votedFor = -1
 	cm.cmState.lastSnapshotIndex = snapIndex

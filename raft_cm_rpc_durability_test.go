@@ -13,7 +13,7 @@ import (
 // считать от установившейся точки.
 func newAEDurabilityCM(dir string) (*ConsensusModule, *store.FileStorage) {
 	storage := store.NewFileStorage(dir)
-	cm := &ConsensusModule{storage: storage}
+	cm := &ConsensusModule{limits: testLimits, storage: storage}
 	cm.cmState.state = Follower
 	cm.cmState.currentTerm = 1
 	cm.cmState.votedFor = -1

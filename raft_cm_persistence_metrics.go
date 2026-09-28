@@ -314,6 +314,12 @@ type statsPersistV2 struct {
 	// OutputError — липкая ошибка общего вывода отчёта; пустая строка
 	// означает отсутствие ошибок.
 	OutputError string `json:"OutputError"`
+	// LimitRejections — счётчик protocol_limit_rejections_total (ключ документа
+	// в принятом для PersistV2 стиле PascalCase): отказы по
+	// пределам F/N/D/C с направлением (send/recv/preflight), параметром и
+	// соседом, без содержимого Data. Поле отсутствует, пока отказов нет, —
+	// прежние потребители документа не затронуты.
+	LimitRejections []statsLimitRejection `json:"ProtocolLimitRejectionsTotal,omitempty"`
 }
 
 // persistReport формирует третью строку отчёта — JSON-документ PersistV2:
@@ -367,6 +373,8 @@ func (s *statsSnapshot) persistDocument(
 		Dirty:        _statsGroupAvailable,
 		DirtyPeriods: s.dirty.document(),
 		OutputError:  outputError,
+
+		LimitRejections: s.limitRows,
 	}
 	if storage.available {
 		at := storage.at

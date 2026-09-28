@@ -379,6 +379,7 @@ func TestDirtyTransitions_RestoreCancelsInitial(t *testing.T) {
 	storage.RewriteLog([]LogEntry{{Index: 0, Term: 1}})
 
 	cm := &ConsensusModule{
+		limits:        testLimits,
 		storage:       storage,
 		snapshotStore: snapStore,
 		fsm:           newSnapshotTestFSM(),

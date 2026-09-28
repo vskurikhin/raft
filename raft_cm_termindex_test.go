@@ -48,6 +48,7 @@ func TestTermIndexMap_AppendEntries(t *testing.T) {
 	// последующая замена суффикса не завершает процесс. Состояние достижимо.
 	storage.RewriteLog([]LogEntry{})
 	cm := &ConsensusModule{
+		limits: testLimits,
 		leaderState: leaderState{
 			matchIndex: map[int]int{0: 0},
 			inflight:   make(map[int]*logFuture),
@@ -115,7 +116,7 @@ func TestTermIndexMap_AppendEntries(t *testing.T) {
 func TestTermIndexMap_CompactLogs(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
-	cm := &ConsensusModule{}
+	cm := &ConsensusModule{limits: testLimits}
 	cm.shutdownCh = make(chan struct{})
 	cm.cmState.termIndexMap = make(map[int]int)
 	cm.cmState.log = []LogEntry{
@@ -175,6 +176,7 @@ func TestTermIndexMap_AppendEntriesConflict(t *testing.T) {
 
 	storage := store.NewMapStorage()
 	cm := &ConsensusModule{
+		limits:     testLimits,
 		storage:    storage,
 		shutdownCh: make(chan struct{}),
 		cmState: cmState{
@@ -324,6 +326,7 @@ func TestTermIndexMap_LeaderSendAEsConflictLookup(t *testing.T) {
 
 	mock := &mockTransportConflict{replyTerm: 2, success: false, conflictTerm: 2}
 	cm := &ConsensusModule{
+		limits: testLimits,
 		leaderState: leaderState{
 			nextIndex:  map[int]int{1: 3},
 			matchIndex: map[int]int{1: -1},
@@ -400,6 +403,7 @@ func TestTermIndexMap_SlicePositionBug(t *testing.T) {
 
 	mock := &mockTransportConflict{replyTerm: 2, success: false, conflictTerm: 2}
 	cm := &ConsensusModule{
+		limits: testLimits,
 		leaderState: leaderState{
 			nextIndex:  map[int]int{1: 3},
 			matchIndex: map[int]int{1: -1},

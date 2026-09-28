@@ -61,11 +61,11 @@ func startTCPHandler(t *testing.T, trans *TCPTransport) func() {
 				switch cmd := rpc.Command.(type) {
 				case *contract.AppendEntriesArgs:
 					rpc.RespChan <- contract.RPCResponse{
-						Reply: &contract.AppendEntriesReply{Success: true, Term: cmd.Term},
+						Reply: &contract.AppendEntriesReply{RPCHeader: testRPCHeader, Success: true, Term: cmd.Term},
 					}
 				case *contract.RequestVoteArgs:
 					rpc.RespChan <- contract.RPCResponse{
-						Reply: &contract.RequestVoteReply{VoteGranted: true, Term: cmd.Term},
+						Reply: &contract.RequestVoteReply{RPCHeader: testRPCHeader, VoteGranted: true, Term: cmd.Term},
 					}
 				}
 			case <-done:
@@ -204,6 +204,7 @@ func TestTCPAppendEntriesSuccess(t *testing.T) {
 	defer startTCPHandler(t, server)()
 
 	args := contract.AppendEntriesArgs{
+		RPCHeader:    testRPCHeader,
 		Term:         1,
 		LeaderID:     0,
 		PrevLogIndex: -1,
@@ -232,7 +233,7 @@ func TestTCPAppendEntriesUnknownPeer(t *testing.T) {
 	defer client.Close()
 
 	// Не вызываем Connect для peer 1
-	args := contract.AppendEntriesArgs{Term: 1}
+	args := contract.AppendEntriesArgs{RPCHeader: testRPCHeader, Term: 1}
 	_, err = client.AppendEntries(1, args)
 	if err == nil {
 		t.Fatal("expected error for unknown peer")
@@ -248,7 +249,7 @@ func TestTCPAppendEntriesAfterClose(t *testing.T) {
 
 	client.Close()
 
-	args := contract.AppendEntriesArgs{Term: 1}
+	args := contract.AppendEntriesArgs{RPCHeader: testRPCHeader, Term: 1}
 	_, err := client.AppendEntries(1, args)
 	if err == nil {
 		t.Fatal("expected error after Close")
@@ -263,7 +264,7 @@ func TestTCPAppendEntriesDisconnect(t *testing.T) {
 	defer startTCPHandler(t, server)()
 
 	// Сначала успешная отправка
-	args := contract.AppendEntriesArgs{Term: 1, LeaderID: 0}
+	args := contract.AppendEntriesArgs{RPCHeader: testRPCHeader, Term: 1, LeaderID: 0}
 	reply, err := client.AppendEntries(1, args)
 	if err != nil {
 		t.Fatalf("first AppendEntries failed: %v", err)
@@ -282,13 +283,13 @@ func TestTCPAppendEntriesDisconnect(t *testing.T) {
 	}
 }
 
-// TestTCPAppendEntriesTimeout проверяет таймаут ответа.
-// «Коротким» делается ResponseTimeout СЕРВЕРА: ошибку ErrEnqueueTimeout
-// формирует сервер в handleCommand по time.After(respTimeout), ожидая
-// ответа потребителя; строка ошибки передаётся по проводу и
-// восстанавливается клиентом в маркерную ошибку ErrEnqueueTimeout
-// (decodeResponse). Остальные поля сервера и все поля клиента —
-// равномерно по 1 с, чтобы сработал именно серверный дедлайн ответа.
+// TestTCPAppendEntriesTimeout проверяет истечение окна получателя.
+// «Коротким» делается ResponseTimeout СЕРВЕРА: одно абсолютное окно
+// D_body (очередь, ответ обработчика, запись ответа) истекает раньше окна
+// клиента. Получатель закрывает соединение; код 2 при истёкшем сроке сокета
+// не гарантирован, поэтому клиент получает либо ErrEnqueueTimeout, либо
+// обрыв соединения — но не успех и не собственный i/o timeout. Соединение
+// не возвращается в пул.
 func TestTCPAppendEntriesTimeout(t *testing.T) {
 	defer leaktest.CheckTimeout(t, raft.LeaktestBudget)()
 	server, err := NewTCPTransport("127.0.0.1:0", TCPTimeouts{
@@ -311,10 +312,18 @@ func TestTCPAppendEntriesTimeout(t *testing.T) {
 	defer server.Close()
 	defer startTCPHandlerNoReply(t, server)()
 
-	args := contract.AppendEntriesArgs{Term: 1}
+	args := contract.AppendEntriesArgs{RPCHeader: testRPCHeader, Term: 1}
+	start := time.Now()
 	_, err = client.AppendEntries(1, args)
-	if err != contract.ErrEnqueueTimeout {
-		t.Fatalf("want ErrEnqueueTimeout, got %v", err)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("want receiver window expiry, got success")
+	}
+	if elapsed < 50*time.Millisecond || elapsed >= time.Second {
+		t.Fatalf("elapsed %v: want the server window (50ms), not the client window (1s)", elapsed)
+	}
+	if n := client.pooledCount(contract.ServerAddress(server.LocalAddr())); n != 0 {
+		t.Fatalf("connection pooled after receiver window expiry: %d", n)
 	}
 }
 
@@ -326,9 +335,10 @@ func TestTCPAppendEntriesTimeout(t *testing.T) {
 // max(responseTimeout, installSnapshotTimeout) × ⌊DataSize/256 КиБ⌋
 // (на умолчаниях TCPTimeouts{} — max(200, 310) × 1 = 310 мс). Медленный
 // потребитель (чтение по 16 КиБ с паузой 20 мс: 300 КиБ / 16 КиБ × 20 мс
-// ≈ 380 мс) не успевает дочитать данные снимка за окно; сервер кодирует
-// маркер ErrEnqueueTimeout, выполняет Flush и закрывает соединение —
-// продолжение декодирования из того же bufio.Reader исключено, гонки нет.
+// ≈ 380 мс) не успевает дочитать данные снимка за окно; сервер по
+// возможности пишет код 2 (при истёкшем сроке сокета запись не проходит)
+// и закрывает соединение, не читая общий bufio.Reader, — продолжение
+// декодирования из того же bufio.Reader исключено, гонки нет.
 //
 // Клиенту задаётся uniformTCPTimeouts(time.Second): дедлайн клиента (1 с)
 // взводится позже серверного окна (310 мс), поэтому истекает именно окно
@@ -389,6 +399,7 @@ func TestTCPInstallSnapshotSlowConsumer(t *testing.T) {
 
 	const dataSize = 300 * 1024
 	args := contract.InstallSnapshotRequest{
+		RPCHeader:    testRPCHeader,
 		Term:         1,
 		LeaderID:     0,
 		LastLogIndex: 100,
@@ -400,13 +411,15 @@ func TestTCPInstallSnapshotSlowConsumer(t *testing.T) {
 	_, err = client.InstallSnapshot(1, args, bytes.NewReader(data))
 	elapsed := time.Since(start)
 
-	if err != contract.ErrEnqueueTimeout {
-		t.Fatalf("want ErrEnqueueTimeout, got %v", err)
+	// Окно получателя истекло: код 2 записывается по возможности, при
+	// истёкшем сроке сокета — обрыв соединения; успеха нет.
+	if err == nil {
+		t.Fatal("want receiver snapshot window expiry, got success")
 	}
 	// Путь истечения серверного окна: elapsed ≥ 300 мс (окно 310 мс
-	// с допуском на планирование).
-	if elapsed < 300*time.Millisecond {
-		t.Fatalf("elapsed = %v, want >= 300ms (server snapshot window)", elapsed)
+	// с допуском на планирование) и меньше окна клиента 1 с.
+	if elapsed < 300*time.Millisecond || elapsed >= time.Second {
+		t.Fatalf("elapsed = %v, want >= 300ms (server snapshot window) and < 1s", elapsed)
 	}
 	<-consumerDone
 }
@@ -419,6 +432,7 @@ func TestTCPRequestVoteSuccess(t *testing.T) {
 	defer startTCPHandler(t, server)()
 
 	args := contract.RequestVoteArgs{
+		RPCHeader:    testRPCHeader,
 		Term:         2,
 		CandidateID:  0,
 		LastLogIndex: -1,
@@ -445,7 +459,7 @@ func TestTCPRequestVoteUnknownPeer(t *testing.T) {
 	}
 	defer client.Close()
 
-	_, err = client.RequestVote(1, contract.RequestVoteArgs{Term: 1})
+	_, err = client.RequestVote(1, contract.RequestVoteArgs{RPCHeader: testRPCHeader, Term: 1})
 	if err == nil {
 		t.Fatal("expected error for unknown peer")
 	}
@@ -460,7 +474,7 @@ func TestTCPRequestVoteAfterClose(t *testing.T) {
 
 	client.Close()
 
-	_, err := client.RequestVote(1, contract.RequestVoteArgs{Term: 1})
+	_, err := client.RequestVote(1, contract.RequestVoteArgs{RPCHeader: testRPCHeader, Term: 1})
 	if err == nil {
 		t.Fatal("expected error after Close")
 	}
@@ -475,7 +489,7 @@ func TestTCPConnectionReset(t *testing.T) {
 	defer startTCPHandler(t, server)()
 
 	// Успешная отправка
-	args := contract.AppendEntriesArgs{Term: 1, LeaderID: 0}
+	args := contract.AppendEntriesArgs{RPCHeader: testRPCHeader, Term: 1, LeaderID: 0}
 	reply, err := client.AppendEntries(1, args)
 	if err != nil {
 		t.Fatalf("first AppendEntries failed: %v", err)
@@ -502,7 +516,7 @@ func TestTCPReconnectAfterDrop(t *testing.T) {
 	defer cleanup()
 	defer startTCPHandler(t, server)()
 
-	args := contract.AppendEntriesArgs{Term: 1, LeaderID: 0}
+	args := contract.AppendEntriesArgs{RPCHeader: testRPCHeader, Term: 1, LeaderID: 0}
 
 	// Первый вызов успешен
 	reply, err := client.AppendEntries(1, args)
@@ -541,7 +555,7 @@ func TestTCPConcurrentSends(t *testing.T) {
 		wg.Add(1)
 		go func(term int) {
 			defer wg.Done()
-			args := contract.AppendEntriesArgs{Term: term, LeaderID: 0}
+			args := contract.AppendEntriesArgs{RPCHeader: testRPCHeader, Term: term, LeaderID: 0}
 			reply, err := client.AppendEntries(1, args)
 			if err != nil {
 				t.Errorf("AppendEntries failed: %v", err)
@@ -588,63 +602,16 @@ func TestTCPCloseStopsConsumer(t *testing.T) {
 	client.Close()
 
 	// AppendEntries после Close
-	_, err := client.AppendEntries(1, contract.AppendEntriesArgs{Term: 1})
+	_, err := client.AppendEntries(1, contract.AppendEntriesArgs{RPCHeader: testRPCHeader, Term: 1})
 	if err == nil {
 		t.Fatal("expected error after Close")
 	}
 
 	// RequestVote после Close
-	_, err = client.RequestVote(1, contract.RequestVoteArgs{Term: 1})
+	_, err = client.RequestVote(1, contract.RequestVoteArgs{RPCHeader: testRPCHeader, Term: 1})
 	if err == nil {
 		t.Fatal("expected error after Close")
 	}
-}
-
-// TestTCPGobRegistration проверяет, что RPC-типы зарегистрированы в gob.
-func TestTCPGobRegistration(t *testing.T) {
-	defer leaktest.CheckTimeout(t, raft.LeaktestBudget)()
-
-	// Проверяем, что init() зарегистрировал типы — создаём транспорт,
-	// отправляем RPC с разными типами, убеждаемся что gob не паникует.
-	client, server, cleanup := newTCPPair(t, uniformTCPTimeouts(time.Second))
-	defer cleanup()
-	defer startTCPHandler(t, server)()
-
-	t.Run("AppendEntries", func(t *testing.T) {
-		args := contract.AppendEntriesArgs{
-			Term:         1,
-			LeaderID:     0,
-			PrevLogIndex: -1,
-			PrevLogTerm:  -1,
-			Entries: []raft.LogEntry{
-				{Index: 0, Term: 1, Type: raft.LogCommand, Data: "test"},
-			},
-			LeaderCommit: -1,
-		}
-		reply, err := client.AppendEntries(1, args)
-		if err != nil {
-			t.Fatalf("AppendEntries with entries failed: %v", err)
-		}
-		if !reply.Success {
-			t.Fatal("AppendEntries: Success = false")
-		}
-	})
-
-	t.Run("RequestVote", func(t *testing.T) {
-		args := contract.RequestVoteArgs{
-			Term:         5,
-			CandidateID:  0,
-			LastLogIndex: 10,
-			LastLogTerm:  3,
-		}
-		reply, err := client.RequestVote(1, args)
-		if err != nil {
-			t.Fatalf("RequestVote failed: %v", err)
-		}
-		if !reply.VoteGranted {
-			t.Fatal("RequestVote: VoteGranted = false")
-		}
-	})
 }
 
 // TestTCPAppendEntriesError проверяет, что если сервер отвечает с ошибкой,
@@ -665,7 +632,7 @@ func TestTCPAppendEntriesError(t *testing.T) {
 	}()
 	defer close(done)
 
-	_, err := client.AppendEntries(1, contract.AppendEntriesArgs{Term: 1})
+	_, err := client.AppendEntries(1, contract.AppendEntriesArgs{RPCHeader: testRPCHeader, Term: 1})
 	if err != contract.ErrRaftShutdown {
 		t.Fatalf("want ErrRaftShutdown, got %v", err)
 	}
@@ -679,7 +646,7 @@ func TestTCPAppendEntriesMultiple(t *testing.T) {
 	defer startTCPHandler(t, server)()
 
 	for i := 0; i < 10; i++ {
-		args := contract.AppendEntriesArgs{Term: i + 1, LeaderID: 0}
+		args := contract.AppendEntriesArgs{RPCHeader: testRPCHeader, Term: i + 1, LeaderID: 0}
 		reply, err := client.AppendEntries(1, args)
 		if err != nil {
 			t.Fatalf("AppendEntries %d failed: %v", i, err)
@@ -715,19 +682,19 @@ func TestTCPStubsReturnNotImplemented(t *testing.T) {
 	defer trans.Close()
 
 	t.Run("RequestPreVote", func(t *testing.T) {
-		_, err := trans.RequestPreVote(1, contract.RequestPreVoteArgs{})
+		_, err := trans.RequestPreVote(1, contract.RequestPreVoteArgs{RPCHeader: testRPCHeader})
 		if err == nil || err == contract.ErrNotImplemented {
 			t.Fatalf("want transport error, got %v", err)
 		}
 	})
 	t.Run("TimeoutNow", func(t *testing.T) {
-		_, err := trans.TimeoutNow(1, contract.TimeoutNowRequest{})
+		_, err := trans.TimeoutNow(1, contract.TimeoutNowRequest{RPCHeader: testRPCHeader})
 		if err == nil || err == contract.ErrNotImplemented {
 			t.Fatalf("want transport error, got %v", err)
 		}
 	})
 	t.Run("InstallSnapshot", func(t *testing.T) {
-		_, err := trans.InstallSnapshot(1, contract.InstallSnapshotRequest{}, nil)
+		_, err := trans.InstallSnapshot(1, contract.InstallSnapshotRequest{RPCHeader: testRPCHeader}, nil)
 		if err == nil {
 			t.Fatalf("InstallSnapshot: want error, got nil")
 		}
@@ -769,11 +736,11 @@ func TestTCPDisconnectAll(t *testing.T) {
 	client.DisconnectAll()
 
 	// Все соседи должны быть недоступны
-	_, err = client.AppendEntries(1, contract.AppendEntriesArgs{Term: 1})
+	_, err = client.AppendEntries(1, contract.AppendEntriesArgs{RPCHeader: testRPCHeader, Term: 1})
 	if err == nil {
 		t.Fatal("expected error after DisconnectAll for peer 1")
 	}
-	_, err = client.AppendEntries(2, contract.AppendEntriesArgs{Term: 1})
+	_, err = client.AppendEntries(2, contract.AppendEntriesArgs{RPCHeader: testRPCHeader, Term: 1})
 	if err == nil {
 		t.Fatal("expected error after DisconnectAll for peer 2")
 	}
@@ -789,29 +756,4 @@ func TestTCPTransportNoGoroutineLeak(t *testing.T) {
 		t.Fatalf("NewTCPTransport: %v", err)
 	}
 	trans.Close()
-}
-
-// TestRPCFramingBytes фиксирует байты фрейминга TCP RPC: значения
-// используются как поле Type запроса, кодируются gob и уходят
-// в сеть, поэтому смена любого значения — изменение проводного
-// формата.
-func TestRPCFramingBytes(t *testing.T) {
-	tests := []struct {
-		name string
-		got  byte
-		want byte
-	}{
-		{"rpcAppendEntries", _rpcAppendEntries, 0},
-		{"rpcRequestVote", _rpcRequestVote, 1},
-		{"rpcInstallSnapshot", _rpcInstallSnapshot, 2},
-		{"rpcTimeoutNow", _rpcTimeoutNow, 3},
-		{"rpcRequestPreVote", _rpcRequestPreVote, 4},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if tt.got != tt.want {
-				t.Fatalf("got %d, want %d", tt.got, tt.want)
-			}
-		})
-	}
 }

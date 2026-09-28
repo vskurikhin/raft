@@ -1,10 +1,13 @@
 package raft
 
 import (
+	"fmt"
 	"log"
 	"net"
 	"sync"
 	"time"
+
+	"github.com/vskurikhin/raft/pkg/raft/contract"
 )
 
 // TransportManager — транспорт с управлением соединениями и
@@ -36,6 +39,10 @@ type Server struct {
 	// disableStatsOutput — выбор вывода периодической статистики из Config;
 	// передаётся CM при создании и далее неизменен.
 	disableStatsOutput bool
+
+	// limits — профиль пределов сетевого формата из Config; передаётся CM
+	// при создании и сверяется с профилем транспорта.
+	limits contract.Limits
 
 	peerIds  []int
 	serverID int
@@ -70,6 +77,12 @@ type Config struct {
 
 	// HeartbeatTimeout — период пульса лидера (0 = умолчание).
 	HeartbeatTimeout time.Duration
+
+	// Limits — профиль пределов сетевого формата RPC. Целиком нулевое
+	// значение — профиль по умолчанию; частично нулевой или недопустимый
+	// профиль — ошибка конфигурации. Профиль обязан совпадать с профилем
+	// транспорта (contract.LimitsProvider).
+	Limits contract.Limits
 
 	PeerAddresses map[int]net.Addr
 	PeerIds       []int
@@ -106,11 +119,17 @@ func New(cfg *Config, ready <-chan any) *Server {
 	if IsNilInterface(cfg.Transport) {
 		panic("raft: Config.Transport is nil or typed nil: the transport must be created and passed by the caller")
 	}
+	// Профиль пределов и интерфейсы профиля транспорта проверяются до
+	// Serve; временной профиль — в Serve после ValidateTiming.
+	if _, _, err := transportLimits(cfg.Limits, cfg.Transport); err != nil {
+		panic(fmt.Sprintf("raft: New: %v", err))
+	}
 	s := &Server{
 		applyBatchInterval: cfg.ApplyBatchInterval,
 		disableStatsOutput: cfg.DisableStatsOutput,
 		fsm:                cfg.Fsm,
 		heartbeatTimeout:   cfg.HeartbeatTimeout,
+		limits:             cfg.Limits,
 		peerIds:            cfg.PeerIds,
 		quit:               make(chan any),
 		ready:              ready,
@@ -127,51 +146,30 @@ func New(cfg *Config, ready <-chan any) *Server {
 }
 
 // Serve создаёт ConsensusModule поверх переданного транспорта.
+//
+// Временные параметры нормализуются («<= 0 → умолчание») и проверяются
+// ValidateTiming до создания CM; нормализованные значения передаются
+// конструктору, который до запуска горутин сверяет профиль транспорта и
+// временной профиль с фактическими таймерами узла.
 func (s *Server) Serve() {
-	s.cm = newConsensusModule(
-		cmConfig{disableStatsOutput: s.disableStatsOutput},
-		s.serverID, s.peerIds, s.transport, s.storage, s.fsm, s.ready, s.snapshotStore,
-	)
-
-	// Применение временных параметров из конфигурации сразу после создания
-	// CM и до закрытия ready — CM ещё не участвует в выборах. Нормализация
-	// «<= 0 → умолчание» выполняется безусловно, вне зависимости от того,
-	// включены ли снимки. Сеттер — единая точка записи временных полей.
-	heartbeat := s.heartbeatTimeout
-	if heartbeat <= 0 {
-		heartbeat = DefaultHeartbeatTimeout
-	}
-	ticker := s.tickerTimeout
-	if ticker <= 0 {
-		ticker = DefaultTickerTimeout
-	}
-	reelection := s.reelectionTimeout
-	if reelection <= 0 {
-		reelection = DefaultReelectionTimeout
-	}
-	applyBatch := s.applyBatchInterval
-	if applyBatch <= 0 {
-		applyBatch = DefaultApplyBatchInterval
-	}
+	timers := normalizeTimerConfig(TimerConfig{
+		ApplyBatch: s.applyBatchInterval,
+		Heartbeat:  s.heartbeatTimeout,
+		Reelection: s.reelectionTimeout,
+		Ticker:     s.tickerTimeout,
+	})
 
 	// Защитная проверка программного входа: эффективные значения после
 	// нормализации обязаны проходить валидацию. При нарушении — стратегия
 	// немедленного отказа (log.Fatalf) по прецеденту конструктора CM.
-	if err := ValidateTiming(TimerConfig{
-		ApplyBatch: applyBatch,
-		Heartbeat:  heartbeat,
-		Reelection: reelection,
-		Ticker:     ticker,
-	}); err != nil {
+	if err := ValidateTiming(timers); err != nil {
 		log.Fatalf("raft: Serve: invalid timing configuration: %v", err)
 	}
 
-	s.cm.setTimerConfig(TimerConfig{
-		ApplyBatch: applyBatch,
-		Heartbeat:  heartbeat,
-		Reelection: reelection,
-		Ticker:     ticker,
-	})
+	s.cm = newConsensusModule(
+		cmConfig{disableStatsOutput: s.disableStatsOutput, timers: &timers, limits: s.limits},
+		s.serverID, s.peerIds, s.transport, s.storage, s.fsm, s.ready, s.snapshotStore,
+	)
 
 	// Применение параметров снимков из конфигурации сразу после создания
 	// CM и до закрытия ready — CM ещё не участвует в выборах.

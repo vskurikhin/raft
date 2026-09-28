@@ -99,6 +99,7 @@ func TestResponseStatusString(t *testing.T) {
 		{"StatusOK", StatusOK, "OK"},
 		{"StatusNotLeader", StatusNotLeader, "NotLeader"},
 		{"StatusFailedCommit", StatusFailedCommit, "FailedCommit"},
+		{"StatusTooLarge", StatusTooLarge, "TooLarge"},
 		{"unknown", ResponseStatus(42), ""},
 	}
 	for _, tt := range tests {
@@ -107,5 +108,20 @@ func TestResponseStatusString(t *testing.T) {
 				t.Fatalf("got %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestStatusTooLargeValue — StatusTooLarge добавлен после существующих
+// значений (4), прежние значения не перенумерованы; JSON отказа по пределам.
+func TestStatusTooLargeValue(t *testing.T) {
+	values := []ResponseStatus{StatusInvalid, StatusOK, StatusNotLeader, StatusFailedCommit, StatusTooLarge}
+	for want, got := range values {
+		if int(got) != want {
+			t.Fatalf("status %v = %d, want %d", got, int(got), want)
+		}
+	}
+	js, err := json.Marshal(StatusResponse{RespStatus: StatusTooLarge})
+	if err != nil || string(js) != `{"RespStatus":4}` {
+		t.Fatalf("JSON %s %v", js, err)
 	}
 }

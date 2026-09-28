@@ -121,7 +121,7 @@ func TestLatencyObserveUnderMutexDoesNotBlock(t *testing.T) {
 func TestLatencyZeroValueCMMetricPaths(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
-	cm := &ConsensusModule{}
+	cm := &ConsensusModule{limits: testLimits}
 	cm.storage = store.NewMapStorage()
 	cm.fsmMutateCh = make(chan []*commitTuple, _batchApplyBuffer)
 	cm.shutdownCh = make(chan struct{})
@@ -263,6 +263,7 @@ func TestFailedAETraceReportsActualNextIndex(t *testing.T) {
 // (TestLatencyReportFormat, /005).
 func TestRaftCountersReportFormat(t *testing.T) {
 	cm := &ConsensusModule{
+		limits: testLimits,
 		counters: raftCounters{
 			installSnapshotSent:         map[int]int64{2: 3, 1: 4},
 			installSnapshotSkippedStale: map[int]int64{1: 2},
@@ -307,6 +308,7 @@ func TestCounters_DistinguishSnapshotLoop(t *testing.T) {
 	}
 	tracker := newCommitmentTracker(0, 1, -1, make(chan int, 1))
 	cm := &ConsensusModule{
+		limits: testLimits,
 		leaderState: leaderState{
 			nextIndex:              map[int]int{1: 1},
 			matchIndex:             map[int]int{1: -1},

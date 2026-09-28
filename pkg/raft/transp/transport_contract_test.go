@@ -59,11 +59,11 @@ func runTransportHandler(t *testing.T, trans contract.Transport, consume bool) f
 				switch cmd := rpc.Command.(type) {
 				case *contract.AppendEntriesArgs:
 					rpc.RespChan <- contract.RPCResponse{
-						Reply: &contract.AppendEntriesReply{Success: true, Term: cmd.Term},
+						Reply: &contract.AppendEntriesReply{RPCHeader: testRPCHeader, Success: true, Term: cmd.Term},
 					}
 				case *contract.RequestVoteArgs:
 					rpc.RespChan <- contract.RPCResponse{
-						Reply: &contract.RequestVoteReply{VoteGranted: true, Term: cmd.Term},
+						Reply: &contract.RequestVoteReply{RPCHeader: testRPCHeader, VoteGranted: true, Term: cmd.Term},
 					}
 				}
 			case <-done:
@@ -116,7 +116,7 @@ func TestTransportAppendEntriesIdempotent(t *testing.T) {
 			defer cleanup()
 			defer runTransportHandler(t, server, true)()
 
-			args := contract.AppendEntriesArgs{Term: 1, LeaderID: 0, PrevLogIndex: -1, PrevLogTerm: -1, LeaderCommit: -1}
+			args := contract.AppendEntriesArgs{RPCHeader: testRPCHeader, Term: 1, LeaderID: 0, PrevLogIndex: -1, PrevLogTerm: -1, LeaderCommit: -1}
 
 			for i := 0; i < 5; i++ {
 				reply, err := client.AppendEntries(1, args)
@@ -147,7 +147,7 @@ func TestTransportRequestVoteIdempotent(t *testing.T) {
 			defer cleanup()
 			defer runTransportHandler(t, server, true)()
 
-			args := contract.RequestVoteArgs{Term: 2, CandidateID: 0, LastLogIndex: -1, LastLogTerm: -1}
+			args := contract.RequestVoteArgs{RPCHeader: testRPCHeader, Term: 2, CandidateID: 0, LastLogIndex: -1, LastLogTerm: -1}
 
 			for i := 0; i < 5; i++ {
 				reply, err := client.RequestVote(1, args)
@@ -178,7 +178,7 @@ func TestTransportDisconnectReturnsError(t *testing.T) {
 			defer cleanup()
 			defer runTransportHandler(t, server, true)()
 
-			args := contract.AppendEntriesArgs{Term: 1, LeaderID: 0}
+			args := contract.AppendEntriesArgs{RPCHeader: testRPCHeader, Term: 1, LeaderID: 0}
 
 			// Успешная отправка
 			_, err := client.AppendEntries(1, args)
@@ -220,13 +220,13 @@ func TestTransportCloseReturnsError(t *testing.T) {
 				c.Close()
 			}
 
-			args := contract.AppendEntriesArgs{Term: 1}
+			args := contract.AppendEntriesArgs{RPCHeader: testRPCHeader, Term: 1}
 			_, err := client.AppendEntries(1, args)
 			if err == nil {
 				t.Fatal("expected error after Close")
 			}
 
-			_, err = client.RequestVote(1, contract.RequestVoteArgs{Term: 1})
+			_, err = client.RequestVote(1, contract.RequestVoteArgs{RPCHeader: testRPCHeader, Term: 1})
 			if err == nil {
 				t.Fatal("expected error after Close")
 			}
@@ -264,15 +264,15 @@ func TestTransportStubsReturnNotImplemented(t *testing.T) {
 			client, _, cleanup := tt.fn(t)
 			defer cleanup()
 
-			if _, err := client.RequestPreVote(1, contract.RequestPreVoteArgs{}); err == nil || err == contract.ErrNotImplemented {
+			if _, err := client.RequestPreVote(1, contract.RequestPreVoteArgs{RPCHeader: testRPCHeader}); err == nil || err == contract.ErrNotImplemented {
 				t.Fatalf("RequestPreVote: want transport error, got %v", err)
 			}
-			if _, err := client.TimeoutNow(1, contract.TimeoutNowRequest{}); err == nil || err == contract.ErrNotImplemented {
+			if _, err := client.TimeoutNow(1, contract.TimeoutNowRequest{RPCHeader: testRPCHeader}); err == nil || err == contract.ErrNotImplemented {
 				t.Fatalf("TimeoutNow: want transport error, got %v", err)
 			}
 			// InmemTransport реализует InstallSnapshot и возвращает contract.ErrNotReachable
 			// (или другую транспортную ошибку), а TCPTransport — contract.ErrNotImplemented.
-			if _, err := client.InstallSnapshot(1, contract.InstallSnapshotRequest{}, nil); err == nil {
+			if _, err := client.InstallSnapshot(1, contract.InstallSnapshotRequest{RPCHeader: testRPCHeader}, nil); err == nil {
 				t.Fatalf("InstallSnapshot: want error, got nil")
 			}
 			if _, err := client.AppendEntriesPipeline(1); err != contract.ErrNotImplemented {
@@ -299,6 +299,7 @@ func TestTransportAppendEntriesWithEntries(t *testing.T) {
 			defer runTransportHandler(t, server, true)()
 
 			args := contract.AppendEntriesArgs{
+				RPCHeader:    testRPCHeader,
 				Term:         1,
 				LeaderID:     0,
 				PrevLogIndex: -1,

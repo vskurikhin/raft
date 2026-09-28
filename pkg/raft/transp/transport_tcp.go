@@ -2,16 +2,17 @@ package transp
 
 import (
 	"bufio"
-	"encoding/gob"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"sync"
 	"time"
 
 	"github.com/vskurikhin/raft/pkg/raft/contract"
+	"github.com/vskurikhin/raft/pkg/raft/protocol"
 )
 
 const (
@@ -25,46 +26,59 @@ const (
 	// целевой адрес. Значение 2 позволяет переиспользовать соединения
 	// без избыточного удержания ресурсов.
 	_defaultMaxPool = 2
+
+	// _timeoutStepBytes — ступень масштабирования сроков по длине данных:
+	// 256 КиБ. Для обычного RPC срок умножается на
+	// max(1, ⌈BodyLength/256 КиБ⌉), для тела снимка — на
+	// max(1, ⌊DataSize/256 КиБ⌋).
+	_timeoutStepBytes = 262144
+
+	// _frameHeaderBytes — длина заголовка кадра сетевого формата: длина
+	// тела кадра, по которой масштабируется срок, равна длине кадра без
+	// заголовка.
+	_frameHeaderBytes = 24
 )
 
-// Типы RPC для фрейминга (1 байт вместо строки).
+// Типы RPC сетевого формата. Значения заданы таблицами спецификации формата
+// (поле RPCType заголовка кадра) и не зависят от внутренних имён кодека.
 const (
-	_rpcAppendEntries byte = iota
-	_rpcRequestVote
-	_rpcInstallSnapshot
-	_rpcTimeoutNow
-	_rpcRequestPreVote
+	rpcTypeAppendEntries   protocol.RPCType = 0
+	rpcTypeRequestVote     protocol.RPCType = 1
+	rpcTypeInstallSnapshot protocol.RPCType = 2
+	rpcTypeTimeoutNow      protocol.RPCType = 3
+	rpcTypeRequestPreVote  protocol.RPCType = 4
 )
 
-//nolint:gochecknoinits
-func init() {
-	// Метки закреплены полным путём импорта корневого пакета
-	// github.com/vskurikhin/raft.
-	// Метки осознанно сохраняют путь корневого пакета;
-	// заменять их на contract.<ИмяТипа> нельзя.
-	gob.RegisterName("github.com/vskurikhin/raft.AppendEntriesArgs", contract.AppendEntriesArgs{})
-	gob.RegisterName("github.com/vskurikhin/raft.AppendEntriesReply", contract.AppendEntriesReply{})
-	gob.RegisterName("github.com/vskurikhin/raft.RequestVoteArgs", contract.RequestVoteArgs{})
-	gob.RegisterName("github.com/vskurikhin/raft.RequestVoteReply", contract.RequestVoteReply{})
-	gob.RegisterName("github.com/vskurikhin/raft.TimeoutNowRequest", contract.TimeoutNowRequest{})
-	gob.RegisterName("github.com/vskurikhin/raft.TimeoutNowResponse", contract.TimeoutNowResponse{})
-	gob.RegisterName("github.com/vskurikhin/raft.RequestPreVoteArgs", contract.RequestPreVoteArgs{})
-	gob.RegisterName("github.com/vskurikhin/raft.RequestPreVoteReply", contract.RequestPreVoteReply{})
-	gob.RegisterName("github.com/vskurikhin/raft.InstallSnapshotRequest", contract.InstallSnapshotRequest{})
-	gob.RegisterName("github.com/vskurikhin/raft.InstallSnapshotResponse", contract.InstallSnapshotResponse{})
+// rpcTypeName возвращает имя RPC для диагностики.
+func rpcTypeName(typ protocol.RPCType) string {
+	switch typ {
+	case rpcTypeAppendEntries:
+		return "AppendEntries"
+	case rpcTypeRequestVote:
+		return "RequestVote"
+	case rpcTypeInstallSnapshot:
+		return "InstallSnapshot"
+	case rpcTypeTimeoutNow:
+		return "TimeoutNow"
+	case rpcTypeRequestPreVote:
+		return "RequestPreVote"
+	default:
+		return fmt.Sprintf("RPCType(%d)", uint8(typ))
+	}
 }
 
-// tcpConn — обёртка над net.Conn с буферизированным writer и gob-кодеками.
-// Используется как для исходящих соединений (пул), так и для входящих
-// (handleConn).
-// В исходящем случае буфер чтения не используется
-// — декодирование идёт напрямую из conn.
+// errSnapshotBodyUnread — ответ обработчика снимка получен, а тело снимка
+// прочитано не полностью: успешный ответ без полного тела запрещён.
+var errSnapshotBodyUnread = errors.New("raft: snapshot body not fully consumed")
+
+// tcpConn — исходящее соединение пула: net.Conn и буферизированный writer.
+// Ответ читается непосредственно из conn, без собственного буфера чтения.
+// Соединением владеет ровно один обмен от изъятия из пула до возврата
+// в пул либо закрытия.
 type tcpConn struct {
 	target contract.ServerAddress
 	conn   net.Conn
 	w      *bufio.Writer
-	dec    *gob.Decoder
-	enc    *gob.Encoder
 }
 
 // Release закрывает соединение и освобождает ресурсы.
@@ -72,9 +86,10 @@ func (t *tcpConn) Release() error {
 	return t.conn.Close()
 }
 
-// TCPTransport — реализация Transport, использующая TCP и encoding/gob.
-// Содержит пул исходящих соединений (LIFO, maxPool на адрес) и
-// переиспользует входящие соединения для множества RPC (цикл handleConn).
+// TCPTransport — реализация Transport поверх TCP с бинарным сетевым
+// форматом RPC (pkg/raft/protocol). Содержит пул исходящих соединений
+// (LIFO, maxPool на адрес) и переиспользует входящие соединения для
+// множества RPC (цикл handleConn).
 //
 // Потокобезопасность: все методы потокобезопасны.
 // После Close() все методы возвращают транспортную ошибку.
@@ -87,6 +102,13 @@ type TCPTransport struct {
 	genericRPCTimeout      time.Duration
 	installSnapshotTimeout time.Duration
 	responseTimeout        time.Duration
+
+	// limits — пределы сетевого формата; одинаковы для отправки и приёма.
+	// Неизменяемы после конструктора.
+	limits contract.Limits
+	// timing — действующие сроки транспорта, полученные той же
+	// нормализацией, что и поля сроков выше. Неизменяемы после конструктора.
+	timing contract.TransportTiming
 
 	mu    sync.Mutex
 	peers map[contract.ServerID]string
@@ -101,15 +123,22 @@ type TCPTransport struct {
 	activeConns     map[net.Conn]struct{}
 	activeConnsLock sync.Mutex
 
+	// rejections — отказы приёма кадров по пределам сетевого формата.
+	rejections limitRejections
+
 	shutdownCh chan struct{}
 	wg         sync.WaitGroup
 }
 
-var _ contract.Transport = (*TCPTransport)(nil)
+var (
+	_ contract.Transport               = (*TCPTransport)(nil)
+	_ contract.LimitsProvider          = (*TCPTransport)(nil)
+	_ contract.TransportTimingProvider = (*TCPTransport)(nil)
+)
 
 // TCPTimeouts задаёт тайм-ауты TCP-транспорта: установки соединения,
-// обычного RPC, передачи снимка и ожидания ответа. Нулевое значение
-// каждого поля заменяется константой (см. NewTCPTransport).
+// обычного RPC, передачи снимка и ожидания ответа. Неположительное значение
+// каждого поля заменяется константой (см. NormalizeTCPTimeouts).
 type TCPTimeouts struct {
 	// ConnectionTimeout — лимит времени установки TCP-соединения;
 	// нулевое значение заменяется константой.
@@ -125,12 +154,61 @@ type TCPTimeouts struct {
 	ResponseTimeout time.Duration
 }
 
-// NewTCPTransport создаёт новый TCPTransport, слушающий на указанном адресе.
-// Принимает адрес для прослушивания, тайм-ауты TCPTimeouts и максимальный
-// размер пула соединений (0 = _defaultMaxPool). Нулевое поле каждого
-// тайм-аута заменяется константой: 165/200/310/200 мс (установка соединения,
-// обычный RPC, снимок, ответ). Запускает acceptLoop в отдельной горутине.
+// NormalizeTCPTimeouts — единственный источник правил нормализации сроков
+// TCP-транспорта. Каждое поле <= 0 заменяется своим умолчанием:
+// GenericRPCTimeout и ResponseTimeout — contract.TCPRPCTimeout,
+// ConnectionTimeout — contract.ConnectionTCPRPCTimeout,
+// InstallSnapshotTimeout — contract.InstallSnapshotTimeout; положительные
+// значения сохраняются. Возвращает нормализованную копию и соответствующий
+// профиль сроков: BaseSend = GenericRPCTimeout, BaseRecv = ResponseTimeout,
+// Dial = ConnectionTimeout, InProcess = false. Функция чистая и идемпотентная:
+// не открывает соединений и не запускает горутин.
+func NormalizeTCPTimeouts(timeouts TCPTimeouts) (TCPTimeouts, contract.TransportTiming) {
+	normalized := timeouts
+	if normalized.ConnectionTimeout <= 0 {
+		normalized.ConnectionTimeout = contract.ConnectionTCPRPCTimeout
+	}
+	if normalized.GenericRPCTimeout <= 0 {
+		normalized.GenericRPCTimeout = contract.TCPRPCTimeout
+	}
+	if normalized.InstallSnapshotTimeout <= 0 {
+		normalized.InstallSnapshotTimeout = contract.InstallSnapshotTimeout
+	}
+	if normalized.ResponseTimeout <= 0 {
+		normalized.ResponseTimeout = contract.TCPRPCTimeout
+	}
+
+	return normalized, contract.TransportTiming{
+		BaseSend:  normalized.GenericRPCTimeout,
+		BaseRecv:  normalized.ResponseTimeout,
+		Dial:      normalized.ConnectionTimeout,
+		InProcess: false,
+	}
+}
+
+// NewTCPTransport создаёт новый TCPTransport, слушающий на указанном адресе,
+// с профилем пределов по умолчанию (protocol.DefaultLimits). Принимает адрес
+// для прослушивания, тайм-ауты TCPTimeouts и максимальный размер пула
+// соединений (0 = _defaultMaxPool). Неположительные тайм-ауты нормализуются
+// NormalizeTCPTimeouts: 165/200/310/200 мс (установка соединения, обычный
+// RPC, снимок, ответ). Запускает acceptLoop в отдельной горутине.
 func NewTCPTransport(addr string, timeouts TCPTimeouts, maxPool int) (*TCPTransport, error) {
+	return NewTCPTransportWithLimits(addr, timeouts, maxPool, protocol.DefaultLimits())
+}
+
+// NewTCPTransportWithLimits создаёт TCPTransport с заданным профилем
+// пределов сетевого формата. Целиком нулевой профиль заменяется профилем
+// по умолчанию, недопустимый или частично нулевой отвергается до открытия
+// слушателя. Остальное — как у NewTCPTransport.
+func NewTCPTransportWithLimits(
+	addr string, timeouts TCPTimeouts, maxPool int, limits contract.Limits,
+) (*TCPTransport, error) {
+	normalizedLimits, err := protocol.NormalizeLimits(limits)
+	if err != nil {
+		return nil, fmt.Errorf("raft: invalid TCP transport limits: %w", err)
+	}
+	normalized, timing := NormalizeTCPTimeouts(timeouts)
+
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("raft: failed to listen on %s: %w", addr, err)
@@ -138,35 +216,16 @@ func NewTCPTransport(addr string, timeouts TCPTimeouts, maxPool int) (*TCPTransp
 	if maxPool <= 0 {
 		maxPool = _defaultMaxPool
 	}
-	genRPCTimeout := timeouts.GenericRPCTimeout
-	// Защитная проверка: нулевой тайм-аут (например, из нулевой конфигурации
-	// или неявного нуля в литерале) заменяется дефолтом, чтобы транспорт всегда
-	// имел действующие дедлайны соединения, отправки и чтения. Это защитная
-	// проверка, а не молчаливое исправление: недокументированная возможность
-	// «0 = без дедлайнов» изымается из контракта конструктора.
-	if genRPCTimeout <= 0 {
-		genRPCTimeout = contract.TCPRPCTimeout
-	}
-	connRPCTimeout := timeouts.ConnectionTimeout
-	if connRPCTimeout <= 0 {
-		connRPCTimeout = contract.ConnectionTCPRPCTimeout
-	}
-	isTimeout := timeouts.InstallSnapshotTimeout
-	if isTimeout <= 0 {
-		isTimeout = contract.InstallSnapshotTimeout
-	}
-	respTimeout := timeouts.ResponseTimeout
-	if respTimeout <= 0 {
-		respTimeout = contract.TCPRPCTimeout
-	}
 	t := &TCPTransport{
 		consumerCh:             make(chan contract.RPC),
 		localAddr:              contract.ServerAddress(listener.Addr().String()),
 		listener:               listener,
-		connectionTimeout:      connRPCTimeout,
-		genericRPCTimeout:      genRPCTimeout,
-		installSnapshotTimeout: isTimeout,
-		responseTimeout:        respTimeout,
+		connectionTimeout:      normalized.ConnectionTimeout,
+		genericRPCTimeout:      normalized.GenericRPCTimeout,
+		installSnapshotTimeout: normalized.InstallSnapshotTimeout,
+		responseTimeout:        normalized.ResponseTimeout,
+		limits:                 normalizedLimits,
+		timing:                 timing,
 		peers:                  make(map[contract.ServerID]string),
 		connPool:               make(map[contract.ServerAddress][]*tcpConn),
 		maxPool:                maxPool,
@@ -178,10 +237,23 @@ func NewTCPTransport(addr string, timeouts TCPTimeouts, maxPool int) (*TCPTransp
 	return t, nil
 }
 
-// tcpRPCRequest — gob-структура RPC-запроса.
-type tcpRPCRequest struct {
-	Type byte
-	Args any
+// Limits возвращает действующий профиль пределов сетевого формата.
+func (t *TCPTransport) Limits() contract.Limits {
+	return t.limits
+}
+
+// TransportTiming возвращает действующие сроки транспорта — результат
+// NormalizeTCPTimeouts, вычисленный конструктором. TCP всегда сообщает
+// InProcess = false.
+func (t *TCPTransport) TransportTiming() contract.TransportTiming {
+	return t.timing
+}
+
+// LimitRejections возвращает копию счётчика отказов приёма кадров по
+// пределам сетевого формата: ключ "<параметр F/N/D/C>|<адрес соседа>",
+// значение — число отказов.
+func (t *TCPTransport) LimitRejections() map[string]uint64 {
+	return t.rejections.snapshot()
 }
 
 // Consumer возвращает небуферизированный канал входящих RPC.
@@ -207,75 +279,103 @@ func (t *TCPTransport) SetHeartbeatHandler(fn func(contract.RPC)) {
 func (t *TCPTransport) AppendEntries(
 	peerID contract.ServerID, args contract.AppendEntriesArgs,
 ) (contract.AppendEntriesReply, error) {
-	var reply contract.AppendEntriesReply
-	err := t.genericRPC(peerID, _rpcAppendEntries, &args, &reply)
-	return reply, err
+	return typedReply[contract.AppendEntriesReply](t.genericRPC(peerID, &args, rpcTypeAppendEntries))
 }
 
 // RequestVote отправляет RequestVote указанному узлу через пул соединений.
 func (t *TCPTransport) RequestVote(
 	peerID contract.ServerID, args contract.RequestVoteArgs,
 ) (contract.RequestVoteReply, error) {
-	var reply contract.RequestVoteReply
-	err := t.genericRPC(peerID, _rpcRequestVote, &args, &reply)
-	return reply, err
+	return typedReply[contract.RequestVoteReply](t.genericRPC(peerID, &args, rpcTypeRequestVote))
 }
 
 // RequestPreVote отправляет PreVote RPC узлу peerID через пул соединений.
 func (t *TCPTransport) RequestPreVote(
 	peerID contract.ServerID, args contract.RequestPreVoteArgs,
 ) (contract.RequestPreVoteReply, error) {
-	var reply contract.RequestPreVoteReply
-	err := t.genericRPC(peerID, _rpcRequestPreVote, &args, &reply)
-	return reply, err
+	return typedReply[contract.RequestPreVoteReply](t.genericRPC(peerID, &args, rpcTypeRequestPreVote))
 }
 
 // TimeoutNow отправляет TimeoutNowRequest указанному узлу через пул соединений.
 func (t *TCPTransport) TimeoutNow(
 	peerID contract.ServerID, args contract.TimeoutNowRequest,
 ) (contract.TimeoutNowResponse, error) {
-	var reply contract.TimeoutNowResponse
-	err := t.genericRPC(peerID, _rpcTimeoutNow, &args, &reply)
-	return reply, err
+	return typedReply[contract.TimeoutNowResponse](t.genericRPC(peerID, &args, rpcTypeTimeoutNow))
 }
 
-// InstallSnapshot отправляет snapshot узлу peerID. Соединение НЕ возвращается в пул.
+// typedReply разыменовывает ответ ожидаемого типа. Кодек гарантирует тип
+// ответа по ожидаемому RPCType; несовпадение — ошибка формата, не паника.
+func typedReply[T any](reply any, err error) (T, error) {
+	var zero T
+	if err != nil {
+		return zero, err
+	}
+	typed, ok := reply.(*T)
+	if !ok || typed == nil {
+		return zero, fmt.Errorf("raft: %w: unexpected reply %T", protocol.ErrFormat, reply)
+	}
+	return *typed, nil
+}
+
+// InstallSnapshot отправляет снимок узлу peerID: управляющий кадр, затем
+// ровно DataSize байт из data, затем читает ответ. Источник короче DataSize —
+// ошибка; байты источника сверх DataSize не читаются и остаются у владельца
+// data. Соединение снимка закрывается при любом исходе и в пул не
+// возвращается; переданный data транспорт не закрывает.
 //
 //nolint:gocritic
 func (t *TCPTransport) InstallSnapshot(
 	peerID contract.ServerID, args contract.InstallSnapshotRequest, data io.Reader,
 ) (contract.InstallSnapshotResponse, error) {
-	var reply contract.InstallSnapshotResponse
+	var zero contract.InstallSnapshotResponse
+	if data == nil {
+		return zero, errors.New("raft: InstallSnapshot: nil snapshot data reader")
+	}
+	// Управляющий кадр кодируется и проверяется до изъятия соединения:
+	// ошибка кодирования (включая DataSize вне диапазона) не открывает поток.
+	frame, err := protocol.AppendRequest(nil, &args, t.limits)
+	if err != nil {
+		return zero, fmt.Errorf("raft: encode InstallSnapshot request: %w", err)
+	}
+	timeout, err := scaleTimeout("InstallSnapshot send", t.installSnapshotTimeout, snapshotFactor(args.DataSize))
+	if err != nil {
+		return zero, err
+	}
 	target, err := t.lookupPeer(peerID)
 	if err != nil {
-		return reply, err
+		return zero, err
 	}
 	conn, err := t.getConn(target)
 	if err != nil {
-		return reply, err
+		return zero, err
 	}
-	defer func() { _ = conn.Release() }()
+	defer t.discardConn(conn)
 
-	timeout := t.installSnapshotTimeout * time.Duration(args.DataSize/int64(_connSendBufferSize))
-	if timeout < t.installSnapshotTimeout {
-		timeout = t.installSnapshotTimeout
+	if err = conn.conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		return zero, fmt.Errorf("raft: InstallSnapshot set deadline: %w", err)
 	}
-	_ = conn.conn.SetDeadline(time.Now().Add(timeout))
-
-	if err := t.sendRPC(conn, _rpcInstallSnapshot, &args); err != nil {
-		return reply, err
+	if err = protocol.WriteFrame(conn.w, frame); err != nil {
+		return zero, fmt.Errorf("raft: send InstallSnapshot request: %w", err)
 	}
-
-	if _, err := io.Copy(conn.w, data); err != nil {
-		return reply, err
+	n, err := io.CopyN(conn.w, data, args.DataSize)
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return zero, fmt.Errorf("raft: snapshot source ended after %d of %d bytes: %w",
+				n, args.DataSize, io.ErrUnexpectedEOF)
+		}
+		return zero, fmt.Errorf("raft: send snapshot data (%d of %d bytes): %w", n, args.DataSize, err)
 	}
-
-	if err := conn.w.Flush(); err != nil {
-		return reply, err
+	if err = conn.w.Flush(); err != nil {
+		return zero, fmt.Errorf("raft: flush InstallSnapshot: %w", err)
 	}
-
-	_, err = t.decodeResponse(conn, &reply)
-	return reply, err
+	resp, err := protocol.ReadResponseWithHeader(conn.conn, rpcTypeInstallSnapshot, t.limits, nil)
+	if err != nil {
+		return zero, fmt.Errorf("raft: read InstallSnapshot response: %w", err)
+	}
+	if resp.Error != nil {
+		return zero, remoteError(resp.Error)
+	}
+	return typedReply[contract.InstallSnapshotResponse](resp.Reply, nil)
 }
 
 // AppendEntriesPipeline не реализован.
@@ -313,6 +413,8 @@ func (t *TCPTransport) DisconnectAll() {
 // Close завершает работу транспорта: закрывает shutdownCh, слушатель,
 // удаляет всех соседей, закрывает все соединения в пуле и активные входящие
 // соединения, дожидается завершения горутин через wg.Wait(). Идемпотентен.
+// Исходящий обмен, уже изъявший соединение из пула, завершается по своему
+// сроку.
 func (t *TCPTransport) Close() {
 	select {
 	case <-t.shutdownCh:
@@ -360,25 +462,79 @@ func (t *TCPTransport) closeActiveConns() {
 	}
 }
 
-// genericRPC отправляет RPC любого типа, используя пул соединений.
-func (t *TCPTransport) genericRPC(peerID contract.ServerID, rpcType byte, args, reply any) error {
+// genericRPC выполняет один обычный обмен запрос–ответ. Запрос полностью
+// кодируется и проверяется до изъятия соединения: ошибка кодирования не
+// открывает поток и не оставляет в нём частичного кадра. Срок обмена —
+// один абсолютный предел на отправку и ответ: genericRPCTimeout, умноженный
+// на max(1, ⌈BodyLength/256 КиБ⌉) готового кадра. Соединение возвращается
+// в пул только после полностью прочитанного ответа кода 0 или 4; ошибки
+// ввода-вывода, формата и срока, а также коды 1–3 закрывают соединение.
+// Владелец соединения — эта функция: изъятие и возврат либо закрытие
+// выполняются здесь однократно.
+func (t *TCPTransport) genericRPC(peerID contract.ServerID, command any, typ protocol.RPCType) (any, error) {
+	frame, err := protocol.AppendRequest(nil, command, t.limits)
+	if err != nil {
+		return nil, fmt.Errorf("raft: encode %s request: %w", rpcTypeName(typ), err)
+	}
+	window, err := scaleTimeout(rpcTypeName(typ)+" send", t.genericRPCTimeout,
+		bodyFactor(uint64(len(frame)-_frameHeaderBytes)))
+	if err != nil {
+		return nil, err
+	}
 	target, err := t.lookupPeer(peerID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	conn, err := t.getConn(target)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	_ = conn.conn.SetDeadline(time.Now().Add(t.genericRPCTimeout))
-	if err := t.sendRPC(conn, rpcType, args); err != nil {
-		return err
+
+	if err = conn.conn.SetDeadline(time.Now().Add(window)); err != nil {
+		t.discardConn(conn)
+		return nil, fmt.Errorf("raft: %s set deadline: %w", rpcTypeName(typ), err)
 	}
-	canReturn, err := t.decodeResponse(conn, reply)
-	if canReturn {
-		t.returnConn(conn)
+	if err = protocol.WriteFrame(conn.w, frame); err != nil {
+		t.discardConn(conn)
+		return nil, fmt.Errorf("raft: send %s request: %w", rpcTypeName(typ), err)
 	}
-	return err
+	if err = conn.w.Flush(); err != nil {
+		t.discardConn(conn)
+		return nil, fmt.Errorf("raft: flush %s request: %w", rpcTypeName(typ), err)
+	}
+	resp, err := protocol.ReadResponseWithHeader(conn.conn, typ, t.limits, nil)
+	if err != nil {
+		t.discardConn(conn)
+		return nil, fmt.Errorf("raft: read %s response: %w", rpcTypeName(typ), err)
+	}
+	if resp.Error != nil {
+		if closesConnection(resp.Error) {
+			t.discardConn(conn)
+		} else {
+			t.returnConn(conn)
+		}
+		return nil, remoteError(resp.Error)
+	}
+	t.returnConn(conn)
+	return resp.Reply, nil
+}
+
+// closesConnection сообщает, требует ли удалённая ошибка закрытия
+// соединения: коды 1–3 (остановка, истечение окна получателя, несовместимая
+// версия) — закрытие, код 4 — соединение живо.
+func closesConnection(remote error) bool {
+	return errors.Is(remote, contract.ErrRaftShutdown) ||
+		errors.Is(remote, contract.ErrEnqueueTimeout) ||
+		errors.Is(remote, contract.ErrUnsupportedProtocol)
+}
+
+// remoteError возвращает удалённую ошибку вызывающему: маркеры кодов 1–3 —
+// сами значения contract, код 4 — ошибка с текстом удалённой стороны.
+func remoteError(remote error) error {
+	if closesConnection(remote) {
+		return remote
+	}
+	return fmt.Errorf("raft: RPC error from peer: %w", remote)
 }
 
 // lookupPeer возвращает адрес соседа по его ID.
@@ -401,13 +557,10 @@ func (t *TCPTransport) getConn(target contract.ServerAddress) (*tcpConn, error) 
 	if err != nil {
 		return nil, err
 	}
-	w := bufio.NewWriterSize(c, _connSendBufferSize)
 	return &tcpConn{
 		target: target,
 		conn:   c,
-		w:      w,
-		dec:    gob.NewDecoder(c),
-		enc:    gob.NewEncoder(w),
+		w:      bufio.NewWriterSize(c, _connSendBufferSize),
 	}, nil
 }
 
@@ -444,44 +597,12 @@ func (t *TCPTransport) returnConn(conn *tcpConn) {
 	}
 }
 
-// sendRPC кодирует и отправляет RPC-запрос через соединение.
-func (t *TCPTransport) sendRPC(conn *tcpConn, rpcType byte, args any) error {
-	req := tcpRPCRequest{Type: rpcType, Args: args}
-	if err := conn.enc.Encode(req); err != nil {
-		_ = conn.Release()
-		return fmt.Errorf("raft: failed to send RPC: %w", err)
+// discardConn закрывает исходящее соединение без возврата в пул. Ошибка
+// закрытия не заменяет первичную ошибку обмена и записывается в журнал.
+func (t *TCPTransport) discardConn(conn *tcpConn) {
+	if err := conn.Release(); err != nil && !errors.Is(err, net.ErrClosed) {
+		log.Printf("raft: close connection to %s: %v", conn.target, err)
 	}
-	if err := conn.w.Flush(); err != nil {
-		_ = conn.Release()
-		return fmt.Errorf("raft: failed to flush RPC: %w", err)
-	}
-	return nil
-}
-
-// decodeResponse декодирует ответ из соединения. Возвращает canReturn=true,
-// если соединение можно вернуть в пул. При ошибке декодирования вызывает
-// conn.Release() и возвращает canReturn=false.
-func (t *TCPTransport) decodeResponse(conn *tcpConn, reply any) (bool, error) {
-	var rpcError string
-	if err := conn.dec.Decode(&rpcError); err != nil {
-		_ = conn.Release()
-		return false, fmt.Errorf("raft: failed to decode error: %w", err)
-	}
-	if err := conn.dec.Decode(reply); err != nil {
-		_ = conn.Release()
-		return false, fmt.Errorf("raft: failed to decode response: %w", err)
-	}
-	if rpcError != "" {
-		switch rpcError {
-		case contract.ErrRaftShutdown.Error():
-			return true, contract.ErrRaftShutdown
-		case contract.ErrEnqueueTimeout.Error():
-			return true, contract.ErrEnqueueTimeout
-		default:
-			return true, fmt.Errorf("raft: RPC error from peer: %s", rpcError)
-		}
-	}
-	return true, nil
 }
 
 // removeConnPoolForTarget удаляет и закрывает все соединения к указанному адресу.
@@ -530,18 +651,23 @@ func (t *TCPTransport) untrackConn(conn net.Conn) {
 	delete(t.activeConns, conn)
 }
 
-// handleConn обрабатывает входящее соединение в цикле, пока не возникнет
-// ошибка или соединение не будет закрыто. Переиспользует одно TCP-соединение
-// для множества RPC.
+// handleConn обслуживает входящее соединение: последовательность обменов
+// запрос–ответ, пока обмен разрешает продолжение. Единственный
+// bufio.Reader соединения создаётся здесь и передаётся кодеку, а для
+// снимка — обработчику через ограничивающий Reader. Любая ошибка кадра,
+// ввода-вывода или срока, коды ответа 1–3 и снимок завершают соединение
+// без попытки синхронизации потока.
 func (t *TCPTransport) handleConn(conn net.Conn) {
 	defer t.wg.Done()
 	defer t.untrackConn(conn)
-	defer func() { _ = conn.Close() }()
+	defer func() {
+		if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			log.Printf("raft: close incoming connection from %s: %v", conn.RemoteAddr(), err)
+		}
+	}()
 
 	r := bufio.NewReaderSize(conn, _connReceiveBufferSize)
 	w := bufio.NewWriter(conn)
-	dec := gob.NewDecoder(r)
-	enc := gob.NewEncoder(w)
 
 	for {
 		select {
@@ -550,155 +676,285 @@ func (t *TCPTransport) handleConn(conn net.Conn) {
 		default:
 		}
 
-		if err := t.handleCommand(r, conn, dec, enc); err != nil {
-			if errors.Is(err, errSnapshotStreamStale) {
-				// Маркер ErrEnqueueTimeout уже закодирован в w; Flush
-				// доставляет его клиенту (best effort — при неудачном
-				// Flush клиент получит обрыв соединения, оба исхода без
-				// гонки). Поток соединения невыровнен: потребитель мог
-				// не дочитать данные снимка из общего bufio.Reader,
-				// единственное безопасное действие — закрытие соединения.
-				_ = w.Flush()
-				log.Printf("raft: closing connection: snapshot response window expired with unread snapshot data")
-				return
+		keepAlive, err := t.serveRequest(conn, r, w)
+		if err != nil {
+			if parameter := t.rejections.record(remoteHost(conn.RemoteAddr()), err); parameter != "" {
+				// Диагностика отказа по пределу без содержимого Data: адрес
+				// соседа достоверен до разбора кадра, идентификатор узла и
+				// индекс записи до декодирования недоступны.
+				log.Printf("raft: limit rejection: direction=recv peer=%s parameter=%s: %v",
+					conn.RemoteAddr(), parameter, err)
 			}
-			if err != io.EOF {
-				log.Printf("raft: handle conn error: %v", err)
+			if !quietConnError(err) {
+				log.Printf("raft: closing connection from %s: %v", conn.RemoteAddr(), err)
 			}
 			return
 		}
-		if err := w.Flush(); err != nil {
-			log.Printf("raft: flush error: %v", err)
+		if !keepAlive {
 			return
 		}
 	}
 }
 
-// errSnapshotStreamStale — внутренний маркер истечения окна ожидания ответа
-// для RPC со снимком при незакрытом rpc.Reader. После истечения окна поток
-// соединения невыровнен: потребитель мог не дочитать данные снимка из общего
-// bufio.Reader, поэтому продолжение декодирования из того же буфера недопустимо.
-// handleConn распознаёт маркер, выполняет Flush (доставка ответа-ошибки) и
-// закрывает соединение.
-var errSnapshotStreamStale = errors.New("snapshot response window expired with unread snapshot data")
+// quietConnError сообщает, что ошибка соответствует штатному завершению
+// соединения и не требует диагностики: конец потока между кадрами,
+// закрытое соединение или остановка транспорта.
+func quietConnError(err error) bool {
+	return errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, contract.ErrRaftShutdown)
+}
 
-// handleCommand декодирует и отправляет один RPC-запрос из входящего потока.
-// Возвращает ошибку, если декодирование не удалось — вызывающий закрывает соединение.
-// r — bufio.Reader, из которого был создан dec.
-// conn — TCP-соединение, используется для чтения данных снимка напрямую
-// (минуя bufio), чтобы избежать повреждения внутреннего состояния bufio
-// после ошибок gob-декодирования.
-func (t *TCPTransport) handleCommand(r *bufio.Reader, _ net.Conn, dec *gob.Decoder, enc *gob.Encoder) error {
-	var req tcpRPCRequest
-	if err := dec.Decode(&req); err != nil {
-		return err
+// serveRequest обслуживает один входящий обмен. Ожидание первого байта
+// кадра идёт без срока (прежний idle между кадрами). После появления
+// первого байта заголовок читается до t_first+responseTimeout; проверенный
+// заголовок задаёт одно абсолютное окно D_body = t_header +
+// responseTimeout × max(1, ⌈BodyLength/256 КиБ⌉) на тело, очередь
+// потребителя, ответ обработчика и Flush. Ни поступление байтов, ни переход
+// к следующему этапу окно не продлевают. Ошибка заголовка или хука
+// прекращает обмен без чтения тела и без dispatch. Возвращает признак
+// продолжения соединения.
+func (t *TCPTransport) serveRequest(conn net.Conn, r *bufio.Reader, w *bufio.Writer) (bool, error) {
+	if _, err := r.Peek(1); err != nil {
+		return false, err
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(t.responseTimeout)); err != nil {
+		return false, fmt.Errorf("raft: set header deadline: %w", err)
 	}
 
+	var bodyDeadline time.Time
+	beforeBody := func(header protocol.FrameHeader) error {
+		window, err := scaleTimeout(rpcTypeName(header.Type)+" receive", t.responseTimeout,
+			bodyFactor(header.BodyLength))
+		if err != nil {
+			return err
+		}
+		bodyDeadline = time.Now().Add(window)
+		if err = conn.SetReadDeadline(bodyDeadline); err != nil {
+			return err
+		}
+		return conn.SetWriteDeadline(bodyDeadline)
+	}
+
+	typ, command, err := protocol.ReadRequestWithHeader(r, t.limits, beforeBody)
+	if err != nil {
+		if command == nil && errors.Is(err, contract.ErrUnsupportedProtocol) {
+			// Заголовок и длина тела проверены, несовместима только версия
+			// протокола: код 3 до dispatch, затем закрытие соединения.
+			t.writeResponseBestEffort(w, typ, contract.RPCResponse{Error: contract.ErrUnsupportedProtocol})
+		}
+		return false, fmt.Errorf("raft: read request: %w", err)
+	}
+
+	if typ == rpcTypeInstallSnapshot {
+		return false, t.serveSnapshot(conn, r, w, command)
+	}
+	return t.serveRegular(conn, w, typ, command, bodyDeadline)
+}
+
+// serveRegular передаёт обычный запрос потребителю и отвечает. Очередь
+// потребителя, ожидание ответа и запись ответа ограничены тем же D_body.
+func (t *TCPTransport) serveRegular(
+	conn net.Conn, w *bufio.Writer, typ protocol.RPCType, command any, bodyDeadline time.Time,
+) (bool, error) {
 	respCh := make(chan contract.RPCResponse, 1)
+	rpc := contract.RPC{Command: command, RespChan: respCh}
 
-	cmd := req.Args
-	switch v := cmd.(type) {
-	case contract.AppendEntriesArgs:
-		cmd = &v
-	case contract.RequestVoteArgs:
-		cmd = &v
-	case contract.TimeoutNowRequest:
-		cmd = &v
-	case contract.RequestPreVoteArgs:
-		cmd = &v
-	case contract.InstallSnapshotRequest:
-		cmd = &v
-	}
-
-	// Данные снимка не входят в gob-команду — они идут следом в том же потоке.
-	// Поэтому для InstallSnapshot потребитель получает отдельный io.Reader
-	// поверх r, ограниченный DataSize.
-	snapReq, isSnapReq := cmd.(*contract.InstallSnapshotRequest)
-	hasSnapshotData := isSnapReq && snapReq.DataSize > 0
-	var snapReader io.ReadCloser
-	if hasSnapshotData {
-		snapReader = io.NopCloser(io.LimitReader(r, snapReq.DataSize))
-	}
-
-	// Heartbeat fast-path: если это heartbeat и установлен обработчик,
-	// вызываем его напрямую, минуя consumerCh.
-	if req.Type == _rpcAppendEntries {
-		if args, ok := cmd.(*contract.AppendEntriesArgs); ok {
-			if args.Term != 0 && args.LeaderCommit == 0 && len(args.Entries) == 0 {
-				t.heartbeatFnLock.Lock()
-				fn := t.heartbeatFn
-				t.heartbeatFnLock.Unlock()
-				if fn != nil {
-					fn(contract.RPC{Command: cmd, RespChan: respCh})
-					goto RESP
-				}
-			}
+	if !t.dispatchHeartbeat(typ, rpc) {
+		if err := t.dispatch(rpc, bodyDeadline); err != nil {
+			t.expireBestEffort(w, typ, err)
+			return false, fmt.Errorf("raft: dispatch %s: %w", rpcTypeName(typ), err)
 		}
 	}
+	resp, err := t.awaitResponse(respCh, bodyDeadline)
+	if err != nil {
+		t.expireBestEffort(w, typ, err)
+		return false, fmt.Errorf("raft: await %s response: %w", rpcTypeName(typ), err)
+	}
+	if err = t.writeResponse(w, typ, resp); err != nil {
+		return false, err
+	}
+	if resp.Error != nil && closesConnection(resp.Error) {
+		// Коды 1–3: получатель закрывает соединение после записи ответа.
+		return false, nil
+	}
+	// Срок очищается только для ожидания следующего кадра.
+	if err = conn.SetDeadline(time.Time{}); err != nil {
+		return false, fmt.Errorf("raft: clear deadline: %w", err)
+	}
+	return true, nil
+}
 
+// dispatchHeartbeat вызывает установленный внешним кодом обработчик пульса
+// для пустого AppendEntries после полного разбора кадра. Возвращает true,
+// если запрос передан обработчику пульса.
+func (t *TCPTransport) dispatchHeartbeat(typ protocol.RPCType, rpc contract.RPC) bool {
+	if typ != rpcTypeAppendEntries {
+		return false
+	}
+	args, ok := rpc.Command.(*contract.AppendEntriesArgs)
+	if !ok || args.Term == 0 || args.LeaderCommit != 0 || len(args.Entries) != 0 {
+		return false
+	}
+	t.heartbeatFnLock.Lock()
+	fn := t.heartbeatFn
+	t.heartbeatFnLock.Unlock()
+	if fn == nil {
+		return false
+	}
+	fn(rpc)
+	return true
+}
+
+// serveSnapshot обслуживает InstallSnapshot после полного валидного
+// управляющего кадра. Отдельное окно потока снимка начинается здесь:
+// max(responseTimeout, installSnapshotTimeout) × max(1, ⌊DataSize/256 КиБ⌋)
+// и не продлевается очередью, чтением тела, ожиданием ответа и записью.
+// Тело читается обработчиком из того же bufio.Reader через ограничивающий
+// Reader ровно DataSize байт; до получения ответа транспорт этот Reader не
+// читает. Соединение снимка закрывается при любом исходе.
+func (t *TCPTransport) serveSnapshot(conn net.Conn, r *bufio.Reader, w *bufio.Writer, command any) error {
+	req, ok := command.(*contract.InstallSnapshotRequest)
+	if !ok || req == nil {
+		return fmt.Errorf("raft: %w: InstallSnapshot command %T", protocol.ErrFormat, command)
+	}
+	base := max(t.responseTimeout, t.installSnapshotTimeout)
+	window, err := scaleTimeout("InstallSnapshot receive", base, snapshotFactor(req.DataSize))
+	if err != nil {
+		return err
+	}
+	streamDeadline := time.Now().Add(window)
+	if err = conn.SetDeadline(streamDeadline); err != nil {
+		return fmt.Errorf("raft: set snapshot stream deadline: %w", err)
+	}
+
+	body := &io.LimitedReader{R: r, N: req.DataSize}
+	respCh := make(chan contract.RPCResponse, 1)
+	rpc := contract.RPC{Command: req, Reader: body, RespChan: respCh}
+	if err = t.dispatch(rpc, streamDeadline); err != nil {
+		t.expireBestEffort(w, rpcTypeInstallSnapshot, err)
+		return fmt.Errorf("raft: dispatch InstallSnapshot: %w", err)
+	}
+	resp, err := t.awaitResponse(respCh, streamDeadline)
+	if err != nil {
+		// Обработчик мог ещё читать тело: транспорт не читает общий
+		// Reader и не проверяет его счётчики, а только закрывает
+		// соединение, что разблокирует сетевое чтение обработчика.
+		t.expireBestEffort(w, rpcTypeInstallSnapshot, err)
+		return fmt.Errorf("raft: await InstallSnapshot response: %w", err)
+	}
+	// Ответ получен: владение ограничивающим Reader вернулось транспорту.
+	if body.N > 0 {
+		unread := fmt.Errorf("%w: %d of %d bytes unread", errSnapshotBodyUnread, body.N, req.DataSize)
+		if resp.Error == nil {
+			resp = contract.RPCResponse{Error: unread}
+		}
+		log.Printf("raft: InstallSnapshot from %s: %v", conn.RemoteAddr(), unread)
+	}
+	return t.writeResponse(w, rpcTypeInstallSnapshot, resp)
+}
+
+// dispatch передаёт RPC потребителю не позже deadline. Истечение срока —
+// contract.ErrEnqueueTimeout, остановка транспорта — contract.ErrRaftShutdown.
+// Уже истёкшая граница отвергается до постановки: готовый потребитель не
+// получает запрос, разобранный после окончания окна.
+func (t *TCPTransport) dispatch(rpc contract.RPC, deadline time.Time) error {
+	if !time.Now().Before(deadline) {
+		return contract.ErrEnqueueTimeout
+	}
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
 	select {
-	case t.consumerCh <- contract.RPC{Command: cmd, Reader: snapReader, RespChan: respCh}:
+	case t.consumerCh <- rpc:
+		return nil
 	case <-t.shutdownCh:
 		return contract.ErrRaftShutdown
+	case <-timer.C:
+		return contract.ErrEnqueueTimeout
 	}
+}
 
-RESP:
-	var respErr string
-	var respReply any
-	respTimeout := t.responseTimeout
-	if hasSnapshotData {
-		respTimeout = t.snapshotResponseTimeout(snapReq.DataSize)
+// awaitResponse ждёт единственный ответ обработчика не позже deadline.
+// Истёкшая к началу ожидания или к моменту приёма ответа граница —
+// contract.ErrEnqueueTimeout. RespChan имеет ёмкость 1, поэтому поздний
+// ответ обработчика не блокирует его и не достаётся другому обмену.
+func (t *TCPTransport) awaitResponse(respCh <-chan contract.RPCResponse, deadline time.Time) (contract.RPCResponse, error) {
+	if !time.Now().Before(deadline) {
+		return contract.RPCResponse{}, contract.ErrEnqueueTimeout
 	}
-	stale := false
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
 	select {
 	case resp := <-respCh:
-		if resp.Error != nil {
-			respErr = resp.Error.Error()
+		// Ответ, принятый после границы, — истечение окна: новое окно ради
+		// записи ответа не открывается.
+		if !time.Now().Before(deadline) {
+			return contract.RPCResponse{}, contract.ErrEnqueueTimeout
 		}
-		respReply = resp.Reply
+		return resp, nil
 	case <-t.shutdownCh:
-		return contract.ErrRaftShutdown
-	case <-time.After(respTimeout):
-		respErr = contract.ErrEnqueueTimeout.Error()
-		if hasSnapshotData {
-			// Поток соединения невыровнен: потребитель мог не дочитать
-			// данные снимка из общего bufio.Reader. Ответ-маркер
-			// кодируется ниже, затем возвращается сентинел, по которому
-			// handleConn выполнит Flush и закроет соединение — продолжение
-			// декодирования из того же буфера исключено.
-			stale = true
-		}
+		return contract.RPCResponse{}, contract.ErrRaftShutdown
+	case <-timer.C:
+		return contract.RPCResponse{}, contract.ErrEnqueueTimeout
 	}
+}
 
-	if err := enc.Encode(respErr); err != nil {
-		return err
+// writeResponse кодирует ответ полностью до записи и отправляет его с Flush.
+// Локальная ошибка кодирования (например, ответ без Reply и Error или с
+// несовместимой версией) не пишет кадр: соединение закрывается.
+func (t *TCPTransport) writeResponse(w *bufio.Writer, typ protocol.RPCType, resp contract.RPCResponse) error {
+	frame, err := protocol.AppendResponse(nil, typ, resp, t.limits)
+	if err != nil {
+		return fmt.Errorf("raft: encode %s response: %w", rpcTypeName(typ), err)
 	}
-	if respReply == nil {
-		respReply = &contract.AppendEntriesReply{}
+	if err = protocol.WriteFrame(w, frame); err != nil {
+		return fmt.Errorf("raft: write %s response: %w", rpcTypeName(typ), err)
 	}
-	if err := enc.Encode(respReply); err != nil {
-		return err
-	}
-	if stale {
-		return errSnapshotStreamStale
+	if err = w.Flush(); err != nil {
+		return fmt.Errorf("raft: flush %s response: %w", rpcTypeName(typ), err)
 	}
 	return nil
 }
 
-// snapshotResponseTimeout возвращает окно ожидания ответа для RPC со снимком:
-// max(responseTimeout, installSnapshotTimeout) × ⌊DataSize/256 КиБ⌋, но не
-// меньше самой max-базы — зеркально отправителю, который клэмпит вниз до
-// своей базы installSnapshotTimeout. Малые снимки (< 256 КиБ) держат окно
-// получателя на уровне базы отправителя, поэтому флаг управляет обеими
-// сторонами передачи снимка.
-func (t *TCPTransport) snapshotResponseTimeout(dataSize int64) time.Duration {
-	base := t.responseTimeout
-	if t.installSnapshotTimeout > base {
-		base = t.installSnapshotTimeout
+// writeResponseBestEffort пишет ответ перед закрытием соединения; ошибка
+// записи не меняет исхода — соединение закрывается в любом случае.
+func (t *TCPTransport) writeResponseBestEffort(w *bufio.Writer, typ protocol.RPCType, resp contract.RPCResponse) {
+	_ = t.writeResponse(w, typ, resp)
+}
+
+// expireBestEffort пишет код 2 при истечении окна получателя. Окно для
+// записи не продлевается: при истёкшем сроке сокета запись завершится
+// ошибкой, и отправитель получит обрыв соединения.
+func (t *TCPTransport) expireBestEffort(w *bufio.Writer, typ protocol.RPCType, cause error) {
+	if errors.Is(cause, contract.ErrEnqueueTimeout) {
+		t.writeResponseBestEffort(w, typ, contract.RPCResponse{Error: contract.ErrEnqueueTimeout})
 	}
-	timeout := base * time.Duration(dataSize/int64(_connSendBufferSize))
-	if timeout < base {
-		timeout = base
+}
+
+// bodyFactor — max(1, ⌈bodyLength/256 КиБ⌉) для срока обычного RPC.
+func bodyFactor(bodyLength uint64) uint64 {
+	factor := bodyLength / _timeoutStepBytes
+	if bodyLength%_timeoutStepBytes != 0 {
+		factor++
 	}
-	return timeout
+	return max(factor, 1)
+}
+
+// snapshotFactor — max(1, ⌊DataSize/256 КиБ⌋) для срока тела снимка.
+func snapshotFactor(dataSize int64) uint64 {
+	if dataSize <= 0 {
+		return 1
+	}
+	return max(uint64(dataSize)/_timeoutStepBytes, 1)
+}
+
+// scaleTimeout умножает положительный base на factor с проверкой
+// переполнения до умножения: непредставимый срок — ошибка, а не
+// отрицательная или насыщенная длительность.
+func scaleTimeout(name string, base time.Duration, factor uint64) (time.Duration, error) {
+	if base <= 0 {
+		return 0, fmt.Errorf("raft: %s timeout base %v must be positive", name, base)
+	}
+	if factor > uint64(math.MaxInt64/base) {
+		return 0, fmt.Errorf("raft: %s timeout %v x factor %d overflows time.Duration", name, base, factor)
+	}
+	return base * time.Duration(factor), nil
 }

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/vskurikhin/raft/internal/tracelog"
+	"github.com/vskurikhin/raft/pkg/raft/contract"
 )
 
 // ConsensusModule (CM) реализует единый узел консенсуса Raft.
@@ -57,7 +58,7 @@ type ConsensusModule struct {
 	checkQuorumTimeout time.Duration
 
 	// Временные параметры узла. Записываются один раз до close(ready)
-	// (конструктор — умолчания, setTimerConfig — конфигурация), все записи
+	// (конструктор — умолчания либо переданная конфигурация), все записи
 	// и чтения — под cm.mu; чтение нормализует нулевое или отрицательное
 	// значение в соответствующее умолчание Default*.
 	applyBatchInterval time.Duration // интервал батча применения к FSM
@@ -175,6 +176,11 @@ type ConsensusModule struct {
 	stopOnce sync.Once
 
 	transport Transport
+
+	// limits — нормализованный профиль пределов сетевого формата, равный
+	// профилю транспорта. Записывается конструктором до первого goSpawn и
+	// далее не изменяется; читается без блокировки.
+	limits contract.Limits
 
 	// trailingLogs — количество записей журнала, сохраняемых после
 	// последнего снимка.
@@ -474,22 +480,23 @@ func (cm *ConsensusModule) goSpawn(fn func()) {
 // Вызывается из конструктора до первого goSpawn — горутины ещё не запущены,
 // поэтому блокировка cm.mu не требуется.
 func (cm *ConsensusModule) initTimerDefaults() {
-	cm.applyBatchInterval = DefaultApplyBatchInterval
-	cm.heartbeatTimeout = DefaultHeartbeatTimeout
-	cm.reelectionTimeout = DefaultReelectionTimeout
-	cm.tickerTimeout = DefaultTickerTimeout
-	cm.verifyRedispatchMinInterval = DefaultHeartbeatTimeout * 8 / 11
+	cm.applyTimerConfig(defaultTimerConfig())
 }
 
-// setTimerConfig устанавливает временные параметры узла. Вызывается только
-// до закрытия канала готовности (close(ready)).
-// Требования:
-// - Вызывающий код должен передать нормализованные значения > 0.
-// - Метод принимает значения без изменений и пересчитывает зависимую величину.
-// Метод автоматически захватывает блокировку cm.mu и снимает её через defer.
-func (cm *ConsensusModule) setTimerConfig(tc TimerConfig) {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
+// defaultTimerConfig возвращает временные параметры по умолчанию.
+func defaultTimerConfig() TimerConfig {
+	return TimerConfig{
+		ApplyBatch: DefaultApplyBatchInterval,
+		Heartbeat:  DefaultHeartbeatTimeout,
+		Reelection: DefaultReelectionTimeout,
+		Ticker:     DefaultTickerTimeout,
+	}
+}
+
+// applyTimerConfig записывает временные параметры и пересчитывает зависимую
+// величину verify-перерассылки от пульса. Вызывается конструктором до первого
+// goSpawn — горутины ещё не запущены, блокировка cm.mu не требуется.
+func (cm *ConsensusModule) applyTimerConfig(tc TimerConfig) {
 	cm.applyBatchInterval = tc.ApplyBatch
 	cm.heartbeatTimeout = tc.Heartbeat
 	cm.reelectionTimeout = tc.Reelection

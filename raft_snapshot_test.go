@@ -645,7 +645,7 @@ func TestCompactLog_Basic(t *testing.T) {
 func TestCompactLog_All(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
-	cm := &ConsensusModule{}
+	cm := &ConsensusModule{limits: testLimits}
 	cm.shutdownCh = make(chan struct{})
 	cm.cmState.log = []LogEntry{
 		{Index: 1, Term: 1},
@@ -662,7 +662,7 @@ func TestCompactLog_All(t *testing.T) {
 func TestCompactLog_Nothing(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
-	cm := &ConsensusModule{}
+	cm := &ConsensusModule{limits: testLimits}
 	cm.shutdownCh = make(chan struct{})
 	cm.cmState.log = []LogEntry{
 		{Index: 5, Term: 1},
@@ -682,7 +682,7 @@ func TestCompactLog_Nothing(t *testing.T) {
 func TestCompactLog_Empty(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
-	cm := &ConsensusModule{}
+	cm := &ConsensusModule{limits: testLimits}
 	cm.shutdownCh = make(chan struct{})
 	cm.compactLogsLocked(5)
 	if len(cm.cmState.log) != 0 {
@@ -692,7 +692,7 @@ func TestCompactLog_Empty(t *testing.T) {
 
 // TestLogPosition_Exact проверяет точное совпадение индекса.
 func TestLogPosition_Exact(t *testing.T) {
-	cm := &ConsensusModule{}
+	cm := &ConsensusModule{limits: testLimits}
 	cm.cmState.log = []LogEntry{
 		{Index: 5, Term: 1},
 		{Index: 10, Term: 1},
@@ -717,7 +717,7 @@ func TestLogPosition_Exact(t *testing.T) {
 
 // TestLogPosition_NotFound проверяет поиск отсутствующего индекса.
 func TestLogPosition_NotFound(t *testing.T) {
-	cm := &ConsensusModule{}
+	cm := &ConsensusModule{limits: testLimits}
 	cm.cmState.log = []LogEntry{
 		{Index: 5, Term: 1},
 		{Index: 10, Term: 1},
@@ -743,7 +743,7 @@ func TestLogPosition_NotFound(t *testing.T) {
 // TestLogPosition_AfterCompact проверяет, что logPositionLocked работает
 // после сжатия.
 func TestLogPosition_AfterCompact(t *testing.T) {
-	cm := &ConsensusModule{}
+	cm := &ConsensusModule{limits: testLimits}
 	cm.cmState.log = []LogEntry{
 		{Index: 1, Term: 1},
 		{Index: 2, Term: 1},

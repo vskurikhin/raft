@@ -25,7 +25,7 @@ import (
 // Прямая сборка приспособления, как в newBenchCM: достигается только
 // сохраняемое состояние, горутины не запускаются.
 func newScalarCacheCM(currentTerm, votedFor, lastSnapshotIndex, lastSnapshotTerm int) *ConsensusModule {
-	cm := &ConsensusModule{storage: store.NewMapStorage()}
+	cm := &ConsensusModule{limits: testLimits, storage: store.NewMapStorage()}
 	cm.cmState.currentTerm = currentTerm
 	cm.cmState.votedFor = votedFor
 	cm.cmState.lastSnapshotIndex = lastSnapshotIndex
@@ -245,7 +245,7 @@ func TestScalarCache_RestoreLeavesCacheEmpty(t *testing.T) {
 	storage.Set("currentTerm", gobEncode(t, 2))
 	storage.Set("votedFor", gobEncode(t, 0))
 	storage.RewriteLog([]LogEntry{{Index: 0, Term: 1}})
-	cm := &ConsensusModule{storage: storage}
+	cm := &ConsensusModule{limits: testLimits, storage: storage}
 	cm.initSnapshotConfig(nil)
 	cm.restoreFromStorage()
 
@@ -331,7 +331,7 @@ func assertRecordedSets(t *testing.T, got []recordedSet, want []recordedSet) {
 // попаданиях в кэш.
 func TestScalarCache_SetCalledOnEveryPersist(t *testing.T) {
 	rec := &valueRecordingStorage{LogStorage: store.NewMapStorage()}
-	cm := &ConsensusModule{storage: rec}
+	cm := &ConsensusModule{limits: testLimits, storage: rec}
 	cm.cmState.currentTerm = 1
 	cm.cmState.votedFor = -1
 	cm.cmState.lastSnapshotIndex = -1
@@ -385,7 +385,7 @@ func TestScalarCache_FileStorageWriteSequenceUnchanged(t *testing.T) {
 
 	storage := store.NewFileStorage(t.TempDir())
 	counter := &journalCountingStorage{LogStorage: storage}
-	cm := &ConsensusModule{storage: counter}
+	cm := &ConsensusModule{limits: testLimits, storage: counter}
 	cm.cmState.currentTerm = 1
 	cm.cmState.votedFor = -1
 	cm.cmState.lastSnapshotIndex = -1
@@ -427,7 +427,7 @@ func TestScalarCache_FileStorageWriteSequenceUnchanged(t *testing.T) {
 // ни на байты, ни на подлежащий массив кэша кодирования.
 func TestScalarCache_StorageCopyMutationLeavesEncodedIntact(t *testing.T) {
 	storage := store.NewMapStorage()
-	cm := &ConsensusModule{storage: storage}
+	cm := &ConsensusModule{limits: testLimits, storage: storage}
 	cm.cmState.currentTerm = 5
 	cm.cmState.votedFor = -1
 	cm.cmState.lastSnapshotIndex = -1

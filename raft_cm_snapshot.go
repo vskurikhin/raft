@@ -109,6 +109,14 @@ func (cm *ConsensusModule) handleInstallSnapshot(rpc RPC, req *InstallSnapshotRe
 		rpc.RespChan <- RPCResponse{Reply: resp, Error: rpcErr}
 	}()
 
+	// Версия протокола проверяется до любого изменения состояния: запрос
+	// несовместимой версии не меняет терм, роль, журнал и снимок. Остаток
+	// тела потребляется отложенным чтением, ответ — ошибка.
+	if err := checkRPCHeader(req); err != nil {
+		rpcErr = err
+		return
+	}
+
 	cm.mu.Lock()
 	proceed := cm.beginInstallSnapshotLocked(req, resp)
 	cm.mu.Unlock()

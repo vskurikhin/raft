@@ -143,7 +143,7 @@ func TestDefaultTimingBarrier(t *testing.T) {
 	}
 	// Выборка electionTimeout() на CM с умолчанием: диапазон [430; 860) мс,
 	// все значения кратны миллисекунде.
-	cm := &ConsensusModule{}
+	cm := &ConsensusModule{limits: testLimits}
 	for i := 0; i < 1000; i++ {
 		got := cm.electionTimeout()
 		if got < 430*time.Millisecond || got >= 860*time.Millisecond {

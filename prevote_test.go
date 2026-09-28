@@ -251,6 +251,7 @@ func TestPreVote_CandidateRetry(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	cm := &ConsensusModule{
+		limits:     testLimits,
 		id:         0,
 		transport:  &mockPreVoteGrant{peerTerm: 2},
 		storage:    store.NewMapStorage(),
@@ -302,6 +303,7 @@ func TestPreVote_CandidateRetry(t *testing.T) {
 // вызывающий обязан закрыть cm.shutdownCh до проверки утечки горутин.
 func newPreVoteTestCM(transport Transport, term int) *ConsensusModule {
 	cm := &ConsensusModule{
+		limits:     testLimits,
 		id:         0,
 		transport:  transport,
 		storage:    store.NewMapStorage(),

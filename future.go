@@ -11,8 +11,19 @@ import (
 var (
 	ErrNotLeader                    = errors.New("raft: not leader")
 	ErrLeadershipLost               = errors.New("raft: leadership lost while committing")
-	ErrUnsupportedProtocol          = errors.New("raft: unsupported protocol version")
 	ErrLeadershipTransferInProgress = errors.New("raft: leadership transfer in progress")
+
+	// ErrUnsupportedProtocol — маркер несовместимой версии протокола. Это то
+	// же значение, что contract.ErrUnsupportedProtocol: сетевой кодек и
+	// обработчики RPC возвращают единственный маркер, errors.Is истинен
+	// в обе стороны.
+	ErrUnsupportedProtocol = contract.ErrUnsupportedProtocol
+
+	// ErrCommandTooLarge возвращается Apply, когда сетевая длина Data
+	// команды превышает MaxDataBytes действующего профиля пределов. Команда
+	// отвергается до записи в журнал; ошибка кодирования Data этим маркером
+	// не подменяется.
+	ErrCommandTooLarge = errors.New("raft: command exceeds MaxDataBytes")
 
 	// ErrTooManyUncommittedEntries возвращается клиенту, когда
 	// незафиксированный хвост журнала лидера достиг _maxUncommittedEntries.

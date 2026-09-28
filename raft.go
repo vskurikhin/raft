@@ -7,6 +7,8 @@ import (
 	"os"
 	"sync/atomic"
 	"time"
+
+	"github.com/vskurikhin/raft/pkg/raft/contract"
 )
 
 const (
@@ -279,6 +281,12 @@ type cmConfig struct {
 	// disableStatsOutput отключает публикацию периодического отчёта,
 	// не прекращая секундный сбор метрик.
 	disableStatsOutput bool
+	// timers — нормализованные временные параметры узла, применяемые
+	// конструктором до первого goSpawn; nil — умолчания initTimerDefaults.
+	timers *TimerConfig
+	// limits — профиль пределов сетевого формата; целиком нулевой —
+	// профиль по умолчанию. Обязан совпадать с профилем транспорта.
+	limits contract.Limits
 }
 
 // _statsProcessBase — базовое значение ряда экземпляров CM в процессе:
@@ -376,8 +384,20 @@ func newConsensusModule(
 	if IsNilInterface(transport) {
 		log.Fatalln("raft: NewConsensusModule: transport is nil")
 	}
+	// Профиль транспорта и временной профиль проверяются до любых побочных
+	// эффектов конструктора и до первого goSpawn: при нарушении — паника,
+	// горутины не запускаются. Таймеры — те же, что будут применены ниже.
+	timers := defaultTimerConfig()
+	if cfg.timers != nil {
+		timers = *cfg.timers
+	}
+	limits, err := transportProfile(cfg.limits, transport, timers, _defaultCheckQuorumTimeout)
+	if err != nil {
+		panic(fmt.Sprintf("raft: NewConsensusModule: %v", err))
+	}
 	markConsensusModuleCreated()
 	cm := new(ConsensusModule)
+	cm.limits = limits
 	cm.id = id
 	cm.peerIds = peerIds
 	cm.transport = transport
@@ -414,6 +434,9 @@ func newConsensusModule(
 	// Временные параметры инициализируются умолчаниями безусловно, до
 	// первого goSpawn; зависимые величины вычисляются от полей.
 	cm.initTimerDefaults()
+	if cfg.timers != nil {
+		cm.applyTimerConfig(*cfg.timers)
+	}
 	cm.leaderState.inflightAE = make(map[int]*atomic.Bool)
 	cm.cmState.termIndexMap = make(map[int]int)
 	cm.cmState.electionTimerDone = make(chan struct{})

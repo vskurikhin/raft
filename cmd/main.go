@@ -21,6 +21,8 @@ import (
 	"github.com/vskurikhin/raft/internal/_init"
 	"github.com/vskurikhin/raft/internal/config"
 	"github.com/vskurikhin/raft/pkg/kvservice"
+	"github.com/vskurikhin/raft/pkg/raft/contract"
+	"github.com/vskurikhin/raft/pkg/raft/protocol"
 	"github.com/vskurikhin/raft/pkg/raft/store"
 	"github.com/vskurikhin/raft/pkg/raft/transp"
 )
@@ -95,6 +97,12 @@ func runWith(values *config.Values) (func(), error) {
 		dataDir = filepath.Join("data", fmt.Sprintf("node-%d", values.Number))
 	}
 
+	cfg, limits, timeouts, err := validatedNodeConfig(values, nums)
+	if err != nil {
+		stopPprof()
+		return nil, err
+	}
+
 	// Постоянное хранилище снимков: сжатие усекает журнал на диске,
 	// поэтому снимок обязан переживать рестарт процесса. retain=2 —
 	// запас на случай повреждения последнего снимка.
@@ -111,23 +119,8 @@ func runWith(values *config.Values) (func(), error) {
 		maxPool = config.DefaultMaxPool
 	}
 
-	cfg := kvservice.Config{
-		HTTPAddress: values.HTTPAddress.String(),
-		Config: raft.Config{
-			ApplyBatchInterval: values.ApplyBatchInterval,
-			DisableStatsOutput: !values.StatsOutput,
-			HeartbeatTimeout:   values.HeartbeatTimeout,
-			PeerAddresses:      values.Peers,
-			PeerIds:            nums,
-			ReelectionTimeout:  values.ReelectionTimeout,
-			ServerID:           values.Number,
-			SnapshotInterval:   values.SnapshotInterval,
-			SnapshotStore:      snapshotStore,
-			SnapshotThreshold:  values.SnapshotThreshold,
-			Storage:            store.NewFileStorage(dataDir),
-			TickerTimeout:      values.TickerTimeout,
-		},
-	}
+	cfg.SnapshotStore = snapshotStore
+	cfg.Storage = store.NewFileStorage(dataDir)
 
 	// Инициализация транспорта откладывается до момента непосредственно перед
 	// вызовом kvservice.New, чтобы сократить период, в течение которого
@@ -139,11 +132,12 @@ func runWith(values *config.Values) (func(), error) {
 	// на основе переданных значений. Окно RPC и время ожидания ответа потребителя
 	// соответствуют флагу -tcp-rpc-timeout. Нулевые поля автоматически заменяются
 	// значениями по умолчанию, заданными в конструкторе.
-	timeouts := transportTimeouts(values)
 	log.Printf("raftkv: TCP timeouts: connect=%v rpc=%v snapshot=%v response=%v",
 		timeouts.ConnectionTimeout, timeouts.GenericRPCTimeout,
 		timeouts.InstallSnapshotTimeout, timeouts.ResponseTimeout)
-	transport, err := transp.NewTCPTransport(values.RPCAddress.String(), timeouts, maxPool)
+	log.Printf("raftkv: limits: F=%d N=%d D=%d C=%d",
+		limits.MaxFrameBytes, limits.MaxEntries, limits.MaxDataBytes, limits.MaxConfigurationBytes)
+	transport, err := transp.NewTCPTransportWithLimits(values.RPCAddress.String(), timeouts, maxPool, limits)
 	if err != nil {
 		stopPprof()
 		return nil, fmt.Errorf("failed to create TCP transport on %s: %w", values.RPCAddress, err)
@@ -193,6 +187,58 @@ func transportTimeouts(values *config.Values) transp.TCPTimeouts {
 		InstallSnapshotTimeout: values.InstallSnapshotTimeout,
 		ResponseTimeout:        values.TCPRPCTimeout,
 	}
+}
+
+// validatedNodeConfig собирает конфигурацию узла без хранилищ и транспорта и
+// проверяет профиль узла (пределы KV и сетевого формата, временной профиль
+// с фактическими нормализованными сроками транспорта) до создания хранилищ
+// и открытия слушателя. Нормализация сроков — та же функция, что применяет
+// конструктор транспорта.
+func validatedNodeConfig(
+	values *config.Values, nums []int,
+) (kvservice.Config, contract.Limits, transp.TCPTimeouts, error) {
+	limits, err := nodeLimits(values)
+	if err != nil {
+		return kvservice.Config{}, contract.Limits{}, transp.TCPTimeouts{}, err
+	}
+	cfg := kvservice.Config{
+		HTTPAddress:   values.HTTPAddress.String(),
+		MaxKeyBytes:   values.MaxKeyBytes,
+		MaxValueBytes: values.MaxValueBytes,
+		Config: raft.Config{
+			ApplyBatchInterval: values.ApplyBatchInterval,
+			DisableStatsOutput: !values.StatsOutput,
+			HeartbeatTimeout:   values.HeartbeatTimeout,
+			Limits:             limits,
+			PeerAddresses:      values.Peers,
+			PeerIds:            nums,
+			ReelectionTimeout:  values.ReelectionTimeout,
+			ServerID:           values.Number,
+			SnapshotInterval:   values.SnapshotInterval,
+			SnapshotThreshold:  values.SnapshotThreshold,
+			TickerTimeout:      values.TickerTimeout,
+		},
+	}
+	timeouts, timing := transp.NormalizeTCPTimeouts(transportTimeouts(values))
+	if err = kvservice.ValidateConfig(&cfg, timing); err != nil {
+		return kvservice.Config{}, contract.Limits{}, transp.TCPTimeouts{},
+			fmt.Errorf("invalid node configuration: %w", err)
+	}
+	return cfg, limits, timeouts, nil
+}
+
+// nodeLimits строит профиль пределов сетевого формата узла из предела
+// сетевой длины Data: MaxEntries выводится из него (config.DeriveLimits).
+// Ноль в Values — защитное значение: применяется профиль по умолчанию.
+func nodeLimits(values *config.Values) (contract.Limits, error) {
+	if values.MaxDataBytes == 0 {
+		return protocol.DefaultLimits(), nil
+	}
+	limits, err := config.DeriveLimits(values.MaxDataBytes)
+	if err != nil {
+		return contract.Limits{}, fmt.Errorf("invalid node configuration: %w", err)
+	}
+	return limits, nil
 }
 
 // startPprof поднимает отдельный HTTP-сервер профилирования и включает сбор

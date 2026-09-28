@@ -1065,6 +1065,7 @@ func TestSameTermDoubleVotePrevented(t *testing.T) {
 // не вызывает панику при повторном close(electionTimerDone) (проблема 10).
 func TestBecomeFollowerDoubleClose(t *testing.T) {
 	cm := &ConsensusModule{
+		limits: testLimits,
 		leaderState: leaderState{
 			leaderStartIndex:       -1,
 			nextIndex:              make(map[int]int),
@@ -3392,6 +3393,7 @@ func TestRace_TermIndexMapDispatchAndConflict(t *testing.T) {
 	storage.RewriteLog([]LogEntry{})
 	mock := &mockTransportConflict{replyTerm: 1, success: false, conflictTerm: 1}
 	cm := &ConsensusModule{
+		limits: testLimits,
 		leaderState: leaderState{
 			nextIndex:  map[int]int{1: -1},
 			matchIndex: map[int]int{1: -1, 0: -1},
@@ -3498,6 +3500,7 @@ func TestRace_TermIndexMapCompactAndRead(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	cm := &ConsensusModule{
+		limits: testLimits,
 		leaderState: leaderState{
 			nextIndex:  map[int]int{},
 			matchIndex: map[int]int{},

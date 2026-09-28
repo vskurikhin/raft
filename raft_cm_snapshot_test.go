@@ -97,6 +97,7 @@ func TestLeaderSendSnapshot_EmptyListSignalsSnapshot(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	cm := &ConsensusModule{
+		limits:        testLimits,
 		snapshotStore: store.NewInmemSnapshot(),
 		snapshotCh:    make(chan struct{}, 1),
 	}
@@ -135,6 +136,7 @@ func (s *countingSnapshotStore) Create(index, term, configIndex int, configurati
 func newInstallSnapshotCM() (*ConsensusModule, *countingSnapshotStore) {
 	countingStore := &countingSnapshotStore{InmemSnapshot: store.NewInmemSnapshot()}
 	cm := &ConsensusModule{
+		limits:        testLimits,
 		storage:       store.NewMapStorage(),
 		snapshotStore: countingStore,
 		fsm:           newSnapshotTestFSM(),
@@ -298,9 +300,10 @@ func TestInstallSnapshot_NoOpDrainsBody(t *testing.T) {
 }
 
 // TestInstallSnapshot_NoOpKeepsTCPConnectionUsable — тест 3
-// (часть 2, TCP-уровень): после no-op InstallSnapshot то же соединение
-// обязано обслужить следующий RPC (AppendEntries) — интегральная проверка
-// drain'а на реальном TCP-транспорте.
+// (часть 2, TCP-уровень): после no-op InstallSnapshot транспорт обязан
+// обслужить следующий RPC (AppendEntries) — интегральная проверка drain'а
+// на реальном TCP-транспорте. Соединение снимка закрывается после ответа
+// при любом исходе, следующий RPC идёт по новому соединению.
 func TestInstallSnapshot_NoOpKeepsTCPConnectionUsable(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
@@ -309,7 +312,10 @@ func TestInstallSnapshot_NoOpKeepsTCPConnectionUsable(t *testing.T) {
 
 	ready := make(chan any)
 	close(ready)
-	cm := NewConsensusModule(1, []int{}, server, store.NewMapStorage(), newSnapshotTestFSM(), ready, store.NewInmemSnapshot())
+	// Окно RPC транспорта 1 с: 33 + 20 + 1000 = 1053 < 1200 — база выборов
+	// 1200 мс передаётся конструктору до запуска горутин.
+	cm := newConsensusModule(cmConfig{timers: tcpHarnessTimers(1200 * time.Millisecond)},
+		1, []int{}, server, store.NewMapStorage(), newSnapshotTestFSM(), ready, store.NewInmemSnapshot())
 	defer cm.Stop()
 
 	// Узел уже владеет снимком на индексе 10.
@@ -831,6 +837,7 @@ func TestSnapshot_UnappliedBatchesReplayedAfterRestart(t *testing.T) {
 // нулевые значения (готовы к использованию).
 func newFsmSnapshotCM(fsmApplied, dispatched, lastSnapshotIndex int) *ConsensusModule {
 	cm := &ConsensusModule{
+		limits:     testLimits,
 		storage:    store.NewMapStorage(),
 		fsm:        newSnapshotTestFSM(),
 		shutdownCh: make(chan struct{}),
@@ -902,6 +909,7 @@ func TestSnapshotGuard_NothingNewAtSnapshotIndex(t *testing.T) {
 
 	countingStore := &countingSnapshotStore{InmemSnapshot: store.NewInmemSnapshot()}
 	cm := &ConsensusModule{
+		limits:        testLimits,
 		storage:       store.NewMapStorage(),
 		snapshotStore: countingStore,
 		fsm:           newSnapshotTestFSM(),
@@ -1040,6 +1048,7 @@ func TestFsmAppliedIndex_EmptyStartHasNothingToSnapshot(t *testing.T) {
 
 	countingStore := &countingSnapshotStore{InmemSnapshot: store.NewInmemSnapshot()}
 	cm := &ConsensusModule{
+		limits:        testLimits,
 		storage:       store.NewMapStorage(),
 		snapshotStore: countingStore,
 		fsm:           newGatedTestFSM(1),
@@ -1132,7 +1141,7 @@ func TestFsmAppliedIndex_InstallSnapshotSyncsWatermark(t *testing.T) {
 func TestPublishFsmApplied_Monotonic(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
-	cm := &ConsensusModule{}
+	cm := &ConsensusModule{limits: testLimits}
 	cm.cmState.fsmAppliedIndex = 10
 
 	cm.publishFsmApplied(nil)
