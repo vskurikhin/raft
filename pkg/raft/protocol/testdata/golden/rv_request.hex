@@ -1,0 +1,10 @@
+# RequestVote request: PV=3, ServerID=2, Term=5, CandidateID=2,
+# LastLogIndex=-1, LastLogTerm=-1, LeadershipTransfer=1; BodyLength=49.
+52 52 50 43 00 01 00 18 00 01 00 00 00 00 00 00 00 00 00 31 00 00 00 00
+00 00 00 00 00 00 00 03
+00 00 00 00 00 00 00 02
+00 00 00 00 00 00 00 05
+00 00 00 00 00 00 00 02
+ff ff ff ff ff ff ff ff
+ff ff ff ff ff ff ff ff
+01

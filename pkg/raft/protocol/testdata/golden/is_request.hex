@@ -1,0 +1,14 @@
+# InstallSnapshot request: PV=3, ServerID=1, Term=4, LeaderID=1,
+# LastLogIndex=100, LastLogTerm=3, ConfigIndex=-1, DataSize=262145,
+# ConfigurationLength=3, Configuration="abc"; BodyLength=75.
+52 52 50 43 00 01 00 18 00 02 00 00 00 00 00 00 00 00 00 4b 00 00 00 00
+00 00 00 00 00 00 00 03
+00 00 00 00 00 00 00 01
+00 00 00 00 00 00 00 04
+00 00 00 00 00 00 00 01
+00 00 00 00 00 00 00 64
+00 00 00 00 00 00 00 03
+ff ff ff ff ff ff ff ff
+00 00 00 00 00 04 00 01
+00 00 00 00 00 00 00 03
+61 62 63

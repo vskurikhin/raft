@@ -1,0 +1,5 @@
+# AppendEntries response, error code 1, text "raft: raft is shutdown"
+# (22 bytes); BodyLength=30.
+52 52 50 43 00 01 00 18 01 00 00 00 00 00 00 00 00 00 00 1e 00 00 00 00
+00 01 00 00 00 00 00 16
+72 61 66 74 3a 20 72 61 66 74 20 69 73 20 73 68 75 74 64 6f 77 6e

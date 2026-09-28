@@ -1,0 +1,12 @@
+# AppendEntries request without entries (heartbeat): PV=3, ServerID=3, Term=7,
+# LeaderID=3, PrevLogIndex=5, PrevLogTerm=6, LeaderCommit=4, EntryCount=0;
+# BodyLength=64.
+52 52 50 43 00 01 00 18 00 00 00 00 00 00 00 00 00 00 00 40 00 00 00 00
+00 00 00 00 00 00 00 03
+00 00 00 00 00 00 00 03
+00 00 00 00 00 00 00 07
+00 00 00 00 00 00 00 03
+00 00 00 00 00 00 00 05
+00 00 00 00 00 00 00 06
+00 00 00 00 00 00 00 04
+00 00 00 00 00 00 00 00

@@ -1,0 +1,5 @@
+# InstallSnapshot response, error code 2, text
+# "raft: timeout enqueuing operation" (33 bytes); BodyLength=41.
+52 52 50 43 00 01 00 18 01 02 00 00 00 00 00 00 00 00 00 29 00 00 00 00
+00 02 00 00 00 00 00 21
+72 61 66 74 3a 20 74 69 6d 65 6f 75 74 20 65 6e 71 75 65 75 69 6e 67 20 6f 70 65 72 61 74 69 6f 6e

@@ -1,0 +1,8 @@
+# TimeoutNow success reply: code 0; PV=3, ServerID=2, Success=1, Term=9
+# (Success precedes Term); BodyLength=33.
+52 52 50 43 00 01 00 18 01 03 00 00 00 00 00 00 00 00 00 21 00 00 00 00
+00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 03
+00 00 00 00 00 00 00 02
+01
+00 00 00 00 00 00 00 09

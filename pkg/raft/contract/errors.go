@@ -13,3 +13,9 @@ var ErrEnqueueTimeout = errors.New("raft: timeout enqueuing operation")
 // пустой срез и nil. Сравнивается через errors.Is; ошибка чтения или
 // декодирования этой ошибкой не маскируется.
 var ErrLogNotFound = errors.New("raft: log not found")
+
+// ErrUnsupportedProtocol — маркерная ошибка несовместимой версии протокола
+// (ProtocolVersion) в заголовке RPC-сообщения. Единственное значение маркера:
+// сетевой кодек возвращает именно его, а удалённый отказ по версии
+// декодируется в это же значение. Сравнивается через errors.Is.
+var ErrUnsupportedProtocol = errors.New("raft: unsupported protocol version")

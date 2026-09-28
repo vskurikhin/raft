@@ -1,0 +1,5 @@
+# TimeoutNow response, error code 3, text "raft: unsupported protocol version"
+# (34 bytes); BodyLength=42.
+52 52 50 43 00 01 00 18 01 03 00 00 00 00 00 00 00 00 00 2a 00 00 00 00
+00 03 00 00 00 00 00 22
+72 61 66 74 3a 20 75 6e 73 75 70 70 6f 72 74 65 64 20 70 72 6f 74 6f 63 6f 6c 20 76 65 72 73 69 6f 6e

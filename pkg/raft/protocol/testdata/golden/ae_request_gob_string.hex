@@ -1,0 +1,16 @@
+# AppendEntries request with one LogCommand entry, gob Data = string "hi";
+# frozen gob stream of struct{ Data any } (39 bytes) produced by encoding/gob
+# directly, not by the codec. PV=3, ServerID=1, Term=1, LeaderID=1,
+# PrevLogIndex=0, PrevLogTerm=0, LeaderCommit=0, EntryCount=1; BodyLength=135.
+52 52 50 43 00 01 00 18 00 00 00 00 00 00 00 00 00 00 00 87 00 00 00 00
+00 00 00 00 00 00 00 03
+00 00 00 00 00 00 00 01
+00 00 00 00 00 00 00 01
+00 00 00 00 00 00 00 01
+00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 01
+00 00 00 00 00 00 00 01  00 00 00 00 00 00 00 01  00 01 00 00 00 00 00 00  00 00 00 00 00 00 00 27
+14 7f 03 01 02 ff 80 00 01 01 01 04 44 61 74 61 01 10 00 00 00 11 ff 80 01 06 73 74 72 69 6e 67
+0c 04 00 02 68 69 00

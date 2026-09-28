@@ -1,0 +1,3 @@
+# RequestVote response, error code 4, text "x", BodyLength=9 (protocol §10).
+52 52 50 43 00 01 00 18 01 01 00 00 00 00 00 00 00 00 00 09 00 00 00 00
+00 04 00 00 00 00 00 01 78
