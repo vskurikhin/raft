@@ -134,10 +134,10 @@ func (c *KVClient) Put(ctx context.Context, key, value string) (string, bool, er
 	return putResp.PrevValue, putResp.KeyFound, err
 }
 
-// ConsensusGet выполняет сильное чтение по ключу через консенсус: команда
-// CommandGet проходит через журнал (как Put), результат возвращается
-// future'ом по применению. Возвращает ошибку либо (value, found, nil),
-// где found показывает, существует ли указанный ключ в хранилище.
+// ConsensusGet выполняет "сильное" чтение по ключу через консенсус: команда
+// CommandGet проходит через журнал, результат возвращается future'ом по применению.
+// Возвращает ошибку либо (value, found, nil), где found показывает, существует
+// ли указанный ключ в хранилище.
 func (c *KVClient) ConsensusGet(ctx context.Context, key string) (string, bool, error) {
 	getReq := api.GetRequest{
 		Key: key,
@@ -147,7 +147,7 @@ func (c *KVClient) ConsensusGet(ctx context.Context, key string) (string, bool, 
 	return getResp.Value, getResp.KeyFound, err
 }
 
-// WeakGet метод реализует операцию слабого чтения значения по заданному ключу.
+// WeakGet метод реализует операцию "слабого" чтения значения по заданному ключу.
 // Операция не приводит к записи в журнал консенсуса Raft и выполняется только
 // после подтверждения лидерства с использованием механизма ReadIndex (Raft §8).
 // Возвращаемое значение представляет собой либо ошибку, либо тройку (value, found, nil),
@@ -178,7 +178,7 @@ func (c *KVClient) CAS(ctx context.Context, key, compare, value string) (string,
 }
 
 // Delete удаляет ключ, пропуская команду CommandDelete через
-// консенсус (как Put). Возвращает прежнее значение ключа и признак
+// консенсус. Возвращает прежнее значение ключа и признак
 // его существования до удаления.
 func (c *KVClient) Delete(ctx context.Context, key string) (string, bool, error) {
 	delReq := api.DeleteRequest{
@@ -234,7 +234,7 @@ func (c *KVClient) handleStatus(status api.ResponseStatus) (retry bool, err erro
 	}
 }
 
-// sendGet выполняет GET-запрос слабого чтения с ротацией адресов —
+// sendGet выполняет GET-запрос "слабого" чтения с ротацией адресов —
 // аналогично send. Отличия: ключ в path-сегменте (URL-кодирование),
 // запрос без тела и досрочный возврат при 405 — метод маршрута
 // одинаков для всех узлов, повтор по другому адресу бессмыслен.

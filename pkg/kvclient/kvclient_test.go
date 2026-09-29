@@ -248,7 +248,7 @@ func TestNewWithTimeout(t *testing.T) {
 	}
 }
 
-// TestWeakGetMethodNotAllowedFailsFast — 405 на GET-запрос слабого
+// TestWeakGetMethodNotAllowedFailsFast — 405 на GET-запрос "слабого"
 // чтения возвращает явную ошибку без ротации адресов: метод
 // одинаков для всех узлов кластера, повтор бессмыслен.
 func TestWeakGetMethodNotAllowedFailsFast(t *testing.T) {
@@ -275,7 +275,7 @@ func TestWeakGetMethodNotAllowedFailsFast(t *testing.T) {
 	}
 }
 
-// TestWeakGetRouteMismatchFailsFast — 404 на GET-запрос слабого чтения
+// TestWeakGetRouteMismatchFailsFast — 404 на GET-запрос "слабого" чтения
 // возвращает явную ошибку errRouteMismatch без ротации адресов: класс
 // «маршрут не совпал» детерминирован для всех узлов, повтор бессмыслен.
 func TestWeakGetRouteMismatchFailsFast(t *testing.T) {

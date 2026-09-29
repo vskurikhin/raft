@@ -35,12 +35,12 @@ func TestErrUnsupportedProtocolIsContractMarker(t *testing.T) {
 	}
 }
 
-// deadCM — остановленный узел: обработчики трёх RPC с Dead-веткой.
-func deadCM() *ConsensusModule {
-	cm := &ConsensusModule{limits: testLimits}
-	cm.cmState.state = Dead
-	cm.cmState.currentTerm = 5
-	cm.cmState.lastSnapshotIndex = -1
+// deadCM — остановленный узел: создан конструктором на сохранённом терме 5
+// и переведён в Dead штатным Stop; обработчики трёх RPC с Dead-веткой.
+func deadCM(t *testing.T) *ConsensusModule {
+	cm, ready := restartedFollowerCM(t, 5)
+	close(ready)
+	cm.Stop()
 	return cm
 }
 
@@ -69,7 +69,7 @@ func serveCM(cm *ConsensusModule, trans Transport) func() {
 // получают: их штатный ответ — код 0 с Success=false и Error=nil.
 func TestDeadHandlersReturnShutdownMarker(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
-	cm := deadCM()
+	cm := deadCM(t)
 
 	if err := cm.AppendEntries(AppendEntriesArgs{RPCHeader: hdr3(1)}, &AppendEntriesReply{}); !errors.Is(err, contract.ErrRaftShutdown) {
 		t.Fatalf("direct AppendEntries: %v", err)
@@ -535,6 +535,11 @@ func TestConstructorProfileChecks(t *testing.T) {
 	}
 	inmem := transp.NewInmemTransport("i")
 	defer inmem.Close()
+	limitsOnly := limitsOnlyTransport{Transport: inmem, limits: inmem.Limits()}
+	if msg := recoverPanic(build(cmConfig{}, limitsOnly)); !strings.Contains(msg,
+		"does not implement contract.TransportTimingProvider") {
+		t.Fatalf("missing timing provider: %q", msg)
+	}
 	upper := contract.Limits{MaxFrameBytes: 262144, MaxEntries: 6, MaxDataBytes: 41984, MaxConfigurationBytes: 2560}
 	if msg := recoverPanic(build(cmConfig{limits: upper}, inmem)); !strings.Contains(msg,
 		"limits mismatch: parameter MaxEntries node 6 transport 31") {
@@ -767,3 +772,28 @@ func waitTCPLeader(t *testing.T, cms []*ConsensusModule) int {
 	t.Fatal("no single leader")
 	return -1
 }
+
+// restartedFollowerCM — ведомый, созданный конструктором поверх хранилища с
+// сохранённым термом term, пустым голосом и пустым журналом, с действительными
+// Inmem-транспортом и хранилищем снимков; ready не закрыт.
+func restartedFollowerCM(t *testing.T, term int) (*ConsensusModule, chan any) {
+	t.Helper()
+	storage := store.NewMapStorage()
+	storage.Set(_storageKeyCurrentTerm, gobEncode(t, term))
+	storage.Set(_storageKeyVotedFor, gobEncode(t, -1))
+	storage.RewriteLog([]LogEntry{})
+	trans := transp.NewInmemTransport("d")
+	t.Cleanup(trans.Close)
+	ready := make(chan any)
+	cm := NewConsensusModule(1, []int{0, 2}, trans, storage, NoOpFSM{}, ready, store.NewInmemSnapshot())
+	return cm, ready
+}
+
+// limitsOnlyTransport — действительный транспорт, сообщающий пределы, но не
+// сроки: встроенное поле интерфейса Transport скрывает TransportTiming.
+type limitsOnlyTransport struct {
+	Transport
+	limits contract.Limits
+}
+
+func (t limitsOnlyTransport) Limits() contract.Limits { return t.limits }

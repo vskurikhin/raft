@@ -233,13 +233,12 @@ func run(ctx context.Context, client *kvclient.KVClient) {
 	}
 }
 
-// chooseOp — лестница распределения операций. Полосы:
-// [0,d) DELETE; [d,d+w) WEAK-GET; [d+w,d+w+g) GET; остаток PUT.
-// При d+w+g > 100 усекается последняя достигнутая полоса
-// (при d>100 — DELETE, при d+w>100 — WEAK-GET, иначе GET),
-// последующие полосы и PUT пусты. Значения долей вне [0,100]
-// не поддерживаются: отрицательная доля сдвигает все
-// последующие границы вниз.
+// chooseOp — распределение операций по диапазонам (лестница).
+// Диапазоны: [0,d) — DELETE; [d,d+w) — WEAK‑GET; [d+w,d+w+g) — GET; остаток — PUT.
+// Если суммарная длина диапазонов превышает 100, последняя достигнутая полоса
+// обрезается, а последующие (включая PUT) остаются пустыми.
+// Доли должны находиться в диапазоне [0,100]; отрицательные значения сдвигают
+// границы последующих полос вниз.
 func chooseOp(r, d, w, g int) opKind {
 	switch {
 	case r < d:
@@ -253,7 +252,7 @@ func chooseOp(r, d, w, g int) opKind {
 	}
 }
 
-// get выполняет сильное чтение через консенсус (как Put) и учитывает
+// get выполняет "сильное" чтение через консенсус (как Put) и учитывает
 // его результат.
 func get(ctx context.Context, client *kvclient.KVClient, key string) {
 	start := time.Now()
@@ -268,7 +267,7 @@ func get(ctx context.Context, client *kvclient.KVClient, key string) {
 	_getOK.Add(1)
 }
 
-// weakGet выполняет слабое чтение (без записи в журнал) и учитывает его
+// weakGet выполняет "слабое" чтение (без записи в журнал) и учитывает его
 // результат.
 func weakGet(ctx context.Context, client *kvclient.KVClient, key string) {
 	start := time.Now()

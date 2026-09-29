@@ -303,3 +303,57 @@ func TestAllocationProfile(t *testing.T) {
 		t.Fatalf("allocations decode=%v encode=%v", decodeAllocs, encodeAllocs)
 	}
 }
+
+// TestSnapshotConfigurationOwnsMemory — V11: Configuration декодированного
+// InstallSnapshot не ссылается на тело кадра. Тело собирается так же, как в
+// readFrame, — отдельный буфер длины BodyLength с копией тела независимого
+// эталона после проверок пределов и заголовка, которые ReadRequestWithHeader
+// выполняет до decodeRequest; тот же кадр через ReadRequest даёт равный запрос.
+func TestSnapshotConfigurationOwnsMemory(t *testing.T) {
+	limits := DefaultLimits()
+	frame := loadGolden(t, "is_request")
+	if err := checkLimits(limits); err != nil {
+		t.Fatalf("limits: %v", err)
+	}
+	header, err := parseHeader((*[headerSize]byte)(frame[:headerSize]))
+	if err != nil {
+		t.Fatalf("header: %v", err)
+	}
+	if err = requestCheck(limits)(header); err != nil || header.Type != rpcInstallSnapshot ||
+		header.BodyLength != uint64(len(frame)-headerSize) {
+		t.Fatalf("header %+v: %v", header, err)
+	}
+	body := make([]byte, header.BodyLength)
+	copy(body, frame[headerSize:])
+
+	decoded, err := decodeInstallSnapshotRequest(&bodyDecoder{body: body}, limits)
+	if err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	_, public, err := readRequestBytes(frame, limits)
+	if err != nil || !reflect.DeepEqual(public, decoded) {
+		t.Fatalf("ReadRequest %#v, %v; body decode %#v", public, err, decoded)
+	}
+
+	clear(body)
+	if string(decoded.Configuration) != "abc" {
+		t.Fatalf("configuration aliased frame body: %q", decoded.Configuration)
+	}
+}
+
+// TestAppendRequestErrorRestoresLength — V07/V13: ошибка кодирования второй
+// записи AppendEntries при dst длины 3 и ёмкости 1024 возвращает срез длины 3
+// с прежним префиксом. Содержимое свободной ёмкости dst не проверяется.
+func TestAppendRequestErrorRestoresLength(t *testing.T) {
+	dst := make([]byte, 3, 1024)
+	copy(dst, "abc")
+	args := &contract.AppendEntriesArgs{RPCHeader: header3(1), Term: 1, Entries: []contract.LogEntry{
+		{Index: 1, Term: 1, Type: contract.LogCommand, Data: "first"},
+		{Index: 2, Term: 1, Type: maxLogType + 1},
+	}}
+	frame, err := AppendRequest(dst, args, DefaultLimits())
+	requireIs(t, err, ErrFormat)
+	if len(frame) != 3 || !bytes.Equal(frame, []byte("abc")) {
+		t.Fatalf("error result len=%d %q", len(frame), frame)
+	}
+}

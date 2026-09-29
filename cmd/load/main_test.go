@@ -82,7 +82,7 @@ func (s *kvStub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.mu.Unlock()
 		encode(w, getResponse{RespStatus: statusOK, KeyFound: found, Value: value})
 	case strings.HasPrefix(r.URL.Path, "/weak-get/"):
-		// Слабое чтение в стабе ведёт себя как обычное чтение: возвращает
+		// "Слабое" чтение в стабе ведёт себя как обычное чтение: возвращает
 		// значение ключа без изменения состояния хранилища. Ключ передаётся
 		// path-сегментом GET-запроса (r.URL.Path уже декодирован).
 		key := strings.TrimPrefix(r.URL.Path, "/weak-get/")
@@ -449,7 +449,7 @@ func TestOperationCountersCountEachOperationOnce(t *testing.T) {
 		t.Errorf("_putDone = %d, _verifyDone = %d, want equal", _putDone.Load(), _verifyDone.Load())
 	}
 	// Латентность чтения (GET) и перечитывания (verify) учитывается в разных
-	// рекордерах: verify использует слабое чтение и пишет в _weakGetLatency.
+	// рекордерах: verify использует "слабое" чтение и пишет в _weakGetLatency.
 	samples, _ := _getLatency.from(0)
 	if uint64(len(samples)) != _getDone.Load() {
 		t.Errorf("GET latency samples = %d, want %d", len(samples), _getDone.Load())
@@ -624,7 +624,7 @@ func TestChooseOp(t *testing.T) {
 			want: func(r int) opKind { return opDelete },
 		},
 		{
-			// Только слабое чтение: полоса WEAK-GET занимает весь диапазон.
+			// Только "слабое" чтение: полоса WEAK-GET занимает весь диапазон.
 			name: "weak-get-100",
 			d:    0, w: 100, g: 0,
 			want: func(r int) opKind { return opWeakGet },
@@ -761,7 +761,7 @@ func TestDeletePercentSaturating(t *testing.T) {
 }
 
 // TestWeakGetPercentSaturating проверяет интеграционное поведение при
-// WeakGetPercent=100: каждая операция — слабое чтение, _weakGetDone равен
+// WeakGetPercent=100: каждая операция — "слабое" чтение, _weakGetDone равен
 // числу HTTP-запросов стаба.
 func TestWeakGetPercentSaturating(t *testing.T) {
 	resetMetrics()
@@ -798,12 +798,7 @@ func TestWeakGetPercentSaturating(t *testing.T) {
 	}
 }
 
-// Эталонные строки run: и done: взяты дословно из исторического артефакта
-// .doc/TODO/2026-09-06.P-PERF-2/2026-09-06-P-PERF-2-base-consensus/trace/P-PERF-2-base-consensus_loadkv.out
-// (строки 60–61). Артефакт снят текущим форматом вывода генератора до правок
-// TASK-001, поэтому строки обязаны совпадать побайтово, включая двойные
-// пробелы (межверсионный гейт RISK-013). Литералы не собираются через
-// fmt.Sprintf с форматами main.go: источник — ссылка на артефакт.
+// Эталонные строки.
 const (
 	goldenRunLine  = "run: concurrency=128 request-rate=500 value-size=128 duration=1m0s TRACE_LOG_LEVEL=не задан  mix: delete=0 weak-get=0 get=75 put=25 (эффективные)"
 	goldenDoneLine = "done: get=22485 put=7418 verify=0 weak-get=0 delete=0 delete-verify=0  GET ok=22485 fail=0  PUT ok=7418 fail=0  VERIFY ok=0 bad=0  WEAK GET ok=0 fail=0  DELETE ok=0 fail=0  DELETE-VERIFY ok=0 bad=0  _dropped=0 _latencyDropped=0"

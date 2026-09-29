@@ -227,3 +227,19 @@ func TestDataLengthLimitDecode(t *testing.T) {
 	_, _, err = readRequestBytes(frame, smallLimits)
 	requireIs(t, err, ErrLimit)
 }
+
+// TestConfigurationLengthFieldLimit — V07: поле ConfigurationLength больше C
+// (C+1 и MaxUint64) при корректной внешней длине кадра отвергается ErrLimit,
+// а не более поздней сверкой с остатком тела.
+func TestConfigurationLengthFieldLimit(t *testing.T) {
+	limits := DefaultLimits()
+	frame := loadGolden(t, "is_request")
+	offset := requestBody + installSnapshotMin - 8
+	for _, length := range []uint64{limits.MaxConfigurationBytes + 1, math.MaxUint64} {
+		_, command, err := readRequestBytes(patchUint64(frame, offset, length), limits)
+		requireIs(t, err, ErrLimit)
+		if command != nil {
+			t.Fatalf("ConfigurationLength %d: command %v", length, command)
+		}
+	}
+}

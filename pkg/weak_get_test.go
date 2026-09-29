@@ -148,7 +148,7 @@ func TestWeakGetMissingKeyStatusOK(t *testing.T) {
 }
 
 // TestDisconnectLeaderWeakGetTimesOut — паритет фрагмента
-// TestDisconnectLeaderAfterPuts: таймаут слабого чтения на изолированном
+// TestDisconnectLeaderAfterPuts: таймаут "слабого" чтения на изолированном
 // лидере. put-клиент и таймаут-клиент — РАЗНЫЕ: PUT выполняется до
 // изоляции обычным многоадресным клиентом, таймаут проверяется клиентом,
 // привязанным только к изолированному лидеру.

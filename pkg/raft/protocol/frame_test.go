@@ -113,7 +113,7 @@ func TestBodyLengthRules(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			spy := &countingReader{r: bytes.NewReader(withBodyLength(loadGolden(t, tc.golden), tc.length))}
-			hook := &hookRecorder{}
+			hook := &hookRecorder{err: errHookMustNotRun}
 			_, command, err := ReadRequestWithHeader(spy, limits, hook.hook)
 			requireIs(t, err, tc.want)
 			if command != nil || hook.calls != 0 || spy.consumed != headerSize {
@@ -132,7 +132,7 @@ func TestBodyLengthRules(t *testing.T) {
 	}
 	for _, tc := range responseCases {
 		spy := &countingReader{r: bytes.NewReader(withBodyLength(loadGolden(t, "rv_reply"), tc.length))}
-		hook := &hookRecorder{}
+		hook := &hookRecorder{err: errHookMustNotRun}
 		_, err := ReadResponseWithHeader(spy, rpcRequestVote, limits, hook.hook)
 		requireIs(t, err, tc.want)
 		if hook.calls != 0 || spy.consumed != headerSize {
@@ -288,7 +288,7 @@ func TestWriteFrame(t *testing.T) {
 		t.Fatalf("n+error writer: err=%v calls=%d written=%d", err, calls, len(partial.written))
 	}
 
-	stalled := &scriptedWriter{step: func([]byte) (int, error) { return 0, nil }}
+	stalled := &stalledWriter{t: t}
 	requireIs(t, WriteFrame(stalled, frame), io.ErrShortWrite)
 
 	invalid := &scriptedWriter{step: func(p []byte) (int, error) { return len(p) + 1, nil }}
@@ -610,4 +610,62 @@ func payloadWithEncodedLength(t *testing.T, want, limit uint64) []byte {
 	t.Fatalf("no []byte with encoded length %d", want)
 
 	return nil
+}
+
+// errHookMustNotRun — отказ BeforeBody в проверках, где заголовок обязан
+// быть отвергнут до вызова: незаконный вызов прекращает чтение до выделения
+// тела и виден как ошибка вместо ожидаемой.
+var errHookMustNotRun = errors.New("BeforeBody must not be called")
+
+// errWriteAfterStall — ответ stalledWriter на повторный вызов после (0, nil):
+// повторная запись без продвижения видна вызывающему как ошибка вместо
+// io.ErrShortWrite.
+var errWriteAfterStall = errors.New("stalled writer called again after (0, nil)")
+
+// stalledWriter отвечает (0, nil) на первый вызов без продвижения записи и
+// errWriteAfterStall на повторный: цикл записи конечен при любом числе
+// вызовов, лишний вызов обнаруживается проверкой результата WriteFrame.
+type stalledWriter struct {
+	t     *testing.T
+	calls int
+}
+
+func (w *stalledWriter) Write([]byte) (int, error) {
+	w.calls++
+	if w.calls > 2 {
+		w.t.Fatalf("Write called %d times after (0, nil)", w.calls)
+	}
+	if w.calls > 1 {
+		return 0, errWriteAfterStall
+	}
+
+	return 0, nil
+}
+
+// TestUnknownRPCTypeWithFullBody — V02/V15: RPCType 5 и 255 отвергаются по
+// заголовку при полном корректном теле AppendEntries: тип не приводится к
+// AppendEntries, BeforeBody не вызывается, тело не читается, результата нет;
+// то же для ответа AppendEntries.
+func TestUnknownRPCTypeWithFullBody(t *testing.T) {
+	request := loadGolden(t, "ae_request_noop")
+	reply := loadGolden(t, "ae_reply")
+	for _, value := range []byte{5, 255} {
+		spy := &countingReader{r: bytes.NewReader(patchByte(request, offsetRPCType, value))}
+		hook := &hookRecorder{}
+		typ, command, err := ReadRequestWithHeader(spy, DefaultLimits(), hook.hook)
+		requireIs(t, err, ErrFormat)
+		if typ != 0 || command != nil || hook.calls != 0 || spy.consumed != headerSize {
+			t.Fatalf("request RPCType %d: typ=%d command=%v hook=%d consumed=%d",
+				value, typ, command, hook.calls, spy.consumed)
+		}
+
+		responseSpy := &countingReader{r: bytes.NewReader(patchByte(reply, offsetRPCType, value))}
+		responseHook := &hookRecorder{}
+		response, err := ReadResponseWithHeader(responseSpy, rpcAppendEntries, DefaultLimits(), responseHook.hook)
+		requireIs(t, err, ErrFormat)
+		if response != (contract.RPCResponse{}) || responseHook.calls != 0 || responseSpy.consumed != headerSize {
+			t.Fatalf("response RPCType %d: response=%#v hook=%d consumed=%d",
+				value, response, responseHook.calls, responseSpy.consumed)
+		}
+	}
 }

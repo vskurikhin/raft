@@ -59,7 +59,7 @@ func TestWriteHandlersDoNotVerifyLeader(t *testing.T) {
 // TestReadHandlersStillVerifyLeader — контроль от вырождения предыдущей
 // проверки: консенсусный handleGet переведён в список записи (Э4);
 // слабое чтение — handleWeakGet. Подтверждение лидерства сохраняется
-// только для ручки слабого чтения и отдельной ручки VerifyLeader.
+// только для ручки "слабого" чтения и отдельной ручки VerifyLeader.
 func TestReadHandlersStillVerifyLeader(t *testing.T) {
 	for _, name := range []string{"handleVerifyLeader", "handleWeakGet"} {
 		if got := verifyLeaderCallsIn(t, name); got == 0 {

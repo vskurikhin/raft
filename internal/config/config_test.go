@@ -392,10 +392,8 @@ func TestParseFlagsMaxPool(t *testing.T) {
 	}
 }
 
-// TestParseFlagsTCPRPCTimeoutDefaults проверяет дефолт флага -tcp-rpc-timeout:
-// без флага поле Values.TCPRPCTimeout равно raft.TCPRPCTimeout (200 мс).
-// Одновременно это защита от рассинхрона дефолта между internal/config
-// и пакетом raft (RISK-023): единый источник — алиас raft.TCPRPCTimeout.
+// TestParseFlagsTCPRPCTimeoutDefaults — -tcp-rpc-timeout = raft.TCPRPCTimeout (200 мс).
+// Единый источник, защита от рассинхрона.
 func TestParseFlagsTCPRPCTimeoutDefaults(t *testing.T) {
 	origArgs := os.Args
 	t.Cleanup(func() { os.Args = origArgs })
@@ -432,11 +430,10 @@ func TestParseFlagsTCPRPCTimeout(t *testing.T) {
 	}
 }
 
-// TestParseFlagsTCPTimeoutsDefaults проверяет дефолты трёх флагов
-// тайм-аутов TCP-транспорта: без флагов поля Values равны константам
-// raft.*. Защита от рассинхрона дефолтов между internal/config и
-// пакетом raft (RISK-023). Дефолтный набор проходит инварианты:
-// 165 ≤ 200, 165 + 200 = 365 ≤ 400, 310 ≥ 200.
+// TestParseFlagsTCPTimeoutsDefaults — проверка значений по умолчанию трёх флагов
+// тайм‑аутов TCP: без флагов Values равны константам raft.
+// Защита от рассинхронизации дефолтов (internal/config ↔ raft).
+// Значения проходят инварианты: 165 ≤ 200, 165+200=365 ≤ 400, 310 ≥ 200.
 func TestParseFlagsTCPTimeoutsDefaults(t *testing.T) {
 	origArgs := os.Args
 	t.Cleanup(func() { os.Args = origArgs })

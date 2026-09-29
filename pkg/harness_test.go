@@ -545,7 +545,7 @@ func (h *Harness) TryGet(c *kvclient.KVClient, key string, wantValue string) err
 	return nil
 }
 
-// TryWeakGet отправляет через клиента c запрос слабого чтения WeakGet и
+// TryWeakGet отправляет через клиента c запрос "слабого" чтения WeakGet и
 // проверяет, что ключ найден и его значение совпадает с ожидаемым.
 // Возвращает ошибку без обращения к *testing.T.
 func (h *Harness) TryWeakGet(c *kvclient.KVClient, key string, wantValue string) error {
@@ -597,7 +597,7 @@ func (h *Harness) TryGetNotFound(c *kvclient.KVClient, key string) error {
 	return nil
 }
 
-// TryWeakGetNotFound отправляет через клиента c запрос слабого чтения
+// TryWeakGetNotFound отправляет через клиента c запрос "слабого" чтения
 // WeakGet и проверяет, что ключ отсутствует. Возвращает ошибку без
 // обращения к *testing.T.
 func (h *Harness) TryWeakGetNotFound(c *kvclient.KVClient, key string) error {
@@ -678,7 +678,7 @@ func (h *Harness) CheckGet(c *kvclient.KVClient, key string, wantValue string) {
 	}
 }
 
-// CheckWeakGet отправляет через клиента c запрос слабого чтения WeakGet
+// CheckWeakGet отправляет через клиента c запрос "слабого" чтения WeakGet
 // и проверяет отсутствие ошибок. Также проверяет, что ключ найден и его
 // значение совпадает с ожидаемым. Вызывается только из тестовой горутины
 // (см. TryWeakGet).
@@ -734,7 +734,7 @@ func (h *Harness) CheckGetNotFound(c *kvclient.KVClient, key string) {
 	}
 }
 
-// CheckWeakGetNotFound отправляет через клиента c запрос слабого чтения
+// CheckWeakGetNotFound отправляет через клиента c запрос "слабого" чтения
 // WeakGet и проверяет отсутствие ошибок, а также то, что указанный ключ
 // отсутствует в сервисе. Вызывается только из тестовой горутины
 // (см. TryWeakGetNotFound).
@@ -770,7 +770,7 @@ func (h *Harness) CheckGetTimesOut(c *kvclient.KVClient, key string) {
 	}
 }
 
-// CheckWeakGetTimesOut проверяет, что запрос слабого чтения WeakGet,
+// CheckWeakGetTimesOut проверяет, что запрос "слабого" чтения WeakGet,
 // отправленный через данного клиента, завершится по тайм-ауту при
 // использовании контекста с дедлайном, поскольку клиент не сможет
 // добиться подтверждения лидерства сервисом.

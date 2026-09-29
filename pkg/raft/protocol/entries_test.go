@@ -235,3 +235,30 @@ func TestNoopData(t *testing.T) {
 		t.Fatalf("decoded %#v, %v", decoded, err)
 	}
 }
+
+// TestEntryCountRemainingCheckedFirst — V06: при допустимом профиле, где
+// EntryCount не больше N, но больше и остатка тела /32, и
+// MaxInt/sizeof(LogEntry), первой срабатывает проверка остатка тела: ErrFormat
+// до выделения Entries, а не ErrLimit следующей защитной проверки.
+func TestEntryCountRemainingCheckedFirst(t *testing.T) {
+	huge := Limits{MaxFrameBytes: math.MaxInt, MaxEntries: (math.MaxInt - 88) / 33, MaxDataBytes: 1,
+		MaxConfigurationBytes: 1}
+	if err := huge.Validate(); err != nil {
+		t.Fatalf("limits: %v", err)
+	}
+	count := uint64(math.MaxInt)/logEntrySize + 1
+	if count > huge.MaxEntries {
+		t.Skipf("count %d exceeds N on this platform", count)
+	}
+	frame := buildAppendEntries(count, 0)
+	remaining := uint64(len(frame) - headerSize - appendEntriesMinBody)
+	if count <= remaining/entryHeaderBytes || count <= math.MaxInt/logEntrySize {
+		t.Fatalf("count %d does not exceed remaining %d / %d and MaxInt / %d",
+			count, remaining, entryHeaderBytes, logEntrySize)
+	}
+	_, command, err := readRequestBytes(frame, huge)
+	requireIs(t, err, ErrFormat)
+	if command != nil {
+		t.Fatalf("command %v", command)
+	}
+}
