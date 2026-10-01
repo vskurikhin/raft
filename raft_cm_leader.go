@@ -9,9 +9,9 @@ import (
 	"github.com/vskurikhin/raft/pkg/raft/protocol"
 )
 
-// _leadershipTransferPollInterval — период опроса nextIndex целевого
-// узла при догонке в передаче лидерства: до завершения догонки цикл
-// повторяет сигнал репликации с этим интервалом.
+// _leadershipTransferPollInterval — период опроса nextIndex целевого узла
+// во время до синхронизации в передаче лидерства:
+// до завершения синхронизации цикл повторяет сигнал репликации с этим интервалом.
 const _leadershipTransferPollInterval = 10 * time.Millisecond
 
 // AddNonvoter добавляет новый не голосующий сервер или обновляет адрес существующего.
@@ -307,7 +307,7 @@ func (cm *ConsensusModule) appendConfigurationEntry(future *configurationChangeF
 		}
 		cm.cmState.commitIndex = newCI
 	}
-	// Значение снимается в критической секции до Unlock (RISK-002):
+	// Значение снимается в критической секции до Unlock:
 	// чтение cm.cmState.commitIndex вне cm.mu — data race.
 	commitIndex := cm.cmState.commitIndex
 	cm.mu.Unlock()

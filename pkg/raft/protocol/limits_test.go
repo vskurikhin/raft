@@ -9,8 +9,9 @@ import (
 	"github.com/vskurikhin/raft/pkg/raft/contract"
 )
 
-// TestDefaultLimits — V27/AC5: DefaultLimits возвращает {262144, 31, 8192,
-// 2560} новой копией; изменение копии не влияет на следующий вызов.
+// TestDefaultLimits — V27/AC5:
+// DefaultLimits возвращает {262144, 31, 8192, 2560} новой копией;
+// изменение копии не влияет на следующий вызов.
 func TestDefaultLimits(t *testing.T) {
 	want := contract.Limits{MaxFrameBytes: 262144, MaxEntries: 31, MaxDataBytes: 8192, MaxConfigurationBytes: 2560}
 	got := DefaultLimits()
@@ -91,8 +92,15 @@ func TestHugeBodyRejectedBeforeRead(t *testing.T) {
 	limits := DefaultLimits()
 	header := appendHeader(nil, directionRequest, rpcAppendEntries, 1<<40)
 	spy := &countingReader{r: endlessReader{header: header}}
-	_, _, err := ReadRequest(spy, limits)
+	// Запрещающий BeforeBody: BASE обязан отвергнуть заголовок до вызова
+	// hook; на мутанте без проверки длины hook возвращает маркерную ошибку
+	// до выделения тела.
+	hook := &hookRecorder{err: errHookMustNotRun}
+	_, _, err := ReadRequestWithHeader(spy, limits, hook.hook)
 	requireIs(t, err, ErrLimit)
+	if hook.calls != 0 {
+		t.Fatalf("BeforeBody called %d times", hook.calls)
+	}
 	if spy.consumed != headerSize {
 		t.Fatalf("consumed %d bytes", spy.consumed)
 	}
