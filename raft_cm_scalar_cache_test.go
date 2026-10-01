@@ -3,6 +3,7 @@ package raft
 import (
 	"bytes"
 	"math"
+	"math/bits"
 	"slices"
 	"sync"
 	"testing"
@@ -184,11 +185,17 @@ func TestScalarCache_ABAReencodesA(t *testing.T) {
 // между значениями кодируется заново с байтами, равными прежнему gob; повтор
 // того же значения массив не заменяет. Значения подаются напрямую в кодировщик
 // под cm.mu, поэтому невозможные для терма корректного узла величины (нули,
-// отрицательные, границы int) не записываются как состояние CM.
+// отрицательные, границы int) не записываются как состояние CM. Границы int
+// берутся для целевой архитектуры; значения за пределами int32 добавляются
+// только при 64-битном int, поэтому тест собирается и на GOARCH=386.
 func TestScalarCache_BoundaryAndNegativeValues(t *testing.T) {
 	values := []int{
-		0, -1, 1, math.MinInt64, math.MaxInt64, math.MinInt32, math.MaxInt32,
-		-(1 << 40), 1 << 40,
+		0, -1, 1, math.MinInt, math.MaxInt, math.MinInt32, math.MaxInt32,
+	}
+	if bits.UintSize == 64 {
+		// Сдвиг не константный: на 32-битном int константа 1<<40 не компилируется.
+		shift := 40
+		values = append(values, -(1 << shift), 1<<shift)
 	}
 	cm := newScalarCacheCM(1, -1, -1, -1)
 
