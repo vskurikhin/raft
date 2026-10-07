@@ -430,8 +430,18 @@ func (r *recordingStorage) keysSnapshot() []string {
 	return append([]string{}, r.keys...)
 }
 
-// persistKeys — ключи, которые вправе записывать persistToStorage.
+// persistKeys — ключи, которые вправе записывать persistToStorageLocked.
 var persistKeys = []string{"currentTerm", "votedFor", "lastSnapshotIndex", "lastSnapshotTerm", "log"}
+
+// persistToStorageForTest выполняет прямое сохранение в приспособлении.
+// Локальный захват и снятие cm.mu выполняются здесь же; источник test
+// предназначен только для прямых вызовов и не является производственной
+// точкой.
+func persistToStorageForTest(cm *ConsensusModule) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.persistToStorageLocked(persistSourceTest)
+}
 
 // assertPersistKeyOrder проверяет инвариант отказоустойчивости
 // на основе наблюдаемой последовательности ключей: ключи снимка
@@ -487,7 +497,7 @@ func TestPersistToStorage_LogWrittenLast(t *testing.T) {
 	cm.cmState.log = []LogEntry{{Index: 5, Term: 1}}
 	cm.cmState.logNeedsPersist = true
 
-	cm.persistToStorage()
+	persistToStorageForTest(cm)
 
 	keys := rec.keysSnapshot()
 	if len(keys) == 0 {
@@ -525,7 +535,7 @@ func TestPersistToStorage_KeyOrderWithSkippedWrites(t *testing.T) {
 	cm.cmState.log = []LogEntry{{Index: 5, Term: 1}}
 	cm.cmState.logNeedsPersist = true
 
-	cm.persistToStorage()
+	persistToStorageForTest(cm)
 
 	keys := rec.keysSnapshot()
 	if len(keys) != 2 || keys[0] != "currentTerm" || keys[1] != "log" {
@@ -549,13 +559,13 @@ func TestPersistToStorage_NoWritesWhenUnchanged(t *testing.T) {
 	cm.cmState.log = []LogEntry{{Index: 0, Term: 1}}
 	cm.cmState.logNeedsPersist = true
 
-	cm.persistToStorage()
+	persistToStorageForTest(cm)
 	if got := storage.WriteCount(); got != 5 {
 		t.Fatalf("writeCount = %d after first persist, want 5", got)
 	}
 
 	before := storage.WriteCount()
-	cm.persistToStorage()
+	persistToStorageForTest(cm)
 	if got := storage.WriteCount() - before; got != 0 {
 		t.Fatalf("%d writes for unchanged state, want 0", got)
 	}
@@ -563,7 +573,7 @@ func TestPersistToStorage_NoWritesWhenUnchanged(t *testing.T) {
 	cm.cmState.log = append(cm.cmState.log, LogEntry{Index: 1, Term: 1})
 	cm.cmState.logNeedsPersist = true
 	before = storage.WriteCount()
-	cm.persistToStorage()
+	persistToStorageForTest(cm)
 	if got := storage.WriteCount() - before; got != 1 {
 		t.Fatalf("%d writes for changed log, want 1", got)
 	}

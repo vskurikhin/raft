@@ -1,5 +1,3 @@
-// Copyright 2026 Victor N. Skurikhin
-// SPDX-License-Identifier: Apache-2.0
 package raft
 
 import (
@@ -276,7 +274,7 @@ func (f *configurationChangeFuture) Index() int {
 
 // cmConfig — внутренние параметры создания ConsensusModule, не входящие
 // в публичную сигнатуру конструктора. Нулевое значение сохраняет прежнее
-// поведение.
+// поведение: периодическая статистика выводится.
 type cmConfig struct {
 	// disableStatsOutput отключает публикацию периодического отчёта,
 	// не прекращая секундный сбор метрик.

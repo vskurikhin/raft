@@ -29,30 +29,39 @@ func newBenchCM(dir string) *ConsensusModule {
 }
 
 // BenchmarkPersistToStorageUnchanged измеряет сохранение состояния, при
-// котором журнал не менялся: пишутся только дешёвые ключи.
+// котором журнал не менялся: пишутся только дешёвые ключи. Вызов требует
+// удержания cm.mu, поэтому блокировка берётся один раз до b.ResetTimer и
+// снимается отложенно в этой же функции: Lock/Unlock не входят в ns/op.
 func BenchmarkPersistToStorageUnchanged(b *testing.B) {
 	cm := newBenchCM(b.TempDir())
 	cm.cmState.log = benchLogEntries(100, benchValueSizeLog)
 	cm.cmState.logNeedsPersist = false
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		cm.persistToStorage()
+		cm.persistToStorageLocked(persistSourceTest)
 	}
+	b.StopTimer()
 }
 
 // BenchmarkPersistToStorageLogChanged измеряет сохранение состояния, при
 // котором журнал меняется на каждой итерации и переписывается целиком.
+// Обвязка блокировки идентична BenchmarkPersistToStorageUnchanged.
 func BenchmarkPersistToStorageLogChanged(b *testing.B) {
 	cm := newBenchCM(b.TempDir())
 	cm.cmState.log = benchLogEntries(100, benchValueSizeLog)
 	last := len(cm.cmState.log) - 1
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
 	b.SetBytes(int64(benchValueSizeLog))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		cm.cmState.log[last].Term = i + 1
 		cm.cmState.logNeedsPersist = true
-		cm.persistToStorage()
+		cm.persistToStorageLocked(persistSourceTest)
 	}
+	b.StopTimer()
 }
 
 // BenchmarkProcessLogsFileStorage измеряет продвижение применённых записей

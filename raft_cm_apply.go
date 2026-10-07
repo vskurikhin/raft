@@ -1,5 +1,3 @@
-// Copyright 2026 Victor N. Skurikhin
-// SPDX-License-Identifier: Apache-2.0
 package raft
 
 import (
@@ -93,7 +91,7 @@ func (cm *ConsensusModule) processLogs(commitIndex int) {
 	}
 	lastApplied := cm.cmState.lastApplied
 	cm.cmState.lastApplied = commitIndex
-	cm.persistToStorage()
+	cm.persistToStorageLocked(persistSourceApply)
 	cm.mu.Unlock()
 
 	start := lastApplied + 1

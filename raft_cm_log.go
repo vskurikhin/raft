@@ -1,5 +1,3 @@
-// Copyright 2026 Victor N. Skurikhin
-// SPDX-License-Identifier: Apache-2.0
 package raft
 
 import (
@@ -201,7 +199,7 @@ func (cm *ConsensusModule) dispatchLogsLocked(applyLogs []*logFuture) {
 	}
 	cm.setLastLogLocked(lastIndex, term)
 	cm.cmState.logNeedsPersist = true
-	cm.persistToStorage()
+	cm.persistToStorageLocked(persistSourceLeaderAppend)
 	cm.leaderState.matchIndex[cm.id] = lastIndex
 
 	for _, f := range applyLogs {

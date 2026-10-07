@@ -13,4 +13,7 @@
 //
 // Пакет зависит только от базового пакета контрактов (contract) и стандартной
 // библиотеки. Тесты пакета дополнительно импортируют корневой пакет raft.
+//
+// Copyright 2026 Victor N. Skurikhin
+// SPDX-License-Identifier: Apache-2.0
 package transp

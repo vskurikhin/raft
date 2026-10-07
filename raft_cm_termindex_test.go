@@ -270,7 +270,7 @@ func TestTermIndexMap_RestoreFromStorage(t *testing.T) {
 	cm.rebuildTermIndexMapLocked()
 	cm.cmState.state = Follower
 	cm.cmState.currentTerm = 1
-	cm.persistToStorage()
+	cm.persistToStorageLocked(persistSourceTest)
 	cm.mu.Unlock()
 	cm.Stop()
 
