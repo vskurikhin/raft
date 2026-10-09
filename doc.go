@@ -1,3 +1,5 @@
 // Package raft — реализация протокола консенсуса Raft (v3).
-// This code is in the public domain.
+//
+// Copyright 2026 Victor N. Skurikhin
+// SPDX-License-Identifier: Apache-2.0
 package raft

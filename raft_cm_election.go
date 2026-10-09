@@ -67,7 +67,7 @@ func (cm *ConsensusModule) becomeFollowerLocked(term int) {
 	if term > cm.cmState.currentTerm {
 		cm.cmState.currentTerm = term
 		cm.cmState.votedFor = -1
-		cm.persistToStorage()
+		cm.persistToStorageLocked(persistSourceFollowerTerm)
 	}
 	cm.cmState.leaderLastContact = time.Time{}
 	cm.cmState.leaderID = -1
@@ -100,7 +100,7 @@ func (cm *ConsensusModule) startElectionLocked() {
 	savedCurrentTerm := cm.cmState.currentTerm
 	cm.cmState.electionResetEvent = time.Now()
 	cm.cmState.votedFor = cm.id
-	cm.persistToStorage()
+	cm.persistToStorageLocked(persistSourceCandidate)
 	if traceEnabled(_traceLevelKeyEvents) {
 		cm.traceLogfLocked(
 			"becomes Candidate (currentTerm=%d); len(log)=%v",

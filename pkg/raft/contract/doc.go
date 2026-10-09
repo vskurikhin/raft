@@ -15,4 +15,7 @@
 // Корневой пакет сохраняет публичный API через прозрачные type-алиасы и
 // const-переэкспорты; маркерные ошибки которые используются потребителями
 // непосредственно через квалификатор contract.Err*, без переэкспорта.
+//
+// Copyright 2026 Victor N. Skurikhin
+// SPDX-License-Identifier: Apache-2.0
 package contract

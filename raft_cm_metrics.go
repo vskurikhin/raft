@@ -219,7 +219,8 @@ func (cm *ConsensusModule) uncommittedLogLenLocked() int {
 // statsSnapshot — согласованный снимок состояния CM для одного выпуска
 // периодического отчёта. Все значения скопированы; ссылок на карты, журнал
 // и другие изменяемые коллекции CM нет: даже пары соседей лежат в counters.peers
-// собственной копией среза.
+// собственной копией среза, а матрица сохранений — собственной копией набора
+// счётчиков.
 type statsSnapshot struct {
 	at       time.Time     // момент снятия; несёт монотонные часы
 	age      time.Duration // монотонный возраст CM от создания
@@ -229,14 +230,15 @@ type statsSnapshot struct {
 	term     int
 	latency  latencyReport
 	counters statsCountersSnapshot
+	persist  persistenceSnapshot
 }
 
 // takeStatsSnapshot снимает состояние отчёта за один захват cm.mu: роль,
 // терм и ID, защищённые счётчики с суммами карт, пары соседей, размер
-// незафиксированного хвоста и момент снятия. Здесь же ровно один раз
-// выполняется сброс агрегатов латентности — как при включённом, так и при
-// выключенном выводе. Атомарные поля читаются через Load.
-// Блокировка берётся и снимается в этой функции.
+// незафиксированного хвоста, матрицу сохранений и момент снятия. Здесь же
+// ровно один раз выполняется сброс агрегатов латентности — как при
+// включённом, так и при выключенном выводе. Атомарные поля читаются через
+// Load. Блокировка берётся и снимается в этой функции.
 func (cm *ConsensusModule) takeStatsSnapshot() statsSnapshot {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
@@ -249,13 +251,16 @@ func (cm *ConsensusModule) takeStatsSnapshot() statsSnapshot {
 		term:     cm.cmState.currentTerm,
 		latency:  cm.latency.snapshotAndReset(),
 		counters: cm.countersSnapshotLocked(),
+		persist:  cm.persistence.snapshot(),
 	}
 }
 
 // publishStats выполняет один выпуск периодического отчёта: снимает
-// согласованный снимок и, если вывод разрешён, пишет три строки в out —
-// латентность, счётчики Raft, PersistV1 — уже без cm.mu. Порядок строк
-// фиксирован; префикс всех трёх строк взят из одного снимка.
+// согласованный снимок CM и, если вывод разрешён, отдельный диагностический
+// снимок хранилища и пишет три строки в out — латентность, счётчики Raft,
+// PersistV1 — уже без cm.mu. Порядок строк фиксирован; префикс всех трёх
+// строк взят из одного снимка CM, а момент снимка Storage у PersistV1
+// собственный.
 //
 // Первая неуспешная строка прекращает текущий выпуск; ошибка становится
 // липкой и публикуется в следующей успешной PersistV1. Одна диагностическая
@@ -272,6 +277,7 @@ func (cm *ConsensusModule) publishStats(out, diag io.Writer) {
 	if cm.disableStatsOutput {
 		return
 	}
+	storage := takeStorageDiagnostics(cm.storage)
 	cm.statsSeq++
 	prefix := tracelog.FormatPrefix(tracelog.Prefix{
 		Letter: stateLetter(snap.role),
@@ -281,7 +287,7 @@ func (cm *ConsensusModule) publishStats(out, diag io.Writer) {
 	lines := []string{
 		prefix + snap.latency.format(),
 		prefix + snap.counters.report(),
-		prefix + snap.persistReport(cm.statsSeq, cm.statsOutputErr, _statsPersistLineLimit-len(prefix)),
+		prefix + snap.persistReport(cm.statsSeq, cm.statsOutputErr, storage, _statsPersistLineLimit-len(prefix)),
 	}
 	for _, line := range lines {
 		if err := writeStatsLine(out, line); err != nil {
