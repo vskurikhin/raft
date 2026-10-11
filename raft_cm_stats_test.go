@@ -165,8 +165,9 @@ func TestStatsPublishThreeLines(t *testing.T) {
 	if doc.Persist == nil {
 		t.Error("Persist = null, want матрицу сохранений")
 	}
-	if doc.Dirty != _statsGroupUnavailable || doc.Storage != _statsGroupUnavailable {
-		t.Errorf("Dirty/Storage = (%q, %q), want обе %q", doc.Dirty, doc.Storage, _statsGroupUnavailable)
+	if doc.Dirty != _statsGroupAvailable || doc.DirtyPeriods == nil || doc.Storage != _statsGroupUnavailable {
+		t.Errorf("Dirty/DirtyPeriods/Storage = (%q, %v, %q), want ok, документ и %q",
+			doc.Dirty, doc.DirtyPeriods, doc.Storage, _statsGroupUnavailable)
 	}
 	if doc.StorageSnapshotNs != nil {
 		t.Errorf("StorageSnapshotNs = %v, want null (возможность хранилища недоступна)", *doc.StorageSnapshotNs)

@@ -114,6 +114,9 @@ func (cm *ConsensusModule) compactLogsLocked(compactIndex int) {
 	copy(kept, cm.cmState.log[pos:])
 	cm.cmState.log = kept
 	cm.cmState.logNeedsPersist = true
+	// Уплотнение переписывает журнал, но не добавляет записей: период
+	// отмечается с нулём добавлений.
+	cm.dirty.mark(dirtyCauseCompact, 0)
 	if pos > 0 {
 		cm.rebuildTermIndexMapLocked()
 	}
@@ -199,6 +202,9 @@ func (cm *ConsensusModule) dispatchLogsLocked(applyLogs []*logFuture) {
 	}
 	cm.setLastLogLocked(lastIndex, term)
 	cm.cmState.logNeedsPersist = true
+	// Добавления — длина фактически добавленного пакета, не разность
+	// индексов: замена суффикса считается по реально приписанному срезу.
+	cm.dirty.mark(dirtyCauseLeaderAppend, int64(len(applyLogs)))
 	cm.persistToStorageLocked(persistSourceLeaderAppend)
 	cm.leaderState.matchIndex[cm.id] = lastIndex
 

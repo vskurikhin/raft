@@ -81,6 +81,12 @@ func (cm *ConsensusModule) persistToStorageLocked(source persistSource) {
 		logLen = len(cm.cmState.log)
 		logBytes = logData.Len()
 		cm.storage.Set(_storageKeyLog, logData.Bytes())
+		// Период грязного журнала закрывается после успешного Set(log)
+		// и до прежнего сброса флага: возраст считается до этого момента,
+		// ожидание — от первой отметки до входа в сохранение. Обе операции
+		// выполняются под одним удержанием cm.mu, порядок на семантику
+		// не влияет.
+		cm.dirty.completeAt(start, time.Now())
 		cm.cmState.logNeedsPersist = false
 	}
 
