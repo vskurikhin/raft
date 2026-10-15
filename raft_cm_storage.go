@@ -42,33 +42,24 @@ const (
 // байты: повторного кодирования ради статистики нет. Метрики не влияют на
 // решение о сохранении и не создают записей Storage.
 //
+// Четыре скалярных значения кодируются через кэш последнего представления
+// (cm.scalarCache): неизменённое значение переиспользует готовые байты,
+// изменённое — кодируется заново прежним способом (gob(int) в собственный
+// bytes.Buffer). Кэш не означает долговечности: Set каждого скалярного
+// ключа выполняется при каждом вызове независимо от попадания в кэш.
+//
 // Требует удержания cm.mu — мьютекса владельца сохраняемого состояния.
 func (cm *ConsensusModule) persistToStorageLocked(source persistSource) {
 	start := time.Now()
 	full := cm.cmState.logNeedsPersist
-	var termData bytes.Buffer
-	if err := gob.NewEncoder(&termData).Encode(cm.cmState.currentTerm); err != nil {
-		log.Fatal(err)
-	}
-	cm.storage.Set(_storageKeyCurrentTerm, termData.Bytes())
-
-	var votedData bytes.Buffer
-	if err := gob.NewEncoder(&votedData).Encode(cm.cmState.votedFor); err != nil {
-		log.Fatal(err)
-	}
-	cm.storage.Set(_storageKeyVotedFor, votedData.Bytes())
-
-	var snapIdxData bytes.Buffer
-	if err := gob.NewEncoder(&snapIdxData).Encode(cm.cmState.lastSnapshotIndex); err != nil {
-		log.Fatal(err)
-	}
-	cm.storage.Set(_storageKeyLastSnapshotIndex, snapIdxData.Bytes())
-
-	var snapTermData bytes.Buffer
-	if err := gob.NewEncoder(&snapTermData).Encode(cm.cmState.lastSnapshotTerm); err != nil {
-		log.Fatal(err)
-	}
-	cm.storage.Set(_storageKeyLastSnapshotTerm, snapTermData.Bytes())
+	cm.storage.Set(_storageKeyCurrentTerm,
+		encodeScalarLocked(&cm.scalarCache.currentTerm, cm.cmState.currentTerm))
+	cm.storage.Set(_storageKeyVotedFor,
+		encodeScalarLocked(&cm.scalarCache.votedFor, cm.cmState.votedFor))
+	cm.storage.Set(_storageKeyLastSnapshotIndex,
+		encodeScalarLocked(&cm.scalarCache.lastSnapshotIndex, cm.cmState.lastSnapshotIndex))
+	cm.storage.Set(_storageKeyLastSnapshotTerm,
+		encodeScalarLocked(&cm.scalarCache.lastSnapshotTerm, cm.cmState.lastSnapshotTerm))
 
 	var logLen, logBytes int
 	if full {
