@@ -232,13 +232,22 @@ func (cm *ConsensusModule) appendMatchingEntriesLocked(
 				args.Entries[newEntriesIndex:], logInsertIndex,
 			)
 		}
+		// Замена затрагивает существующие записи, если точка вставки
+		// находится до конца прежнего журнала; чистый append конфликтом
+		// не считается. Счётчик растёт на мутацию, а не на сохранение.
+		oldLen := len(cm.cmState.log)
+		if logInsertPos < oldLen {
+			cm.persistence.markConflictSuffixReplacementLocked()
+		}
 		cm.cmState.log = append(cm.cmState.log[:logInsertPos], args.Entries[newEntriesIndex:]...)
 		if traceEnabled(_traceLevelLogDump) {
 			cm.traceSprintfLocked("... log is now: %v", cm.cmState.log)
 		}
 		cm.rebuildLastLogLocked()
 		cm.rebuildTermIndexMapLocked()
-		cm.cmState.logNeedsPersist = true
+		// Заменённый суффикс начинается с индекса первой фактически
+		// записанной записи; при нескольких мутациях сохраняется минимум.
+		cm.markLogSuffixDirtyLocked(logInsertIndex)
 		// Добавления — длина действительно приписанного остатка записей:
 		// совпавший префикс не считается, заменённые записи считаются,
 		// даже если последний индекс журнала уменьшился.

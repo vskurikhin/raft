@@ -38,9 +38,9 @@ type FileStorage struct {
 	fileSyncNS int64
 	dirSyncNS  int64
 
-	// write и read — экземплярные швы ввода-вывода. Заполняются
+	// write и read — наборы функций ввода-вывода для данного хранилища. Заполняются
 	// конструктором и после этого не мутируются, поэтому не требуют
-	// отдельной синхронизации. Операции швов вызываются внутри fs.mu на
+	// отдельной синхронизации. Функции вызываются при удержании fs.mu на
 	// всём цикле ключа от сравнения до обновления кэша.
 	write writeSeam
 	read  readSeam
@@ -50,9 +50,18 @@ type FileStorage struct {
 	// на каждом изменённом Set перезаписывается целиком. Массив — поле,
 	// а не локальная переменная: срез заголовка не должен уходить в кучу.
 	hdr [_headerSize]byte
+
+	// journal — кэш кодированного представления сохранённого журнала:
+	// записи, их индексы и размер принятого файла. Наполняется при загрузке
+	// каталога и обновляется только после успешной операции; незавершённый
+	// хвост в кэш не входит. Поле защищено fs.mu.
+	journal logCache
 }
 
-var _ contract.Storage = (*FileStorage)(nil)
+var (
+	_ contract.Storage    = (*FileStorage)(nil)
+	_ contract.LogStorage = (*FileStorage)(nil)
+)
 
 const (
 	// _dataFileSuffix — суффикс файла данных: каждый ключ Storage
@@ -74,6 +83,14 @@ const (
 	// CRC-32C: смена алгоритма контрольной суммы без version=2
 	// недопустима.
 	_formatVersion uint16 = 1
+
+	// _logKey — зарезервированный ключ журнала. В режиме L3 журнал читается
+	// и пишется только операциями LogStorage: прямой Set завершается
+	// немедленно, Get возвращает отсутствие.
+	_logKey = "log"
+
+	// _logFileName — имя файла журнала в каталоге данных.
+	_logFileName = _logKey + _dataFileSuffix
 )
 
 // _magic — сигнатура кадра: байты ASCII "RAFTPST" и завершающий 0x00.
@@ -135,15 +152,15 @@ type writeAtFile interface {
 	WriteAt(b []byte, off int64) (int, error)
 }
 
-// writeSeam — закрытый набор операций записи кадра. Экземпляр шва —
+// writeSeam — закрытый набор подменяемых операций записи кадра. Хранится как
 // неизменяемое поле FileStorage: заполняется в конструкторе и после этого
 // не мутируется, поэтому не требует синхронизации. Все операции вызываются
 // под fs.mu. Расширение набора операций требует отдельного решения.
 //
 // Операции над файлами получают уже собранный полный путь (createTmp —
-// временного файла, rename — исходного и конечного): так шов повторяет
-// прежний профиль аллокаций производственного пути и не добавляет
-// повторных соединений пути на каждом изменённом Set. Каталог dir
+// временного файла, rename — исходного и конечного): так сохраняется
+// прежний профиль выделения памяти и не требуется повторное
+// соединение частей пути на каждом изменённом Set. Каталог dir
 // передаётся отдельно — он нужен тестовым реализациям, чтобы отличать
 // хранилища; реализация по умолчанию использует переданные пути напрямую.
 type writeSeam struct {
@@ -154,15 +171,25 @@ type writeSeam struct {
 	closeFile    func(f writeAtFile) error
 	rename       func(dir, from, to string) error
 	syncDir      func(dir string) error
+
+	// openLog и writeLog — операции обычного добавления пакета в конец уже
+	// опубликованного журнала. Открытие отдаёт дескриптор и текущий размер
+	// файла; запись идёт по смещению конца принятого журнала. Отдельные
+	// операции от записи скалярного ключа позволяют проверить матрицу
+	// отказов обычного добавления (открытие, короткая запись, синхронизация,
+	// закрытие) без подмены пакетных функций.
+	openLog  func(dir, name string) (writeAtFile, int64, error)
+	writeLog func(f writeAtFile, b []byte, off int64) error
 }
 
 // readSeam — закрытый набор операций чтения каталога и файлов данных.
-// Правила владения и вызова те же, что у шва записи.
+// Правила владения и вызова те же, что у набора операций записи writeSeam.
 type readSeam struct {
 	readDir     func(dir string) ([]entry, error)
 	lstat       func(dir, name string) (entryType, error)
 	openRegular func(dir, name string) (f readFile, size int64, err error)
 	readAll     func(f readFile, n int) ([]byte, error)
+	readWhole   func(f readFile, size int64) ([]byte, error)
 	closeRead   func(f readFile) error
 }
 
@@ -176,6 +203,8 @@ func defaultWriteSeam() writeSeam {
 		closeFile:    closeFileHandle,
 		rename:       renameFile,
 		syncDir:      syncDir,
+		openLog:      openLogFile,
+		writeLog:     writeLogAt,
 	}
 }
 
@@ -186,6 +215,7 @@ func defaultReadSeam() readSeam {
 		lstat:       lstatEntryType,
 		openRegular: openRegularFile,
 		readAll:     readAllAt,
+		readWhole:   readWholeAt,
 		closeRead:   closeReadFile,
 	}
 }
@@ -216,7 +246,7 @@ func writeAllAt(f writeAtFile, b []byte, off int64) error {
 		return err
 	}
 	if n < len(b) {
-		return fmt.Errorf("короткая запись: %d из %d байт", n, len(b))
+		return fmt.Errorf("short write: %d of %d bytes", n, len(b))
 	}
 	return nil
 }
@@ -225,7 +255,7 @@ func writeAllAt(f writeAtFile, b []byte, off int64) error {
 func syncFileHandle(f writeAtFile) error {
 	file, ok := f.(*os.File)
 	if !ok {
-		return fmt.Errorf("синхронизация: неожиданный тип дескриптора %T", f)
+		return fmt.Errorf("sync: unexpected handle type %T", f)
 	}
 	return file.Sync()
 }
@@ -234,7 +264,7 @@ func syncFileHandle(f writeAtFile) error {
 func closeFileHandle(f writeAtFile) error {
 	file, ok := f.(*os.File)
 	if !ok {
-		return fmt.Errorf("закрытие: неожиданный тип дескриптора %T", f)
+		return fmt.Errorf("close: unexpected handle type %T", f)
 	}
 	return file.Close()
 }
@@ -243,6 +273,28 @@ func closeFileHandle(f writeAtFile) error {
 // не используется: пути уже собраны вызывающим.
 func renameFile(_, from, to string) error {
 	return os.Rename(from, to)
+}
+
+// openLogFile открывает опубликованный журнал для обычного добавления и
+// возвращает дескриптор вместе с размером файла из fstat. Дескриптор не
+// хранится между вызовами: он закрывается в том же стеке операции.
+func openLogFile(dir, name string) (writeAtFile, int64, error) {
+	f, err := os.OpenFile(filepath.Join(dir, name), os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, 0, err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, 0, err
+	}
+	return f, info.Size(), nil
+}
+
+// writeLogAt пишет пакет по смещению конца принятого журнала.
+// Короткая запись — ошибка.
+func writeLogAt(f writeAtFile, b []byte, off int64) error {
+	return writeAllAt(f, b, off)
 }
 
 // readDirEntries возвращает имена и типы записей каталога без следования
@@ -307,7 +359,7 @@ func readAllAt(f readFile, n int) ([]byte, error) {
 	buf := make([]byte, n)
 	got, err := f.ReadAt(buf, _headerSize)
 	if got < n {
-		return nil, fmt.Errorf("короткое чтение: %d из %d байт", got, n)
+		return nil, fmt.Errorf("short read: %d of %d bytes", got, n)
 	}
 	if err != nil {
 		return nil, err
@@ -319,9 +371,30 @@ func readAllAt(f readFile, n int) ([]byte, error) {
 func closeReadFile(f readFile) error {
 	file, ok := f.(*os.File)
 	if !ok {
-		return fmt.Errorf("закрытие: неожиданный тип дескриптора %T", f)
+		return fmt.Errorf("close: unexpected handle type %T", f)
 	}
 	return file.Close()
+}
+
+// readWholeAt читает файл журнала целиком от нулевого смещения: пакетный
+// формат проверяется по всему содержимому, поэтому размер файла и его байты
+// обязаны относиться к одному состоянию. Короткое чтение — ошибка.
+func readWholeAt(f readFile, size int64) ([]byte, error) {
+	if size < 0 {
+		return nil, fmt.Errorf("negative log file size %d", size)
+	}
+	if size == 0 {
+		return []byte{}, nil
+	}
+	buf := make([]byte, size)
+	n, err := f.ReadAt(buf, 0)
+	if int64(n) < size {
+		if err == nil {
+			err = io.ErrUnexpectedEOF
+		}
+		return nil, fmt.Errorf("short log read: %d of %d bytes: %w", n, size, err)
+	}
+	return buf, nil
 }
 
 // NewFileStorage создаёт FileStorage в указанной директории, создавая её
@@ -346,9 +419,9 @@ func NewFileStorage(dir string) *FileStorage {
 	return fs
 }
 
-// newFileStorage собирает хранилище с заданными швами, не создавая каталог
-// и не выполняя загрузку. Неэкспортируемый конструктор пакета: тесты
-// внедряют через него собственные реализации швов, не подменяя пакетные
+// newFileStorage собирает хранилище с заданными наборами функций ввода-вывода,
+// не создавая каталог и не выполняя загрузку. Неэкспортируемый конструктор пакета:
+// тесты передают через него собственные реализации файловых операций, не подменяя пакетные
 // переменные-функции, которые разделялись бы всеми экземплярами.
 func newFileStorage(dir string, write writeSeam, read readSeam) *FileStorage {
 	return &FileStorage{
@@ -381,6 +454,9 @@ func newFileStorage(dir string, write writeSeam, read readSeam) *FileStorage {
 //
 //nolint:gocritic // log.Fatalf завершает процесс: отложенное снятие на пути ошибки не наблюдаемо
 func (fs *FileStorage) Set(key string, value []byte) {
+	if key == _logKey {
+		log.Fatalf("FileStorage.Set: ключ %q зарезервирован: журнал пишут операции LogStorage", key)
+	}
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
@@ -459,11 +535,15 @@ func (fs *FileStorage) buildHeader(value []byte) {
 	binary.BigEndian.PutUint32(fs.hdr[20:24], crc32.Checksum(value, _crc32c))
 }
 
-// Get возвращает значение key из in-memory кэша.
+// Get возвращает значение key из in-memory кэша. Для зарезервированного
+// ключа журнала возвращает отсутствие: журнал читают через LoadLog.
 //
 // Возвращается защитная копия: вызывающий может мутировать полученный срез,
 // не затрагивая ни кэш, ни содержимое диска.
 func (fs *FileStorage) Get(key string) ([]byte, bool) {
+	if key == _logKey {
+		return nil, false
+	}
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	v, ok := fs.data[key]
@@ -532,8 +612,16 @@ func (fs *FileStorage) loadAll() error {
 			return fmt.Errorf("%s: stat: %w", filepath.Join(fs.dir, e.name), err)
 		}
 		if typ != entryRegular {
-			return fmt.Errorf("%s: %s, отказ старта: Storage не создаёт таких имён",
+			return fmt.Errorf("%s: %s, startup refused: Storage does not create such names",
 				filepath.Join(fs.dir, e.name), typ)
+		}
+		// Файл журнала имеет собственную роль и пакетный формат;
+		// скалярные ключи остаются на кадре версии 1.
+		if e.name == _logFileName {
+			if err := fs.loadLogFile(e.name); err != nil {
+				return err
+			}
+			continue
 		}
 		if err := fs.loadFile(e.name); err != nil {
 			return err
@@ -575,34 +663,293 @@ func (fs *FileStorage) readFrame(f readFile, size int64, path string) ([]byte, e
 		if err == nil {
 			err = io.ErrUnexpectedEOF
 		}
-		return nil, fmt.Errorf("%s: усечённый заголовок: %d из %d байт: %w", path, n, len(hdr), err)
+		return nil, fmt.Errorf("%s: truncated header: %d of %d bytes: %w", path, n, len(hdr), err)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("%s: чтение заголовка: %w", path, err)
+		return nil, fmt.Errorf("%s: read header: %w", path, err)
 	}
 	if !bytes.Equal(hdr[:8], _magic[:]) {
-		return nil, fmt.Errorf("%s: неверная сигнатура кадра", path)
+		return nil, fmt.Errorf("%s: invalid frame signature", path)
 	}
 	if v := binary.BigEndian.Uint16(hdr[8:10]); v != _formatVersion {
-		return nil, fmt.Errorf("%s: неподдерживаемая версия кадра %d", path, v)
+		return nil, fmt.Errorf("%s: unsupported frame version %d", path, v)
 	}
 	if r := binary.BigEndian.Uint16(hdr[10:12]); r != 0 {
-		return nil, fmt.Errorf("%s: ненулевое зарезервированное поле %d", path, r)
+		return nil, fmt.Errorf("%s: non-zero reserved field %d", path, r)
 	}
 	length := binary.BigEndian.Uint64(hdr[12:20])
 	if size < _headerSize || length != uint64(size-_headerSize) {
-		return nil, fmt.Errorf("%s: длина кадра %d не совпадает с размером файла %d", path, length, size)
+		return nil, fmt.Errorf("%s: frame length %d does not match file size %d", path, length, size)
 	}
 	if length > uint64(math.MaxInt) {
-		return nil, fmt.Errorf("%s: длина кадра %d превышает предел платформы", path, length)
+		return nil, fmt.Errorf("%s: frame length %d exceeds platform limit", path, length)
 	}
 	want := binary.BigEndian.Uint32(hdr[20:24])
 	payload, err := fs.read.readAll(f, int(length))
 	if err != nil {
-		return nil, fmt.Errorf("%s: чтение payload: %w", path, err)
+		return nil, fmt.Errorf("%s: read payload: %w", path, err)
 	}
 	if got := crc32.Checksum(payload, _crc32c); got != want {
-		return nil, fmt.Errorf("%s: несовпадение контрольной суммы: получено %d, ожидалось %d", path, got, want)
+		return nil, fmt.Errorf("%s: checksum mismatch: got %d, want %d", path, got, want)
 	}
 	return payload, nil
+}
+
+// loadLogFile проверяет и загружает файл журнала версии 2: заголовок файла
+// и кадры пакетов целиком. Структурный разбор не декодирует gob Data — это
+// выполняет LoadLog после регистрации типов потребителем. Незавершённый
+// последний пакет после целой базы отбрасывается и запоминается для
+// нормализации перед следующей записью; повреждение любого целого пакета
+// или базы — ошибка старта.
+func (fs *FileStorage) loadLogFile(name string) error {
+	path := filepath.Join(fs.dir, name)
+	f, size, err := fs.read.openRegular(fs.dir, name)
+	if err != nil {
+		return fmt.Errorf("%s: open: %w", path, err)
+	}
+	raw, err := fs.read.readWhole(f, size)
+	if err != nil {
+		_ = fs.read.closeRead(f)
+		return fmt.Errorf("%s: read: %w", path, err)
+	}
+	if err := fs.read.closeRead(f); err != nil {
+		return fmt.Errorf("%s: close: %w", path, err)
+	}
+	scan, err := scanLogFile(raw)
+	if err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	entries := make([]encodedLogEntry, len(scan.entries))
+	for i := range scan.entries {
+		entry := &scan.entries[i]
+		entries[i] = encodedLogEntry{
+			index: entry.index,
+			term:  entry.term,
+			typ:   entry.typ,
+			data:  slices.Clone(entry.data),
+		}
+	}
+	fs.journal = logCache{exists: true, entries: entries, validEnd: scan.validEnd, tail: scan.tail}
+	fs.hasData = true
+	return nil
+}
+
+// StoreLogEntries реализует LogStorage: атомарная замена сохранённого
+// суффикса журнала от абсолютного fromIndex. Обычное добавление дописывает
+// один пакет в конец уже опубликованного файла; конфликт и усечение
+// собирают новый файл атомарной заменой. Ошибка валидации, кодирования или
+// ввода-вывода завершает процесс: успешный возврат при незакреплённых
+// данных запрещён.
+//
+//nolint:gocritic // log.Fatalf завершает процесс: отложенное снятие на пути ошибки не наблюдаемо
+func (fs *FileStorage) StoreLogEntries(fromIndex int, entries []contract.LogEntry) contract.LogWriteResult {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	result, err := fs.storeLogEntriesLocked(fromIndex, entries)
+	if err != nil {
+		log.Fatalf("FileStorage.StoreLogEntries: %v", err)
+	}
+	return result
+}
+
+// RewriteLog реализует LogStorage: полная замена журнала, включая создание
+// пустого, атомарной публикацией нового файла. Ошибка завершает процесс.
+//
+//nolint:gocritic // log.Fatalf завершает процесс: отложенное снятие на пути ошибки не наблюдаемо
+func (fs *FileStorage) RewriteLog(entries []contract.LogEntry) contract.LogWriteResult {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	result, err := fs.rewriteLogLocked(entries)
+	if err != nil {
+		log.Fatalf("FileStorage.RewriteLog: %v", err)
+	}
+	return result
+}
+
+// LoadLog реализует LogStorage: возвращает независимый граф сохранённых
+// записей. Отсутствующий журнал даёт ErrLogNotFound; незавершённый хвост
+// уже отброшен при загрузке, а сам файл здесь не изменяется. Ошибка
+// декодирования Data возвращается вызывающему.
+func (fs *FileStorage) LoadLog() ([]contract.LogEntry, error) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	return fs.loadLogLocked()
+}
+
+// applyLogCache обновляет кэш после успешной записи. Вызов допустим только
+// на полностью успешном пути: при ошибке кэш остаётся соответствующим
+// последнему опубликованному состоянию файла.
+func (fs *FileStorage) applyLogCache(entries []encodedLogEntry, validEnd int) {
+	fs.journal = logCache{exists: true, entries: entries, validEnd: validEnd}
+	fs.hasData = true
+}
+
+// storeLogEntriesLocked выполняет замену суффикса под fs.mu. Требует
+// удержания fs.mu; публичный StoreLogEntries превращает ошибку в отказ
+// процесса. Нормализация незавершённого хвоста выполняется до проверки
+// размера файла: до неё превышение validEnd законно.
+func (fs *FileStorage) storeLogEntriesLocked(fromIndex int, entries []contract.LogEntry) (contract.LogWriteResult, error) {
+	var result contract.LogWriteResult
+
+	if fs.journal.tail {
+		written, err := fs.normalizeLogLocked()
+		if err != nil {
+			return contract.LogWriteResult{}, err
+		}
+		result.BytesWritten += uint64(written)
+		result.Writes++
+	}
+
+	if !fs.journal.exists {
+		return contract.LogWriteResult{}, errLogMissing
+	}
+
+	encoded, err := encodeLogEntries(entries)
+	if err != nil {
+		return contract.LogWriteResult{}, err
+	}
+	if err := checkStoreRange(&fs.journal, fromIndex, encoded); err != nil {
+		return contract.LogWriteResult{}, err
+	}
+
+	// Логический no-op: пустой журнал с пустым набором либо позиция строго
+	// за последней записью. Ввода-вывода нет; нормализация хвоста, если она
+	// была, уже учтена выше.
+	if len(encoded) == 0 && (len(fs.journal.entries) == 0 || fromIndex == fs.journal.lastIndex()+1) {
+		return result, nil
+	}
+
+	// Обычное добавление: позиция за последней записью непустого журнала
+	// либо непустая вставка в существующий пустой журнал.
+	if len(fs.journal.entries) == 0 || fromIndex == fs.journal.lastIndex()+1 {
+		written, err := fs.appendJournalLocked(encoded)
+		if err != nil {
+			return contract.LogWriteResult{}, err
+		}
+		result.BytesWritten += uint64(written)
+		result.Writes++
+		return result, nil
+	}
+
+	// Конфликт либо чистое усечение: сохраняемый префикс и новые записи
+	// собираются в один пакет одной атомарной заменой файла. Совпадающий
+	// по байтам суффикс изменением не считается и ввода-вывода не делает.
+	keep := fromIndex - fs.journal.firstIndex()
+	if encodedSuffixEqual(fs.journal.entries, keep, encoded) {
+		return result, nil
+	}
+	combined := make([]encodedLogEntry, 0, keep+len(encoded))
+	combined = append(combined, fs.journal.entries[:keep]...)
+	combined = append(combined, encoded...)
+	written, err := fs.rewriteJournalLocked(combined)
+	if err != nil {
+		return contract.LogWriteResult{}, err
+	}
+	result.BytesWritten += uint64(written)
+	result.Writes++
+	return result, nil
+}
+
+// rewriteLogLocked выполняет полную замену журнала под fs.mu. Требует
+// удержания fs.mu; публичный RewriteLog превращает ошибку в отказ процесса.
+func (fs *FileStorage) rewriteLogLocked(entries []contract.LogEntry) (contract.LogWriteResult, error) {
+	encoded, err := encodeLogEntries(entries)
+	if err != nil {
+		return contract.LogWriteResult{}, err
+	}
+	written, err := fs.rewriteJournalLocked(encoded)
+	if err != nil {
+		return contract.LogWriteResult{}, err
+	}
+	return contract.LogWriteResult{BytesWritten: uint64(written), Writes: 1}, nil
+}
+
+// loadLogLocked возвращает независимый граф записей из кэша. Требует
+// удержания fs.mu.
+func (fs *FileStorage) loadLogLocked() ([]contract.LogEntry, error) {
+	if !fs.journal.exists {
+		return nil, contract.ErrLogNotFound
+	}
+	return decodeCachedEntries(fs.journal.entries)
+}
+
+// appendJournalLocked дописывает один пакет в конец опубликованного журнала:
+// открытие, проверка размера против принятого конца, позиционная запись,
+// синхронизация файла и закрытие. Кэш обновляется только после успеха.
+// Требует удержания fs.mu.
+func (fs *FileStorage) appendJournalLocked(encoded []encodedLogEntry) (int, error) {
+	packet := encodeLogBatchEncoded(encoded)
+	path := filepath.Join(fs.dir, _logFileName)
+
+	f, size, err := fs.write.openLog(fs.dir, _logFileName)
+	if err != nil {
+		return 0, fmt.Errorf("open log %s: %w", path, err)
+	}
+	if int(size) != fs.journal.validEnd {
+		_ = fs.write.closeFile(f)
+		return 0, fmt.Errorf("log %s size is %d, want %d: external modification detected",
+			path, size, fs.journal.validEnd)
+	}
+	if err := fs.write.writeLog(f, packet, int64(fs.journal.validEnd)); err != nil {
+		_ = fs.write.closeFile(f)
+		return 0, fmt.Errorf("write batch %s: %w", path, err)
+	}
+	if err := fs.write.syncFile(f); err != nil {
+		_ = fs.write.closeFile(f)
+		return 0, fmt.Errorf("sync %s: %w", path, err)
+	}
+	if err := fs.write.closeFile(f); err != nil {
+		return 0, fmt.Errorf("close %s: %w", path, err)
+	}
+
+	fs.journal.entries = append(fs.journal.entries, encoded...)
+	fs.journal.validEnd += len(packet)
+	return len(packet), nil
+}
+
+// rewriteJournalLocked публикует новый файл журнала атомарной заменой:
+// временный файл с заголовком и одним пакетом, синхронизация, закрытие,
+// переименование и синхронизация каталога. Кэш принимает переданное
+// представление только после успеха. Требует удержания fs.mu.
+func (fs *FileStorage) rewriteJournalLocked(encoded []encodedLogEntry) (int, error) {
+	path := filepath.Join(fs.dir, _logFileName)
+	tmpPath := path + _tmpFileSuffix
+
+	f, err := fs.write.createTmp(fs.dir, tmpPath)
+	if err != nil {
+		return 0, fmt.Errorf("cannot create tmp file %s: %w", tmpPath, err)
+	}
+	header := encodeLogFileHeader()
+	if err := fs.write.writeHeader(f, header[:]); err != nil {
+		_ = fs.write.closeFile(f)
+		return 0, fmt.Errorf("write header %s: %w", tmpPath, err)
+	}
+	packet := encodeLogBatchEncoded(encoded)
+	if err := fs.write.writePayload(f, packet); err != nil {
+		_ = fs.write.closeFile(f)
+		return 0, fmt.Errorf("write payload %s: %w", tmpPath, err)
+	}
+	if err := fs.write.syncFile(f); err != nil {
+		_ = fs.write.closeFile(f)
+		return 0, fmt.Errorf("sync %s: %w", tmpPath, err)
+	}
+	if err := fs.write.closeFile(f); err != nil {
+		return 0, fmt.Errorf("close %s: %w", tmpPath, err)
+	}
+	if err := fs.write.rename(fs.dir, tmpPath, path); err != nil {
+		return 0, fmt.Errorf("rename %s -> %s: %w", tmpPath, path, err)
+	}
+	if err := fs.write.syncDir(fs.dir); err != nil {
+		return 0, fmt.Errorf("sync dir %s: %w", fs.dir, err)
+	}
+
+	fs.applyLogCache(encoded, len(header)+len(packet))
+	return fs.journal.validEnd, nil
+}
+
+// normalizeLogLocked нормализует незавершённый хвост однократной атомарной
+// заменой принятого журнала. Вызывается до новой записи и учитывается в её
+// результате. Требует удержания fs.mu.
+func (fs *FileStorage) normalizeLogLocked() (int, error) {
+	return fs.rewriteJournalLocked(fs.journal.entries)
 }

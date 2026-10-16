@@ -425,6 +425,10 @@ func newAliasTestCM(k int) *ConsensusModule {
 	cm.cmState.lastLogTerm = 1
 	cm.cmState.commitIndex = -1
 	cm.cmState.lastApplied = -1
+	// Хранилище приводится в соответствие памяти: журнал создаётся полной
+	// заменой, как после первого персиста. Состояние достижимо.
+	cm.storage.RewriteLog(cm.cmState.log)
+	cm.clearLogDirtyLocked()
 	return cm
 }
 

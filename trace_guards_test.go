@@ -327,7 +327,7 @@ func guardRootPackage() (string, []string, map[string]string, error) {
 			if err := dec.Decode(&pkg); err == io.EOF {
 				break
 			} else if err != nil {
-				guardRootErr = fmt.Errorf("разбор go list: %w", err)
+				guardRootErr = fmt.Errorf("parse go list: %w", err)
 				return
 			}
 			if pkg.Export != "" {
@@ -339,7 +339,7 @@ func guardRootPackage() (string, []string, map[string]string, error) {
 			}
 		}
 		if guardRootDir == "" || len(guardRootFiles) == 0 {
-			guardRootErr = errors.New("go list не вернул корневой пакет")
+			guardRootErr = errors.New("go list returned no root package")
 			return
 		}
 		sort.Strings(guardRootFiles)
@@ -376,11 +376,11 @@ func parseGuardPackage(t *testing.T) *guardPackage {
 	}
 	lookup := func(path string) (io.ReadCloser, error) {
 		if path == "unsafe" {
-			return nil, errors.New("для unsafe нет export data")
+			return nil, errors.New("no export data for unsafe")
 		}
 		ep, ok := export[path]
 		if !ok || ep == "" {
-			return nil, fmt.Errorf("нет export data для %q", path)
+			return nil, fmt.Errorf("no export data for %q", path)
 		}
 		return os.Open(ep)
 	}

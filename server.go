@@ -28,7 +28,7 @@ type Server struct {
 
 	fsm           FSM
 	snapshotStore SnapshotStore
-	storage       Storage
+	storage       LogStorage
 
 	cm        *ConsensusModule
 	transport TransportManager
@@ -89,7 +89,8 @@ type Config struct {
 	// снимка, при котором создаётся новый снимок (0 = дефолт конструктора).
 	SnapshotThreshold int
 
-	Storage Storage
+	// Storage — постоянное хранилище состояния узла с операциями журнала.
+	Storage LogStorage
 
 	// TickerTimeout — такт тикера выборов (0 = умолчание).
 	TickerTimeout time.Duration

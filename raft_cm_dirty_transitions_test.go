@@ -32,6 +32,10 @@ func newDirtyFollowerCM(t *testing.T, entries int) (*ConsensusModule, *store.Fil
 		cm.cmState.lastLogTerm = 1
 		cm.cmState.termIndexMap[1] = entries
 	}
+	// Хранилище приводится в соответствие памяти: посев выполняется полной
+	// заменой журнала, как после первого персиста. Состояние достижимо.
+	storage.RewriteLog(cm.cmState.log)
+	cm.clearLogDirtyLocked()
 	return cm, storage
 }
 
@@ -219,7 +223,8 @@ func TestDirtyTransitions_AppendEntriesCommitAdvanceSinglePeriod(t *testing.T) {
 	defer close(cm.shutdownCh)
 
 	before := dirtySnapshotOf(cm)
-	writesBefore := storage.WriteCount()
+	persistBefore := persistenceSnapshotOf(cm)
+	scalarsBefore := storage.WriteCount()
 
 	entries := []LogEntry{{Index: 0, Term: 1, Type: LogCommand, Data: "k0=v0"}}
 	var reply AppendEntriesReply
@@ -229,8 +234,12 @@ func TestDirtyTransitions_AppendEntriesCommitAdvanceSinglePeriod(t *testing.T) {
 	if !reply.Success {
 		t.Fatal("reply.Success = false, want true")
 	}
-	if got := storage.WriteCount() - writesBefore; got != 1 {
-		t.Fatalf("%d записей на продвижение фиксации, want 1", got)
+	persistAfter := persistenceSnapshotOf(cm)
+	if got := persistAfter.logWrites - persistBefore.logWrites; got != 1 {
+		t.Fatalf("%d записей журнала на продвижение фиксации, want 1", got)
+	}
+	if got := storage.WriteCount() - scalarsBefore; got != 0 {
+		t.Fatalf("%d скалярных записей на продвижение фиксации, want 0", got)
 	}
 
 	after := dirtySnapshotOf(cm)
@@ -367,7 +376,7 @@ func TestDirtyTransitions_RestoreCancelsInitial(t *testing.T) {
 	storage := store.NewMapStorage()
 	storage.Set(_storageKeyCurrentTerm, gobEncode(t, 3))
 	storage.Set(_storageKeyVotedFor, gobEncode(t, 1))
-	storage.Set(_storageKeyLog, gobEncode(t, []LogEntry{{Index: 0, Term: 1}}))
+	storage.RewriteLog([]LogEntry{{Index: 0, Term: 1}})
 
 	cm := &ConsensusModule{
 		storage:       storage,
@@ -379,7 +388,7 @@ func TestDirtyTransitions_RestoreCancelsInitial(t *testing.T) {
 	// в конструкторе до восстановления.
 	cm.cmState.lastSnapshotIndex = 9
 	cm.cmState.lastSnapshotTerm = 1
-	cm.cmState.logNeedsPersist = true
+	cm.markLogRewriteDirtyLocked()
 	cm.dirty.markAt(dirtyCauseInitial, 0, time.Now())
 
 	restoreData(cm)

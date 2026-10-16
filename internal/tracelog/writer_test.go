@@ -777,7 +777,7 @@ func TestTraceWriterTwoShutdownsWithLiveSenders(t *testing.T) {
 // последующие сообщения обрабатываются, частичная строка не
 // переписывается.
 func TestTraceWriterWriteErrorAndShortWrite(t *testing.T) {
-	errSink := errors.New("тестовый сбой приёмника")
+	errSink := errors.New("test sink failure")
 	start := time.Date(2026, 11, 11, 0, 0, 0, 0, time.UTC)
 
 	t.Run("error", func(t *testing.T) {

@@ -240,6 +240,10 @@ func newRedispatchLeaderCM(transport Transport) *ConsensusModule {
 	cm.leaderState.inflightAE[1].Store(false)
 	cm.leaderState.commitmentTracker = newCommitmentTracker(cm.id, 1, 0, cm.commitCh)
 	cm.leaderState.commitmentTracker.setConfiguration([]int{0, 1}, cm.lookupTermLocked)
+	// Хранилище приводится в соответствие памяти: журнал создаётся полной
+	// заменой, как после первого персиста. Состояние достижимо.
+	cm.storage.RewriteLog(cm.cmState.log)
+	cm.clearLogDirtyLocked()
 	return cm
 }
 

@@ -29,16 +29,16 @@ func (s shortWriteAt) WriteAt(b []byte, off int64) (int, error) {
 }
 
 // TestSetLocked_WriteFaultMatrix проверяет матрицу отказов записи: ошибка
-// каждой операции шва и короткая запись не скрываются, не дают успешного
+// каждой подменяемой файловой операции и короткая запись не скрываются, не дают успешного
 // возврата, не обновляют кэш, записи и наблюдения, а прежний файл данных
 // остаётся доступным (кроме отказа синхронизации каталога, где
 // переименование уже видно процессу).
 func TestSetLocked_WriteFaultMatrix(t *testing.T) {
-	injected := errors.New("инъекция отказа")
+	injected := errors.New("injected failure")
 
 	tests := []struct {
 		name string
-		// inject портит одну операцию базового шва.
+		// inject подменяет одну файловую операцию, чтобы имитировать её отказ.
 		inject func(w *writeSeam)
 		// fileMayChange отмечает отказ после успешного переименования:
 		// новый файл уже виден процессу, его долговечность не обещается.
@@ -109,8 +109,8 @@ func TestSetLocked_WriteFaultMatrix(t *testing.T) {
 
 			// Прежнее значение записывается штатным путём на диск.
 			seed := newFileStorage(dir, defaultWriteSeam(), defaultReadSeam())
-			seed.Set("log", []byte("old"))
-			before := readDatFile(t, dir, "log")
+			seed.Set("k", []byte("old"))
+			before := readDatFile(t, dir, "k")
 
 			seam := defaultWriteSeam()
 			tt.inject(&seam)
@@ -120,14 +120,14 @@ func TestSetLocked_WriteFaultMatrix(t *testing.T) {
 				t.Fatalf("loadAll: %v", err)
 			}
 
-			err := fs.setLocked("log", []byte("new"))
+			err := fs.setLocked("k", []byte("new"))
 			if err == nil {
 				t.Fatal("setLocked вернул nil, want отказ")
 			}
 
 			// Успешного возврата нет: кэш, счётчик записей и наблюдения не
 			// изменились.
-			if got, ok := fs.Get("log"); !ok || string(got) != "old" {
+			if got, ok := fs.Get("k"); !ok || string(got) != "old" {
 				t.Fatalf("кэш = %q, ok=%v, want old", got, ok)
 			}
 			if got := fs.WriteCount(); got != 0 {
@@ -139,7 +139,7 @@ func TestSetLocked_WriteFaultMatrix(t *testing.T) {
 			}
 
 			if !tt.fileMayChange {
-				after := readDatFile(t, dir, "log")
+				after := readDatFile(t, dir, "k")
 				if !bytes.Equal(before, after) {
 					t.Fatalf("файл данных изменён при отказе %s: %x -> %x", tt.name, before, after)
 				}
@@ -186,7 +186,7 @@ func TestSetLocked_WriterTrace(t *testing.T) {
 	}
 
 	fs := newFileStorage(t.TempDir(), seam, defaultReadSeam())
-	if err := fs.setLocked("log", []byte("value")); err != nil {
+	if err := fs.setLocked("k", []byte("value")); err != nil {
 		t.Fatalf("setLocked: %v", err)
 	}
 
@@ -200,7 +200,7 @@ func TestSetLocked_WriterTrace(t *testing.T) {
 // хранимый в поле FileStorage, не уходит в кучу: на изменённый Set
 // добавляется не более трёх строк пути и одной защитной копии значения.
 // Если бы заголовок собирался в локальном массиве и передавался через
-// поле-функцию шва, добавился бы ещё один объект — 24 байта на изменённый
+// поле-функцию writeSeam, добавился бы ещё один объект — 24 байта на изменённый
 // Set.
 func TestSetLocked_HeaderStaysOnInstance(t *testing.T) {
 	stub := writeSeam{
@@ -217,7 +217,7 @@ func TestSetLocked_HeaderStaysOnInstance(t *testing.T) {
 
 	allocs := testing.AllocsPerRun(100, func() {
 		value[0]++
-		if err := fs.setLocked("log", value); err != nil {
+		if err := fs.setLocked("k", value); err != nil {
 			t.Fatalf("setLocked: %v", err)
 		}
 	})
@@ -227,7 +227,7 @@ func TestSetLocked_HeaderStaysOnInstance(t *testing.T) {
 }
 
 // errPowerLoss — маркер потери питания в модели устойчивого носителя.
-var errPowerLoss = errors.New("внезапная потеря питания")
+var errPowerLoss = errors.New("sudden power loss")
 
 // mediumFile — дескриптор временного файла модели носителя.
 type mediumFile struct {
@@ -241,8 +241,8 @@ func (f *mediumFile) WriteAt(b []byte, off int64) (int, error) {
 	return len(b), nil
 }
 
-// powerLossMedium — детерминированная модель устойчивого носителя поверх
-// того же файлового шва: синхронизация файла закрепляет данные,
+// powerLossMedium — детерминированная модель устойчивого носителя, реализующая
+// тот же набор файловых операций: синхронизация файла закрепляет данные,
 // синхронизация каталога закрепляет переименование, потеря питания
 // отбрасывает всё незакреплённое. Модель не доказывает свойства
 // контроллера: соблюдение flush накопителем — внешняя предпосылка.
@@ -308,7 +308,7 @@ func (m *powerLossMedium) crash() {
 	m.pendingRenames = nil
 }
 
-// writeSeam собирает шов записи поверх модели.
+// writeSeam создаёт набор функций записи, работающих с моделью носителя.
 func (m *powerLossMedium) writeSeam() writeSeam {
 	return writeSeam{
 		createTmp: func(_, name string) (writeAtFile, error) {
@@ -370,10 +370,10 @@ func (m *powerLossMedium) writeSeam() writeSeam {
 	}
 }
 
-// readSeam собирает шов чтения поверх закреплённого состояния модели: при
+// readSeam создаёт набор функций чтения закреплённого состояния модели: при
 // необходимости перед этим вызывается crash, чтобы отбросить незакреплённое.
 // Имена в каталоге возвращаются без пути, содержимое берётся по полному
-// пути, как это делает штатный шов на os-функциях.
+// пути, как в обычной реализации на функциях пакета os.
 func (m *powerLossMedium) readSeam() readSeam {
 	return readSeam{
 		readDir: func(string) ([]entry, error) {
@@ -421,14 +421,14 @@ func TestFileStorage_PowerLossModel(t *testing.T) {
 	for crashAt := 0; crashAt <= 7; crashAt++ {
 		t.Run(fmt.Sprintf("сбой_на_%d", crashAt), func(t *testing.T) {
 			m := newPowerLossMedium(crashAt)
-			m.files["/data/log.dat"] = frameBytes([]byte("old"))
-			m.names["/data/log.dat"] = true
+			m.files["/data/k.dat"] = frameBytes([]byte("old"))
+			m.names["/data/k.dat"] = true
 
 			fs := newFileStorage("/data", m.writeSeam(), m.readSeam())
 			if err := fs.loadAll(); err != nil {
 				t.Fatalf("loadAll до записи: %v", err)
 			}
-			err := fs.setLocked("log", []byte("new"))
+			err := fs.setLocked("k", []byte("new"))
 
 			if crashAt == 0 {
 				if err != nil {
@@ -445,7 +445,7 @@ func TestFileStorage_PowerLossModel(t *testing.T) {
 			if loadErr := reopened.loadAll(); loadErr != nil {
 				t.Fatalf("повторная загрузка: %v", loadErr)
 			}
-			got, ok := reopened.Get("log")
+			got, ok := reopened.Get("k")
 			if !ok {
 				t.Fatal("ключ log отсутствует после сбоя")
 			}
@@ -494,10 +494,10 @@ func TestFileStorage_PowerLossFreshKey(t *testing.T) {
 	}
 }
 
-// TestFileStorageSeam_NoSharedState проверяет, что шов экземплярный: два
-// хранилища с разными внедрёнными швами работают параллельно, и воздействия
-// одного не наблюдаются другим. Прогон под -race ловит разделяемое
-// изменяемое состояние, если бы шов был общим.
+// TestFileStorageSeam_NoSharedState проверяет независимость наборов файловых
+// операций: два хранилища с разными реализациями работают параллельно,
+// и действия одного не влияют на другое. Запуск с -race выявляет гонки
+// при обращении к общему изменяемому состоянию.
 func TestFileStorageSeam_NoSharedState(t *testing.T) {
 	t.Parallel()
 
@@ -562,15 +562,15 @@ type nopWriteFile struct{}
 // WriteAt сообщает полную запись, ничего не сохраняя.
 func (nopWriteFile) WriteAt(b []byte, _ int64) (int, error) { return len(b), nil }
 
-// TestSetFatalOnWriteError проверяет, что публичный Set при отказе шва
+// TestSetFatalOnWriteError проверяет, что публичный Set при отказе файловой операции
 // завершает процесс: помощник запускается дочерним процессом, отказ
 // обнаруживается по ненулевому коду возврата и сообщению.
 func TestSetFatalOnWriteError(t *testing.T) {
 	if os.Getenv("STORE_FATAL_HELPER") == "1" {
 		seam := defaultWriteSeam()
-		seam.syncFile = func(writeAtFile) error { return errors.New("отказ синхронизации") }
+		seam.syncFile = func(writeAtFile) error { return errors.New("sync failed") }
 		fs := newFileStorage(t.TempDir(), seam, defaultReadSeam())
-		fs.Set("log", []byte("value"))
+		fs.Set("k", []byte("value"))
 		// log.Fatalf завершает процесс: возврат сюда недостижим.
 		return
 	}
@@ -588,7 +588,8 @@ func TestSetFatalOnWriteError(t *testing.T) {
 
 // TestSetKillBeforeAndAfterResponse проверяет реальный SIGKILL процесса,
 // пишущего через FileStorage, отдельно от модели потери питания. Помощник
-// блокируется внутри шва до ответа либо после ответа; родитель убивает его
+// блокируется в подменённой функции синхронизации файла до возврата из Set
+// либо после возврата из Set. Родитель завершает его сигналом SIGKILL
 // и перечитывает данные новым экземпляром.
 func TestSetKillBeforeAndAfterResponse(t *testing.T) {
 	if mode := os.Getenv("STORE_KILL_HELPER"); mode != "" {
@@ -614,7 +615,7 @@ func TestSetKillBeforeAndAfterResponse(t *testing.T) {
 			dir := t.TempDir()
 
 			seed := NewFileStorage(dir)
-			seed.Set("log", []byte("old"))
+			seed.Set("k", []byte("old"))
 
 			cmd := exec.Command(os.Args[0], "-test.run=^TestSetKillBeforeAndAfterResponse$")
 			cmd.Env = append(os.Environ(),
@@ -644,7 +645,7 @@ func TestSetKillBeforeAndAfterResponse(t *testing.T) {
 			_ = cmd.Wait()
 
 			reopened := NewFileStorage(dir)
-			got, ok := reopened.Get("log")
+			got, ok := reopened.Get("k")
 			if tt.wantOldKey {
 				if !ok || string(got) != "old" {
 					t.Fatalf("после kill до ответа log = %q, ok=%v, want old", got, ok)
@@ -675,12 +676,12 @@ func runKillHelper(mode string) {
 			select {}
 		}
 		fs := newFileStorage(dir, seam, defaultReadSeam())
-		fs.Set("log", []byte("new"))
+		fs.Set("k", []byte("new"))
 		return
 	}
 
 	fs := newFileStorage(dir, defaultWriteSeam(), defaultReadSeam())
-	fs.Set("log", []byte("new"))
+	fs.Set("k", []byte("new"))
 	_, _ = os.Stdout.WriteString("ready\n")
 	select {}
 }

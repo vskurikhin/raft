@@ -19,7 +19,7 @@ import (
 // -- Тесты единого периодического отчёта (RC-8): снимок, публикация,
 // -- независимое отключение вывода и учёт ошибок. --
 //
-// Правило детерминизма: seq и липкая ошибка принадлежат горутине stats.
+// Правило детерминизма: seq и сохранённая ошибка принадлежат горутине stats.
 // Все проверки этих значений выполняются на литеральном CM без запущенной
 // stats — прямой вызов публикации синхронно владеет состоянием. Проверки
 // живого Server наблюдают только синхронизированно собранный вывод.
@@ -40,7 +40,7 @@ const statsTestLatencyLine = "AE= 2.00ms, BatchingFSM= 0.00ms, Election= 0.00ms,
 // newStatsTestCM создаёт литеральный CM с детерминированным состоянием
 // отчёта: лидер терма 7 с двумя соседями, счётчиками и возрастом 2 с.
 // Горутины не запускаются, stats не работает — прямой вызов публикации
-// безопасен и единолично владеет seq и липкой ошибкой.
+// безопасен и единолично владеет seq и сохранённой ошибкой.
 func newStatsTestCM() *ConsensusModule {
 	return &ConsensusModule{
 		id: 2,
@@ -89,27 +89,27 @@ func statsBodyAfterPrefix(t *testing.T, line string) string {
 	return line[idx+2:]
 }
 
-// statsThirdLineBody возвращает тело третьей строки (PersistV1) без префикса.
+// statsThirdLineBody возвращает тело третьей строки без префикса.
 func statsThirdLineBody(t *testing.T, out string) string {
 	t.Helper()
 	lines := statsLines(t, out)
 	return statsBodyAfterPrefix(t, lines[2])
 }
 
-// statsDecodePersistV1 разбирает тело PersistV1 в документ схемы.
-func statsDecodePersistV1(t *testing.T, body string) statsPersistV1 {
+// statsDecodePersistV2 разбирает тело в документ схемы.
+func statsDecodePersistV2(t *testing.T, body string) statsPersistV2 {
 	t.Helper()
-	var doc statsPersistV1
+	var doc statsPersistV2
 	if err := json.Unmarshal([]byte(body), &doc); err != nil {
-		t.Fatalf("PersistV1 не является корректным JSON: %v\n%s", err, body)
+		t.Fatalf("PersistV2 не является корректным JSON: %v\n%s", err, body)
 	}
 	return doc
 }
 
 // TestStatsPublishThreeLines — базовый контракт разрешённого вывода:
 // одна публикация даёт ровно три строки в фиксированном порядке
-// (латентность, счётчики, PersistV1), все три несут префикс одного снимка,
-// старые форматы совпадают побайтово с эталонами, PersistV1 содержит
+// (латентность, счётчики), все три несут префикс одного снимка,
+// старые форматы совпадают побайтово с эталонами, PersistV2 содержит
 // обязательные поля, а окно латентности сброшено ровно один раз.
 func TestStatsPublishThreeLines(t *testing.T) {
 	cm := newStatsTestCM()
@@ -143,9 +143,9 @@ func TestStatsPublishThreeLines(t *testing.T) {
 		t.Fatalf("строка счётчиков:\n got = %q\nwant = %q", got, statsTestCountersLine)
 	}
 
-	doc := statsDecodePersistV1(t, statsThirdLineBody(t, out.String()))
-	if doc.Schema != 1 {
-		t.Errorf("Schema = %d, want 1", doc.Schema)
+	doc := statsDecodePersistV2(t, statsThirdLineBody(t, out.String()))
+	if doc.Schema != 2 {
+		t.Errorf("Schema = %d, want 2", doc.Schema)
 	}
 	if doc.Instance != 42 {
 		t.Errorf("Instance = %d, want 42", doc.Instance)
@@ -203,7 +203,7 @@ func TestStatsPublishThreeLines(t *testing.T) {
 }
 
 // TestStatsPublishDisabledCollectsNoOutput — stats-output=false:
-// публикация не пишет ни одного байта и не трогает seq/липкую ошибку,
+// публикация не пишет ни одного байта и не трогает seq/сохранённую ошибку,
 // но секундный сбор продолжается — окна латентности снимаются и сбрасываются
 // на каждой публикации, старые окна не накапливаются.
 func TestStatsPublishDisabledCollectsNoOutput(t *testing.T) {
@@ -245,9 +245,7 @@ func TestStatsPublishDisabledCollectsNoOutput(t *testing.T) {
 	}
 }
 
-// TestStatsPublishStopsAtFailingLine — матрица ошибок и коротких записей
-// каждой из трёх строк: выпуск прекращается на первой неуспешной строке,
-// ошибка становится липкой, а следующая успешная PersistV1 её показывает.
+// TestStatsPublishStopsAtFailingLine — матрица ошибок и коротких записей.
 // Проверка выполняется при уровне трассировки 0 (CM без трассировки)
 // и без traceWriter: учёт ошибок от него не зависит.
 func TestStatsPublishStopsAtFailingLine(t *testing.T) {
@@ -290,8 +288,8 @@ func TestStatsPublishStopsAtFailingLine(t *testing.T) {
 			}
 			sticky := cm.statsOutputErr
 
-			// Следующая успешная публикация: три строки, липкая ошибка
-			// в PersistV1, сам счётчик ошибки не очищается.
+			// Следующая успешная публикация:
+			// в PersistV2, сам счётчик ошибки не очищается.
 			var out bytes.Buffer
 			cm.publishStats(&out, io.Discard)
 			if cm.statsSeq != 2 {
@@ -300,9 +298,9 @@ func TestStatsPublishStopsAtFailingLine(t *testing.T) {
 			if cm.statsOutputErr != sticky {
 				t.Fatalf("липкая ошибка заменена: %v -> %v", sticky, cm.statsOutputErr)
 			}
-			doc := statsDecodePersistV1(t, statsThirdLineBody(t, out.String()))
+			doc := statsDecodePersistV2(t, statsThirdLineBody(t, out.String()))
 			if doc.OutputError == "" {
-				t.Fatal("PersistV1 успешной публикации не содержит липкую ошибку")
+				t.Fatal("PersistV2 успешной публикации не содержит липкую ошибку")
 			}
 			if doc.Seq != 2 {
 				t.Fatalf("Seq успешной публикации = %d, want 2", doc.Seq)
@@ -331,7 +329,7 @@ func TestStatsPublishDiagnosticFailureJoined(t *testing.T) {
 		t.Fatalf("липкая ошибка %q потеряла ошибку диагностики", text)
 	}
 
-	// Успешная диагностика: липкая ошибка остаётся ровно основной,
+	// Успешная диагностика: сохранённая ошибка остаётся ровно основной,
 	// лишние ошибки не появляются.
 	cm2 := newStatsTestCM()
 	var diag bytes.Buffer
@@ -412,7 +410,7 @@ func TestStatsSnapshotIndependentOfCM(t *testing.T) {
 	}
 }
 
-// TestStatsSeqAndInstance — ряд PersistV1: номер выпуска растёт на каждую
+// TestStatsSeqAndInstance — ряд PersistV2: номер выпуска растёт на каждую
 // попытку, экземпляр не меняется в пределах CM и различается у разных
 // экземпляров, включая создаваемые подряд.
 func TestStatsSeqAndInstance(t *testing.T) {
@@ -425,8 +423,8 @@ func TestStatsSeqAndInstance(t *testing.T) {
 	if len(all) != 6 {
 		t.Fatalf("строк за две публикации %d, ожидалось 6", len(all))
 	}
-	first := statsDecodePersistV1(t, statsBodyAfterPrefix(t, all[2]))
-	second := statsDecodePersistV1(t, statsBodyAfterPrefix(t, all[5]))
+	first := statsDecodePersistV2(t, statsBodyAfterPrefix(t, all[2]))
+	second := statsDecodePersistV2(t, statsBodyAfterPrefix(t, all[5]))
 	if first.Seq != 1 || second.Seq != 2 {
 		t.Fatalf("Seq = (%d, %d), want (1, 2)", first.Seq, second.Seq)
 	}
@@ -440,8 +438,8 @@ func TestStatsSeqAndInstance(t *testing.T) {
 	}
 }
 
-// TestStatsPersistReportLimit — предел 16 KiB относится только к PersistV1:
-// длинный текст липкой ошибки не превращает строку в обрезанный JSON,
+// TestStatsPersistReportLimit — предел 16 KiB относится только к PersistV2:
+// длинный текст сохранённой ошибки не превращает строку в обрезанный JSON,
 // документ остаётся корректным и не превышает предел, а признак превышения
 // виден в поле ошибки. Старая строка с соседями лимитом не ограничена.
 func TestStatsPersistReportLimit(t *testing.T) {
@@ -453,17 +451,17 @@ func TestStatsPersistReportLimit(t *testing.T) {
 
 	body := statsThirdLineBody(t, out.String())
 	if len(body) > _statsPersistLineLimit {
-		t.Fatalf("тело PersistV1 %d байт, предел %d", len(body), _statsPersistLineLimit)
+		t.Fatalf("тело PersistV2 %d байт, предел %d", len(body), _statsPersistLineLimit)
 	}
 	thirdLine := statsLines(t, out.String())[2]
 	if len(thirdLine) > _statsPersistLineLimit {
-		t.Fatalf("полная строка PersistV1 %d байт, предел %d", len(thirdLine), _statsPersistLineLimit)
+		t.Fatalf("полная строка PersistV2 %d байт, предел %d", len(thirdLine), _statsPersistLineLimit)
 	}
-	doc := statsDecodePersistV1(t, body)
+	doc := statsDecodePersistV2(t, body)
 	if doc.OutputError != _statsPersistOverflow {
 		t.Fatalf("OutputError = %q, want %q", doc.OutputError, _statsPersistOverflow)
 	}
-	if doc.Schema != 1 || doc.Seq != 1 || doc.Instance != 42 {
+	if doc.Schema != 2 || doc.Seq != 1 || doc.Instance != 42 {
 		t.Fatalf("аварийный документ потерял обязательные поля: %+v", doc)
 	}
 }

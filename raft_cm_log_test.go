@@ -95,6 +95,9 @@ func TestRebuildLastLog_AppendEntriesCallSite(t *testing.T) {
 	cm.cmState.lastSnapshotTerm = -1
 	cm.cmState.termIndexMap = make(map[int]int)
 	cm.cmState.commitIndex = -1
+	// Свежий узел до первого персиста: журнал создаётся полной заменой,
+	// как в производственном конструкторе. Состояние достижимо.
+	cm.markLogRewriteDirtyLocked()
 
 	var reply AppendEntriesReply
 	err := cm.AppendEntries(AppendEntriesArgs{
@@ -135,7 +138,7 @@ func TestRebuildLastLog_RestoreFromStorageCallSite(t *testing.T) {
 	storage := store.NewMapStorage()
 	storage.Set("currentTerm", gobEncode(t, 1))
 	storage.Set("votedFor", gobEncode(t, -1))
-	storage.Set("log", gobEncode(t, []LogEntry{}))
+	storage.RewriteLog([]LogEntry{})
 
 	cm := &ConsensusModule{storage: storage}
 	// Конструктор устанавливает lastSnapshotIndex = -1 до restoreFromStorage.
@@ -162,10 +165,10 @@ func TestRebuildLastLog_RestoreFromStorageNonEmptyLog(t *testing.T) {
 	storage := store.NewMapStorage()
 	storage.Set("currentTerm", gobEncode(t, 1))
 	storage.Set("votedFor", gobEncode(t, -1))
-	storage.Set("log", gobEncode(t, []LogEntry{
+	storage.RewriteLog([]LogEntry{
 		{Index: 0, Term: 1},
 		{Index: 1, Term: 1},
-	}))
+	})
 
 	cm := &ConsensusModule{storage: storage}
 	cm.cmState.lastSnapshotIndex = -1
