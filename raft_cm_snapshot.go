@@ -235,7 +235,9 @@ func (cm *ConsensusModule) installSnapshotStateLocked(meta *SnapshotMeta) {
 			)
 		}
 	}
-	cm.cmState.logNeedsPersist = true
+	// Установка снимка удаляет префикс либо очищает журнал: применяется
+	// полная замена.
+	cm.markLogRewriteDirtyLocked()
 	// Установка снимка переписывает журнал, но не добавляет записей:
 	// период отмечается с нулём добавлений.
 	cm.dirty.mark(dirtyCauseInstallSnapshot, 0)

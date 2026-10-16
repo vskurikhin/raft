@@ -373,7 +373,7 @@ func TestRestoreFromSnapshotStore_EmptyLogWithSnapshot(t *testing.T) {
 	storage := store.NewFileStorage(dir)
 	storage.Set("currentTerm", gobEncode(t, 1))
 	storage.Set("votedFor", gobEncode(t, 0))
-	storage.Set("log", gobEncode(t, []LogEntry{}))
+	storage.RewriteLog([]LogEntry{})
 	storage.Set("lastSnapshotIndex", gobEncode(t, 5))
 	storage.Set("lastSnapshotTerm", gobEncode(t, 1))
 
@@ -410,18 +410,35 @@ func TestRestoreFromSnapshotStore_EmptyLogWithSnapshot(t *testing.T) {
 	}
 }
 
-// recordingStorage — обёртка над Storage, фиксирующая последовательность Set.
+// recordingStorage — обёртка над LogStorage, фиксирующая последовательность
+// операций сохранения: скалярные Set и обе операции записи журнала.
+// Журнальная операция отражается псевдоключом "log", чтобы проверка порядка
+// «снимок-ключи до журнала» осталась прежней.
 type recordingStorage struct {
-	Storage
+	LogStorage
 	mu   sync.Mutex
 	keys []string
 }
 
-func (r *recordingStorage) Set(key string, value []byte) {
+func (r *recordingStorage) record(key string) {
 	r.mu.Lock()
 	r.keys = append(r.keys, key)
 	r.mu.Unlock()
-	r.Storage.Set(key, value)
+}
+
+func (r *recordingStorage) Set(key string, value []byte) {
+	r.record(key)
+	r.LogStorage.Set(key, value)
+}
+
+func (r *recordingStorage) StoreLogEntries(fromIndex int, entries []LogEntry) LogWriteResult {
+	r.record("log")
+	return r.LogStorage.StoreLogEntries(fromIndex, entries)
+}
+
+func (r *recordingStorage) RewriteLog(entries []LogEntry) LogWriteResult {
+	r.record("log")
+	return r.LogStorage.RewriteLog(entries)
 }
 
 func (r *recordingStorage) keysSnapshot() []string {
@@ -430,8 +447,49 @@ func (r *recordingStorage) keysSnapshot() []string {
 	return append([]string{}, r.keys...)
 }
 
-// persistKeys — ключи, которые вправе записывать persistToStorageLocked.
+// persistKeys — операции, которые вправе выполнять сохранение: четыре
+// скалярных ключа и запись журнала (отражается псевдоключом "log").
 var persistKeys = []string{"currentTerm", "votedFor", "lastSnapshotIndex", "lastSnapshotTerm", "log"}
+
+// journalWritesOf возвращает накопленное число фактических записей журнала
+// из матрицы сохранений CM: источник истины для «сколько реально записей
+// журнала сделал узел», независимый от счётчика скалярных записей хранилища.
+// Прямые вызовы с источником приспособления в публикуемые суммы не входят —
+// для них используется journalCountingStorage.
+func journalWritesOf(cm *ConsensusModule) int64 {
+	return persistenceSnapshotOf(cm).logWrites
+}
+
+// journalCountingStorage — обёртка LogStorage, суммирующая Writes из
+// результатов операций журнала. Наблюдение не зависит от источника
+// сохранения и пригодно для приспособлений с прямым вызовом.
+type journalCountingStorage struct {
+	LogStorage
+	mu     sync.Mutex
+	writes uint64
+}
+
+func (c *journalCountingStorage) StoreLogEntries(fromIndex int, entries []LogEntry) LogWriteResult {
+	result := c.LogStorage.StoreLogEntries(fromIndex, entries)
+	c.mu.Lock()
+	c.writes += result.Writes
+	c.mu.Unlock()
+	return result
+}
+
+func (c *journalCountingStorage) RewriteLog(entries []LogEntry) LogWriteResult {
+	result := c.LogStorage.RewriteLog(entries)
+	c.mu.Lock()
+	c.writes += result.Writes
+	c.mu.Unlock()
+	return result
+}
+
+func (c *journalCountingStorage) journalWrites() uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.writes
+}
 
 // persistToStorageForTest выполняет прямое сохранение в приспособлении.
 // Локальный захват и снятие cm.mu выполняются здесь же; источник test
@@ -492,10 +550,10 @@ func assertPersistKeyOrder(t *testing.T, keys []string) {
 func TestPersistToStorage_LogWrittenLast(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
-	rec := &recordingStorage{Storage: store.NewMapStorage()}
+	rec := &recordingStorage{LogStorage: store.NewMapStorage()}
 	cm := &ConsensusModule{storage: rec}
 	cm.cmState.log = []LogEntry{{Index: 5, Term: 1}}
-	cm.cmState.logNeedsPersist = true
+	cm.markLogRewriteDirtyLocked()
 
 	persistToStorageForTest(cm)
 
@@ -507,9 +565,10 @@ func TestPersistToStorage_LogWrittenLast(t *testing.T) {
 }
 
 // skippingStorage — хранилище, пропускающее запись части ключей: имитирует
-// слой, который не переписывает значения, уже лежащие на диске.
+// слой, который не переписывает значения, уже лежащие на диске. Журнальная
+// операция отражается ключом "log" и при запрете не выполняется.
 type skippingStorage struct {
-	Storage
+	LogStorage
 	allowed map[string]bool
 }
 
@@ -517,7 +576,21 @@ func (s *skippingStorage) Set(key string, value []byte) {
 	if !s.allowed[key] {
 		return
 	}
-	s.Storage.Set(key, value)
+	s.LogStorage.Set(key, value)
+}
+
+func (s *skippingStorage) StoreLogEntries(fromIndex int, entries []LogEntry) LogWriteResult {
+	if !s.allowed["log"] {
+		return LogWriteResult{}
+	}
+	return s.LogStorage.StoreLogEntries(fromIndex, entries)
+}
+
+func (s *skippingStorage) RewriteLog(entries []LogEntry) LogWriteResult {
+	if !s.allowed["log"] {
+		return LogWriteResult{}
+	}
+	return s.LogStorage.RewriteLog(entries)
 }
 
 // TestPersistToStorage_KeyOrderWithSkippedWrites проверяет, что пропуск записи
@@ -526,14 +599,14 @@ func (s *skippingStorage) Set(key string, value []byte) {
 func TestPersistToStorage_KeyOrderWithSkippedWrites(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
-	rec := &recordingStorage{Storage: store.NewMapStorage()}
+	rec := &recordingStorage{LogStorage: store.NewMapStorage()}
 	skipping := &skippingStorage{
-		Storage: rec,
-		allowed: map[string]bool{"currentTerm": true, "log": true},
+		LogStorage: rec,
+		allowed:    map[string]bool{"currentTerm": true, "log": true},
 	}
 	cm := &ConsensusModule{storage: skipping}
 	cm.cmState.log = []LogEntry{{Index: 5, Term: 1}}
-	cm.cmState.logNeedsPersist = true
+	cm.markLogRewriteDirtyLocked()
 
 	persistToStorageForTest(cm)
 
@@ -546,36 +619,49 @@ func TestPersistToStorage_KeyOrderWithSkippedWrites(t *testing.T) {
 
 // TestPersistToStorage_NoWritesWhenUnchanged проверяет, что сохранение
 // неизменившегося состояния не выполняет записей на диск, а изменение журнала
-// выполняет ровно одну запись.
+// выполняет ровно одну запись журнала. Скалярные записи считает FileStorage,
+// записи журнала — матрица сохранений CM (счётчик FileStorage их не видит).
 func TestPersistToStorage_NoWritesWhenUnchanged(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	storage := store.NewFileStorage(t.TempDir())
-	cm := &ConsensusModule{storage: storage}
+	counter := &journalCountingStorage{LogStorage: storage}
+	cm := &ConsensusModule{storage: counter}
 	cm.cmState.currentTerm = 1
 	cm.cmState.votedFor = -1
 	cm.cmState.lastSnapshotIndex = -1
 	cm.cmState.lastSnapshotTerm = -1
 	cm.cmState.log = []LogEntry{{Index: 0, Term: 1}}
-	cm.cmState.logNeedsPersist = true
+	cm.markLogRewriteDirtyLocked()
 
 	persistToStorageForTest(cm)
-	if got := storage.WriteCount(); got != 5 {
-		t.Fatalf("writeCount = %d after first persist, want 5", got)
+	if got := storage.WriteCount(); got != 4 {
+		t.Fatalf("writeCount = %d after first persist, want 4 (четыре скаляра)", got)
+	}
+	if got := counter.journalWrites(); got != 1 {
+		t.Fatalf("journal writes = %d after first persist, want 1 (создание журнала)", got)
 	}
 
-	before := storage.WriteCount()
+	beforeScalar := storage.WriteCount()
+	beforeJournal := counter.journalWrites()
 	persistToStorageForTest(cm)
-	if got := storage.WriteCount() - before; got != 0 {
-		t.Fatalf("%d writes for unchanged state, want 0", got)
+	if got := storage.WriteCount() - beforeScalar; got != 0 {
+		t.Fatalf("%d scalar writes for unchanged state, want 0", got)
+	}
+	if got := counter.journalWrites() - beforeJournal; got != 0 {
+		t.Fatalf("%d journal writes for unchanged state, want 0", got)
 	}
 
 	cm.cmState.log = append(cm.cmState.log, LogEntry{Index: 1, Term: 1})
-	cm.cmState.logNeedsPersist = true
-	before = storage.WriteCount()
+	cm.markLogSuffixDirtyLocked(1)
+	beforeScalar = storage.WriteCount()
+	beforeJournal = counter.journalWrites()
 	persistToStorageForTest(cm)
-	if got := storage.WriteCount() - before; got != 1 {
-		t.Fatalf("%d writes for changed log, want 1", got)
+	if got := storage.WriteCount() - beforeScalar; got != 0 {
+		t.Fatalf("%d scalar writes for changed log, want 0", got)
+	}
+	if got := counter.journalWrites() - beforeJournal; got != 1 {
+		t.Fatalf("%d journal writes for changed log, want 1", got)
 	}
 }
 
@@ -586,7 +672,7 @@ func TestCheckSnapshotKeysConsistency(t *testing.T) {
 	storage := store.NewMapStorage()
 	storage.Set("currentTerm", gobEncode(t, 1))
 	storage.Set("votedFor", gobEncode(t, 0))
-	storage.Set("log", gobEncode(t, []LogEntry{{Index: 5, Term: 1}}))
+	storage.RewriteLog([]LogEntry{{Index: 5, Term: 1}})
 	cm := &ConsensusModule{storage: storage}
 	cm.cmState.log = []LogEntry{{Index: 5, Term: 1}}
 	if err := cm.checkSnapshotKeysConsistency(); err == nil {
