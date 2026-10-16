@@ -232,16 +232,25 @@ func (cm *ConsensusModule) appendMatchingEntriesLocked(
 				args.Entries[newEntriesIndex:], logInsertIndex,
 			)
 		}
+		// Замена затрагивает существующие записи, если точка вставки
+		// находится до конца прежнего журнала; чистый append конфликтом
+		// не считается. Счётчик растёт на изменение, а не на сохранение.
+		oldLen := len(cm.cmState.log)
+		if logInsertPos < oldLen {
+			cm.persistence.markConflictSuffixReplacementLocked()
+		}
 		cm.cmState.log = append(cm.cmState.log[:logInsertPos], args.Entries[newEntriesIndex:]...)
 		if traceEnabled(_traceLevelLogDump) {
 			cm.traceSprintfLocked("... log is now: %v", cm.cmState.log)
 		}
 		cm.rebuildLastLogLocked()
 		cm.rebuildTermIndexMapLocked()
-		cm.cmState.logNeedsPersist = true
-		// Добавления — длина действительно приписанного остатка записей:
-		// совпавший префикс не считается, заменённые записи считаются,
-		// даже если последний индекс журнала уменьшился.
+		// Заменённый суффикс начинается с индекса первой фактически сохранённой записи;
+		// при нескольких изменениях сохраняется минимальное значение.
+		cm.markLogSuffixDirtyLocked(logInsertIndex)
+		// Добавления — длина фактически добавленного фрагмента записей:
+		// совпадающий префикс не учитывается, заменённые записи считаются,
+		// даже если итоговый индекс журнала уменьшился.
 		cm.dirty.mark(dirtyCauseFollowerAppend, int64(len(args.Entries)-newEntriesIndex))
 		// Если перезапись затронула конфигурацию, откатываем latest.
 		cm.processLogConflict(logInsertIndex)
@@ -399,7 +408,7 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 //
 // В отличие от RequestVote:
 //   - НЕ меняет votedFor, currentTerm
-//   - НЕ персистит состояние
+//   - НЕ сохраняет состояние на диск
 //   - НЕ переводит в Follower при args.Term > cm.cmState.currentTerm
 //   - Добавляет проверку: знает ли получатель о действующем лидере
 //

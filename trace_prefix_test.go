@@ -261,7 +261,7 @@ func TestTraceWriterLockedEnqueueReleasesCMLock(t *testing.T) {
 
 // TestTraceWriterSprintfLockedSnapshot доказывает, что общий
 // enqueueTraceSprintfLocked снимает карту, срез и указатель ответа в
-// строку синхронно под cm.mu: мутация после снятия блокировки не
+// строку синхронно под cm.mu: изменение после снятия блокировки не
 // изменяет записанный текст, гонки нет.
 func TestTraceWriterSprintfLockedSnapshot(t *testing.T) {
 	cm := newTraceTestFollower()
@@ -272,7 +272,7 @@ func TestTraceWriterSprintfLockedSnapshot(t *testing.T) {
 	w := startTraceTestWriter(t, sink, 16, clock.Now)
 
 	// Прогревочная строка задерживает писателя: текст ссылочного
-	// сообщения обязан быть снят до мутации.
+	// сообщения обязан быть снят до изменения.
 	w.EnqueueText(tracelog.Prefix{Letter: 'F', ID: 7, Term: 3}, "blocker")
 	waitTraceTestChan(t, started, "блокировки писателя")
 

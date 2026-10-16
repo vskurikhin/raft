@@ -9,7 +9,7 @@ import (
 
 // -- Узкие бенчмарки измерителя: путь трёх периодических строк целиком
 // -- (снимок, сортировка, форматирование, запись) на одном и том же
-// -- приспособлении. Бенчмарки персиста секундную статистику не вызывают,
+// -- приспособлении. Бенчмарки сохранения секундную статистику не вызывают,
 // -- поэтому её стоимость измеряется здесь отдельно. Пара Enabled/Disabled
 // -- различается только выбором вывода: сбор и сброс латентности выполняются
 // -- в обоих режимах, приспособление и приёмник совпадают. --
@@ -49,8 +49,8 @@ func newStatsBenchCM(disabled bool) *ConsensusModule {
 	cm := newStatsTestCM()
 	cm.disableStatsOutput = disabled
 	for _, source := range []persistSource{persistSourceApply, persistSourceAEFinish, persistSourceAECommit} {
-		cm.persistence.observe(source, true, time.Millisecond, 100, 4096)
-		cm.persistence.observe(source, false, 500*time.Microsecond, 0, 0)
+		cm.persistence.observe(source, true, time.Millisecond, 100, 4096, 1)
+		cm.persistence.observe(source, false, 500*time.Microsecond, 0, 0, 0)
 	}
 	base := time.Now().Add(-time.Second)
 	cm.dirty.markAt(dirtyCauseLeaderAppend, 16, base)

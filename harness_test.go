@@ -140,7 +140,7 @@ type Harness struct {
 
 // HarnessOption — опция конфигурации узлов Harness. Применяется к
 // каждому созданному ConsensusModule ДО close(ready), т.е. до старта
-// фоновых горутин (конфигурация — до старта, без post-start мутаций).
+// фоновых горутин (конфигурация — до старта, без изменений после запуска).
 // Поддерживает кластерное применение.
 type HarnessOption func(cm *ConsensusModule)
 
@@ -202,7 +202,7 @@ func NewHarnessWithOptions(t *testing.T, n int, opts ...HarnessOption) *Harness 
 			storage[i], NewCommitChannelFSM(commitChans[i]), ready,
 		)
 		// Опции применяются после конструктора (фоновые горутины узла уже
-		// запущены) и до close(ready); никакой post-start мутации.
+		// запущены) и до close(ready); никаких изменений после запуска.
 		for _, opt := range opts {
 			opt(cluster[i])
 		}
@@ -269,7 +269,7 @@ func (h *Harness) Shutdown() {
 // DisconnectPeer отключает сервер от всех остальных серверов кластера
 // через разрыв логического соединения в InmemTransport.
 //
-// Мутация connected — короткой секцией h.mu: операции над
+// Изменение connected — короткой секцией h.mu: операции над
 // транспортами выполняются вне блокировки.
 func (h *Harness) DisconnectPeer(id int) {
 	tlog("Disconnect %d", id)
@@ -291,7 +291,7 @@ func (h *Harness) DisconnectPeer(id int) {
 // участником кворума.
 //
 // Значения alive и connected снимаются под h.mu до работы с транспортами;
-// мутация connected — отдельной короткой секцией.
+// изменение connected — отдельной короткой секцией.
 func (h *Harness) ReconnectPeer(id int) {
 	tlog("Reconnect %d", id)
 	alive := h.aliveSnapshot()

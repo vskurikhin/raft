@@ -69,7 +69,7 @@ func (r *RequestVoteReply) GetRPCHeader() RPCHeader {
 }
 
 // RequestPreVoteArgs — аргументы RPC предварительного голосования (§4 Pre-Vote).
-// PreVote НЕ увеличивает currentTerm, НЕ меняет votedFor, НЕ персистится.
+// PreVote НЕ увеличивает currentTerm, НЕ меняет votedFor, НЕ сохраняется на диск.
 // Получатель проверяет только актуальность лога (log-safety) и наличие активного лидера.
 type RequestPreVoteArgs struct {
 	RPCHeader

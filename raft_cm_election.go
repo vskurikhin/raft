@@ -17,10 +17,8 @@ import (
 // термом (split vote).
 const _preVoteJitterMs = 50
 
-// forcedReelectionEnv — имя переменной окружения стресс-хука форсирования
-// выборов. Значение читается один раз при старте узла и кэшируется в
-// _forcedReelectionHook (ADR-CONF-011); тестовое смещение, в промышленных
-// запусках не задаётся.
+// forcedReelectionEnv — имя переменной окружения стресс-хука форсирования выборов.
+// Значение читается один раз при старте узла и кэшируется в _forcedReelectionHook.
 const forcedReelectionEnv = "RAFT_FORCE_MORE_REELECTION"
 
 // _forcedReelectionHook — кэш переменной окружения forcedReelectionEnv:

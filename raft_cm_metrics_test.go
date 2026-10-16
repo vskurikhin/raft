@@ -166,7 +166,7 @@ func TestLatencyZeroValueCMMetricPaths(t *testing.T) {
 	cm.latency.election.observe(time.Microsecond)
 
 	// Положительные парные утверждения: метрические пути действительно
-	// отработали, а не «прошли мимо» (P06R2-02).
+	// отработали, а не «прошли мимо».
 	if got := cm.latency.appendEntries.count.Load(); got < 1 {
 		t.Errorf("appendEntries.count = %d, want >= 1", got)
 	}
@@ -183,8 +183,8 @@ func TestLatencyZeroValueCMMetricPaths(t *testing.T) {
 
 // TestLatencyAttributionPerCM — (два литеральных CM). После observe
 // на CM1 обязаны выполняться одновременно CM1.count > 0 И CM2.count == 0:
-// парное положительное утверждение исключает вакуумный проход (P06R2-02).
-// Проверка по значениям агрегатов, без печатного вывода и без мутации _traceCM.
+// парное положительное утверждение исключает вакуумный проход.
+// Проверка по значениям агрегатов, без печатного вывода и без изменения _traceCM.
 func TestLatencyAttributionPerCM(t *testing.T) {
 	cm1 := new(ConsensusModule)
 	cm2 := new(ConsensusModule)
@@ -243,8 +243,8 @@ func TestLatencyTraceEnabledPredicate(t *testing.T) {
 // текст трассировки неудачного AE печатает фактически
 // присвоенное значение nextIndex (не ni-1) и поля matchIndex/ConflictIndex/
 // ConflictTerm — ровно тот набор, которого не хватило при разборе обоих
-// инцидентов. Формат проверяется через чистую функцию: мутация _traceCM и
-// _traceLogger в тестах запрещена (P06R2-02 T5c).
+// инцидентов. Формат проверяется через чистую функцию: изменение _traceCM и
+// _traceLogger в тестах запрещено.
 func TestFailedAETraceReportsActualNextIndex(t *testing.T) {
 	// Значения инцидента: фактически присвоенный nextIndex = 0 при
 	// matchIndex = 13490; старая трасса печатала бы «13490» (ni-1).

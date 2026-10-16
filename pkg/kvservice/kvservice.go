@@ -31,14 +31,16 @@ var _traceKV = 0
 // в файл функцией SetTrace.
 var _traceLogger = log.Default()
 
-// _traceConfigured — сторожевой флаг строгого set-once: единственная
-// успешная конфигурация трассировки на процесс уже выполнена.
-// Устанавливается только успешным вызовом SetTrace
-// (вызов, завершившийся ошибкой I/O, окно не расходует).
+// _traceConfigured — контракт set-once для конфигурации трассировки:
+// успешная настройка допускается только один раз на процесс.
+// Флаг переходит в true исключительно при успехе SetTrace;
+// ошибки I/O игнорируются с точки зрения флага — повторная
+// попытка конфигурации остаётся допустимой.
 var _traceConfigured atomic.Bool
 
-// _traceCMCreated — сторожевой флаг: в процессе уже создавался
-// KVService. Устанавливается конструктором New/NewKVService.
+// _traceCMCreated — флаг set-once: гарантирует, что KVService
+// создаётся не более одного раза за время жизни процесса.
+// Флаг устанавливается конструкторами New и NewKVService.
 var _traceCMCreated atomic.Bool
 
 // TraceConfig — параметры трассировки KV-сервиса, передаваемые SetTrace.
@@ -51,8 +53,8 @@ type TraceConfig struct {
 	Level int
 
 	// LogFile — путь к файлу журнала трассировки. Файл открывается в
-	// режиме добавления и создаётся при необходимости. Пустая строка
-	// означает вывод в стандартный логгер (stderr).
+	// режиме добавления и создаётся при необходимости.
+	// Пустая строка означает вывод в стандартный логгер (stderr).
 	LogFile string
 }
 
@@ -120,10 +122,10 @@ type KVService struct {
 	// фактический адрес при address == ":0" (GetHTTPListenAddr).
 	ln net.Listener
 
-	// serveErrCh — канал доставки ошибки http.Server.Serve (кроме
-	// штатного ErrServerClosed). Буфер 1: Serve завершается один раз.
-	// Заменяет прежний log.Fatal из Serve-горутины, недопустимый
-	// в тестах.
+	// serveErrCh — канал доставки ошибки http.Server.Serve
+	// (кроме штатного ErrServerClosed).
+	// Буфер 1: Serve завершается один раз.
+	// Заменяет прежний log.Fatal из Serve-горутины, недопустимый в тестах.
 	serveErrCh chan error
 
 	// shutdownOnce обеспечивает идемпотентность Shutdown.
@@ -149,16 +151,18 @@ type Config struct {
 
 // New создаёт новый экземпляр KVService с заданной конфигурацией cfg,
 // хранилищем storage и каналом уведомления readyChan.
-// cfg содержит параметры Raft-сервера (идентификатор, список узлов,
-// RPC-адрес) и HTTP-адрес для REST API сервиса.
+// cfg содержит параметры Raft-сервера
+// (идентификатор, список узлов, RPC-адрес) и HTTP-адрес для REST API сервиса.
 //
 // KVService реализует raft.FSM: зафиксированные записи журнала применяются
 // непосредственно к DataStore через метод Apply.
 func New(cfg *Config, readyChan <-chan any) *KVService {
 	gob.Register(Command{})
 
-	// Сторожевой флаг контракта трассировки: конфигурация SetTrace
-	// разрешена только до создания первого сервиса (строгий set-once).
+	// Контракт трассировки: SetTrace должен быть вызван
+	// строго до создания первого сервиса. Флаг гарантирует
+	// однократную конфигурацию (set-once) и блокирует
+	// любые попытки настройки после инициализации сервиса.
 	_traceCMCreated.Store(true)
 
 	kvs := &KVService{
@@ -185,14 +189,12 @@ func New(cfg *Config, readyChan <-chan any) *KVService {
 //     для создания TCP-транспорта.
 //   - id — идентификатор данного сервиса в кластере Raft.
 //   - peerIds — идентификаторы остальных узлов Raft в кластере.
-//   - storage — реализация интерфейса raft.Storage, используемая сервисом
+//   - storage — реализация интерфейса raft.LogStorage, используемая сервисом
 //     для долговременного хранения и сохранения своего состояния.
 //   - readyChan — канал уведомления, который должен быть закрыт после того,
-//     как кластер Raft будет готов к работе (все узлы запущены и соединены
-//     друг с другом).
-func NewKVService(address string, id int, peerIds []int, storage raft.Storage, readyChan <-chan any) *KVService {
-	// Нулевая структура TCPTimeouts означает использование значений по умолчанию для транспорта:
-	// конструктор подставляет вместо нулевых полей соответствующие константы из contract.
+//     как кластер Raft будет готов к работе
+//     (все узлы запущены и соединены друг с другом).
+func NewKVService(address string, id int, peerIds []int, storage raft.LogStorage, readyChan <-chan any) *KVService {
 	transport, err := transp.NewTCPTransport(address, transp.TCPTimeouts{}, 0)
 	if err != nil {
 		log.Fatalf("kvservice: failed to create TCP transport on %s: %v", address, err)
@@ -353,8 +355,8 @@ func (kvs *KVService) ServeErr() <-chan error {
 
 // Shutdown корректно завершает работу сервиса: останавливает RPC-сервер
 // Raft и основной HTTP-сервер. Метод возвращает управление только после
-// полного завершения процедуры остановки. Идемпотентен — повторные
-// вызовы безопасны и возвращают nil.
+// полного завершения процедуры остановки.
+// Идемпотентен — повторные вызовы безопасны и возвращают nil.
 //
 // Примечание: перед вызовом Shutdown необходимо вызвать
 // DisconnectFromRaftPeers для всех узлов кластера.

@@ -165,7 +165,7 @@ func TestAppendEntries_StaleTermFollower_NoStateChange(t *testing.T) {
 // candidateFromLeadershipTransfer не делает шаг вниз при AppendEntries от
 // старого лидера с равным или на единицу меньшим термом, и только терм строго
 // больше собственного приводит к переходу в Follower со сбросом флага. Во всех
-// трёх подслучаях узел обязан был персистить текущий терм.
+// трёх подслучаях узел обязан был сохранить на диск текущий терм.
 func TestAppendEntries_CandidateFromLeadershipTransfer_NoStepDown(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
@@ -228,7 +228,7 @@ func TestAppendEntries_CandidateFromLeadershipTransfer_NoStepDown(t *testing.T) 
 				t.Fatalf("case %q: candidateFromLeadershipTransfer = %t, want %t", tc.name, got, tc.wantFlag)
 			}
 
-			// Персист: ключ currentTerm присутствует и равен терму после вызова.
+			// Сохранение на диск: ключ currentTerm присутствует и равен терму после вызова.
 			data, ok := cm.storage.Get("currentTerm")
 			if !ok {
 				t.Fatalf("case %q: currentTerm not persisted", tc.name)

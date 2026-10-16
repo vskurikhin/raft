@@ -235,18 +235,21 @@ func (cm *ConsensusModule) installSnapshotStateLocked(meta *SnapshotMeta) {
 			)
 		}
 	}
-	cm.cmState.logNeedsPersist = true
+	// Установка снимка удаляет префикс либо очищает журнал:
+	// применяется полная замена.
+	cm.markLogRewriteDirtyLocked()
 	// Установка снимка переписывает журнал, но не добавляет записей:
 	// период отмечается с нулём добавлений.
 	cm.dirty.mark(dirtyCauseInstallSnapshot, 0)
 	cm.persistToStorageLocked(persistSourceInstallSnapshot)
 }
 
-// receiveAndSealSnapshot принимает тело снимка от лидера в приёмник
-// хранилища снимков и запечатывает его, возвращая идентификатор готового
-// снимка. На каждом ошибочном пути приёмник отменяется, а ошибка
-// возвращается вызывающему для ответа RPC.
-// Блокировку cm.mu не захватывает и не снимает.
+// receiveAndSealSnapshot принимает данные снимка от лидера, записывает их
+// в приёмник хранилища снимков и финализирует снимок (через Close), возвращая
+// его идентификатор.
+// При любой ошибке приёмник сбрасывается (sink.Cancel()), чтобы не оставить
+// частично записанный снимок, и ошибка возвращается для ответа RPC.
+// Метод не захватывает и не снимает блокировку cm.mu.
 func (cm *ConsensusModule) receiveAndSealSnapshot(
 	rpc RPC, req *InstallSnapshotRequest, cfg Configuration,
 ) (sinkID string, err error) {

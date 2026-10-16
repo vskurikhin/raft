@@ -83,8 +83,12 @@ type (
 
 // Типы из contract/storage.go и contract/snapshot_store.go.
 type (
-	// Storage — интерфейс поставщика постоянного хранилища.
+	// Storage — интерфейс абстракции над постоянным хранилищем.
 	Storage = contract.Storage
+	// LogStorage — интерфейс хранилища журнала Raft.
+	LogStorage = contract.LogStorage
+	// LogWriteResult — результат операции записи журнала.
+	LogWriteResult = contract.LogWriteResult
 	// SnapshotStore — хранилище снимков Raft.
 	SnapshotStore = contract.SnapshotStore
 )

@@ -45,7 +45,7 @@ import (
 //   - пять KV-мест elapsed обёрнуты if _traceKV > 0, остальные шесть
 //     вызовов KV не обёрнуты.
 //
-// Отрицательные примеры мутируют разобранное дерево в памяти и обязаны
+// Отрицательные примеры изменяют разобранное дерево в памяти и обязаны
 // быть отвергнуты: изменение уровня guard, перенос вызова в else, новая
 // ссылка в асинхронном вызове, понижение traceSprintfLocked, потеря
 // безусловной блокировки или отложенного снятия в теле traceLogf,
@@ -327,7 +327,7 @@ func guardRootPackage() (string, []string, map[string]string, error) {
 			if err := dec.Decode(&pkg); err == io.EOF {
 				break
 			} else if err != nil {
-				guardRootErr = fmt.Errorf("разбор go list: %w", err)
+				guardRootErr = fmt.Errorf("parse go list: %w", err)
 				return
 			}
 			if pkg.Export != "" {
@@ -339,7 +339,7 @@ func guardRootPackage() (string, []string, map[string]string, error) {
 			}
 		}
 		if guardRootDir == "" || len(guardRootFiles) == 0 {
-			guardRootErr = errors.New("go list не вернул корневой пакет")
+			guardRootErr = errors.New("go list returned no root package")
 			return
 		}
 		sort.Strings(guardRootFiles)
@@ -376,11 +376,11 @@ func parseGuardPackage(t *testing.T) *guardPackage {
 	}
 	lookup := func(path string) (io.ReadCloser, error) {
 		if path == "unsafe" {
-			return nil, errors.New("для unsafe нет export data")
+			return nil, errors.New("no export data for unsafe")
 		}
 		ep, ok := export[path]
 		if !ok || ep == "" {
-			return nil, fmt.Errorf("нет export data для %q", path)
+			return nil, fmt.Errorf("no export data for %q", path)
 		}
 		return os.Open(ep)
 	}
@@ -1246,7 +1246,7 @@ func guardProbeOldSignature(places []*guardPlace, callee string) (func(), bool) 
 }
 
 // guardProbePlainNoLock удаляет безусловный захват cm.mu из тела
-// traceLogf: правило тела обязано отвергнуть мутацию.
+// traceLogf: правило тела обязано отвергнуть изменение.
 func guardProbePlainNoLock(pkg *guardPackage, _ []*guardPlace) (func(), bool) {
 	return guardProbePlainBodyMutation(pkg, func(list []ast.Stmt) []ast.Stmt {
 		return slices.Clone(list[1:])
@@ -1254,7 +1254,7 @@ func guardProbePlainNoLock(pkg *guardPackage, _ []*guardPlace) (func(), bool) {
 }
 
 // guardProbePlainNoUnlock удаляет отложенное снятие cm.mu из тела
-// traceLogf: правило тела обязано отвергнуть мутацию.
+// traceLogf: правило тела обязано отвергнуть изменение.
 func guardProbePlainNoUnlock(pkg *guardPackage, _ []*guardPlace) (func(), bool) {
 	return guardProbePlainBodyMutation(pkg, func(list []ast.Stmt) []ast.Stmt {
 		mutated := slices.Clone(list)
@@ -1277,7 +1277,7 @@ func guardProbePlainLevelCheck(pkg *guardPackage, _ []*guardPlace) (func(), bool
 	})
 }
 
-// guardProbePlainBodyMutation применяет мутацию к телу traceLogf и
+// guardProbePlainBodyMutation применяет изменение к телу traceLogf и
 // возвращает функцию восстановления исходного тела.
 func guardProbePlainBodyMutation(
 	pkg *guardPackage, mutate func([]ast.Stmt) []ast.Stmt,
@@ -1346,7 +1346,7 @@ func guardProbeSprintfDemoted(_ *guardPackage, places []*guardPlace) (func(), bo
 
 // guardProbeDirectEnqueue добавляет прикладной прямой вызов
 // enqueueTraceLocked в тело производственной функции вне трёх обёрток:
-// правило запрета прямых enqueue обязано отвергнуть мутацию.
+// правило запрета прямых enqueue обязано отвергнуть изменение.
 func guardProbeDirectEnqueue(pkg *guardPackage, _ []*guardPlace) (func(), bool) {
 	fn := guardFindMethodDecl(pkg, "stats")
 	if fn == nil {

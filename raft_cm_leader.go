@@ -50,7 +50,7 @@ func (cm *ConsensusModule) AddVoter(id ServerID, addr ServerAddress) IndexFuture
 // Команда будет применена к FSM после фиксации.
 //
 // Обязательство отправителя: объект команды command сохраняется по ссылке
-// (LogEntry.Data = command, без копирования); вызывающий не должен мутировать
+// (LogEntry.Data = command, без копирования); вызывающий не должен изменять
 // переданную команду после вызова Apply — в противном случае изменение увидят
 // и журнал, и FSM, и любой потребитель, удержавший payload.
 func (cm *ConsensusModule) Apply(command any, timeout time.Duration) ApplyFuture {

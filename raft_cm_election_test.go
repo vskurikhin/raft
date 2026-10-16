@@ -15,8 +15,7 @@ import (
 // DefaultReelectionTimeout. Это отключает рандомизацию таймаута, чтобы провоцировать
 // одновременные попытки запуска выборов и проверять устойчивость алгоритма.
 // Переменная читается один раз при создании CM и кэшируется в переменную
-// пакета _forcedReelectionHook (ADR-CONF-011); тесты выставляют её помощником
-// setForcedReelectionHook.
+// пакета _forcedReelectionHook; тесты выставляют её с помощью setForcedReelectionHook.
 
 const (
 	// hookSamples — размер выборки значений electionTimeout() в каждой
@@ -179,7 +178,7 @@ func newRequestVoteFromPeerTestCM(transport Transport, term, lastLogIndex, lastL
 }
 
 // TestRequestVoteFromPeer_OutgoingArgs — белоящичный тест T-1 исходящих
-// аргументов RequestVote, формируемых requestVoteFromPeer. Страж мутации 2
+// аргументов RequestVote, формируемых requestVoteFromPeer. Защитная проверка изменения 2
 // AC-7 (плетение параметров пятиместной сигнатуры).
 //
 // Без кластера, без сети, без таймеров и без сна: requestVoteFromPeer

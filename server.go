@@ -28,7 +28,7 @@ type Server struct {
 
 	fsm           FSM
 	snapshotStore SnapshotStore
-	storage       Storage
+	storage       LogStorage
 
 	cm        *ConsensusModule
 	transport TransportManager
@@ -89,7 +89,8 @@ type Config struct {
 	// снимка, при котором создаётся новый снимок (0 = дефолт конструктора).
 	SnapshotThreshold int
 
-	Storage Storage
+	// Storage — постоянное хранилище состояния узла с операциями журнала.
+	Storage LogStorage
 
 	// TickerTimeout — такт тикера выборов (0 = умолчание).
 	TickerTimeout time.Duration
@@ -195,7 +196,7 @@ func (s *Server) Serve() {
 // Apply отправляет команду в Raft-кластер и возвращает ApplyFuture.
 //
 // Обязательство отправителя: объект команды cmd сохраняется по ссылке;
-// вызывающий не должен мутировать переданную команду после вызова Apply.
+// вызывающий не должен изменять переданную команду после вызова Apply.
 func (s *Server) Apply(cmd any, timeout time.Duration) ApplyFuture {
 	return s.cm.Apply(cmd, timeout)
 }

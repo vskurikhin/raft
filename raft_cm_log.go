@@ -99,9 +99,7 @@ func (cm *ConsensusModule) setLastLogLocked(index, term int) {
 // Инвариант сжатия (Compaction Safety): замена backing array
 // допустима ТОЛЬКО аллокацией нового среза (make+copy). In-place обрезка вида
 // log = log[pos:] с переиспользованием того же массива запрещена: сформированные
-// в sendBatch батчи FSM хранят собственные копии записей, но будущий рефакторинг
-// на in-place обрезку молча сломал бы гарантию «применяемые записи не зависят
-// от мутаций старого массива».
+// в sendBatch батчи FSM хранят собственные копии записей.
 func (cm *ConsensusModule) compactLogsLocked(compactIndex int) {
 	if compactIndex <= 0 {
 		return
@@ -113,7 +111,9 @@ func (cm *ConsensusModule) compactLogsLocked(compactIndex int) {
 	kept := make([]LogEntry, len(cm.cmState.log)-pos)
 	copy(kept, cm.cmState.log[pos:])
 	cm.cmState.log = kept
-	cm.cmState.logNeedsPersist = true
+	// Уплотнение удаляет префикс, что не выражается заменой суффикса:
+	// журнал переписывается целиком.
+	cm.markLogRewriteDirtyLocked()
 	// Уплотнение переписывает журнал, но не добавляет записей: период
 	// отмечается с нулём добавлений.
 	cm.dirty.mark(dirtyCauseCompact, 0)
@@ -135,10 +135,8 @@ func (cm *ConsensusModule) compactLogsLocked(compactIndex int) {
 func (cm *ConsensusModule) dispatchLogs(applyLogs []*logFuture) {
 	cm.mu.Lock()
 
-	// Страховочный лимит незафиксированного хвоста журнала: лидер, потерявший
-	// кворум, не наращивает журнал неограниченно. Это ограничение ущерба, а не
-	// протокольная гарантия, и действует только на клиентском пути — служебные
-	// записи идут через dispatchLogsLocked и лимитом не проверяются.
+	// Защищающий лимит незафиксированного хвоста журнала: лидер, потерявший
+	// кворум, не наращивает журнал неограниченно.
 	if room := _maxUncommittedEntries - cm.uncommittedLogLenLocked(); room < len(applyLogs) {
 		if room < 0 {
 			room = 0
@@ -191,6 +189,9 @@ func (cm *ConsensusModule) dispatchLogs(applyLogs []*logFuture) {
 func (cm *ConsensusModule) dispatchLogsLocked(applyLogs []*logFuture) {
 	term := cm.cmState.currentTerm
 	lastIndex := cm.cmState.lastLogIndex
+	// Первый изменённый индекс — начало пакета:
+	// суффикс сохранения начинается с первой добавленной записи.
+	firstNewIndex := lastIndex + 1
 	now := time.Now()
 	for _, f := range applyLogs {
 		f.dispatch = now
@@ -201,7 +202,7 @@ func (cm *ConsensusModule) dispatchLogsLocked(applyLogs []*logFuture) {
 		cm.cmState.log = append(cm.cmState.log, f.log)
 	}
 	cm.setLastLogLocked(lastIndex, term)
-	cm.cmState.logNeedsPersist = true
+	cm.markLogSuffixDirtyLocked(firstNewIndex)
 	// Добавления — длина фактически добавленного пакета, не разность
 	// индексов: замена суффикса считается по реально приписанному срезу.
 	cm.dirty.mark(dirtyCauseLeaderAppend, int64(len(applyLogs)))
