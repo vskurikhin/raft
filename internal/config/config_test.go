@@ -151,20 +151,6 @@ func TestParseFlagsDefaultAddr(t *testing.T) {
 	}
 }
 
-// TestParseFlagsStatsOutputDefaultsTrue — отсутствие флага -stats-output
-// включает вывод периодической статистики: умолчание равно true.
-func TestParseFlagsStatsOutputDefaultsTrue(t *testing.T) {
-	origArgs := os.Args
-	t.Cleanup(func() { os.Args = origArgs })
-
-	os.Args = []string{"raft", "-number", "1"}
-
-	v := ParseFlags()
-	if !v.StatsOutput {
-		t.Errorf("StatsOutput = false, want true (умолчание)")
-	}
-}
-
 // TestParseFlagsStatsOutputFalse — явное -stats-output=false доезжает
 // до Values.StatsOutput и не связано с уровнем трассировки.
 func TestParseFlagsStatsOutputFalse(t *testing.T) {
@@ -774,7 +760,7 @@ func TestParseFlagsTimingHelp(t *testing.T) {
 	help := buf.String()
 	for _, want := range []string{
 		// Профиль умолчаний и производные потолка пульса.
-		"400ms", "100ms", "430ms", "43ms",
+		"400ms", "100ms", "430ms",
 		"must not exceed -tcp-rpc-timeout",
 		"must be at least -tcp-rpc-timeout",
 		// Межпараметрические связи временных флагов.

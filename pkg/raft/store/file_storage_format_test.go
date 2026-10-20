@@ -100,9 +100,9 @@ func TestFileStorageFrame_PayloadBytesEqualArgument(t *testing.T) {
 	fs := NewFileStorage(dir)
 
 	value := []byte{0x00, 0x00, 0xff, 0x7f, 0x80, 0x00, 0x0a}
-	fs.Set("log", value)
+	fs.Set("k", value)
 
-	raw := readDatFile(t, dir, "log")
+	raw := readDatFile(t, dir, "k")
 	if !bytes.Equal(raw[_headerSize:], value) {
 		t.Fatalf("payload = %x, want %x", raw[_headerSize:], value)
 	}
@@ -121,9 +121,9 @@ func TestFileStorageFrame_LengthFieldBigEndian(t *testing.T) {
 	for i := range value {
 		value[i] = byte(i)
 	}
-	fs.Set("log", value)
+	fs.Set("k", value)
 
-	raw := readDatFile(t, dir, "log")
+	raw := readDatFile(t, dir, "k")
 	if got := binary.BigEndian.Uint16(raw[8:10]); got != _formatVersion {
 		t.Fatalf("version = %d, want %d", got, _formatVersion)
 	}

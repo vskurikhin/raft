@@ -962,8 +962,7 @@ func TestComputeRpsStats(t *testing.T) {
 			if got.total != test.want.total {
 				t.Errorf("total = %d, want %d", got.total, test.want.total)
 			}
-			// Тождество «среднее × секунд = сумма» в пределах погрешности
-			// float: связка величин ADR-PPERF2-010 выполняется точно.
+			// Тождество «среднее × секунд = сумма» в пределах погрешности float
 			if product := got.mean * float64(got.seconds); math.Abs(product-float64(got.total)) > 1e-9 {
 				t.Errorf("mean × seconds = %v, total = %d, want equal", product, got.total)
 			}
@@ -1059,8 +1058,8 @@ func TestSummaryOutputGolden(t *testing.T) {
 }
 
 // TestSummaryExcludesFirstSecond проверяет правило неполных секунд
-// (ADR-PPERF2-010 п. 4): первая секунда ряда исключается из всех шести
-// величин сводки. Проверка потока RPS= здесь недоступна — его печатает
+// первая секунда ряда исключается из всех шести величин.
+// Проверка потока RPS= здесь недоступна — его печатает
 // только горутина stats; инвариант «ряд = печатаемые строки» проверяется
 // тестом TestStatsSeriesMatchesPrintedLines.
 func TestSummaryExcludesFirstSecond(t *testing.T) {
@@ -1131,7 +1130,6 @@ func TestStatsSeriesMatchesPrintedLines(t *testing.T) {
 	if len(series) < 2 {
 		t.Fatalf("rps series length = %d, want at least 2", len(series))
 	}
-	// Инвариант ADR-PPERF2-010: длина ряда равна числу строк RPS=.
 	rpsLines := 0
 	for _, line := range capture.lines() {
 		if strings.HasPrefix(line, "RPS=") {

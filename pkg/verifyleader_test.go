@@ -173,8 +173,7 @@ func TestVerifyLeaderClientRoundTrip(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	got, err := c.VerifyLeader(ctx)
-	// Несущий ассерт: именно err == nil доказывает корректность
-	// декодирования (ADR-API-1V-002) и не зависит от перевыборов.
+	// Именно err == nil доказывает корректность декодирования и не зависит от перевыборов.
 	if err != nil {
 		t.Fatalf("VerifyLeader: %v", err)
 	}

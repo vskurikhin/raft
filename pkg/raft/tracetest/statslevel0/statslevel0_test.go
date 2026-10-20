@@ -95,7 +95,7 @@ func newStatsServer(t *testing.T, disabled bool) *raft.Server {
 }
 
 // TestStatsOutputEnabled — при stats-output=true выводятся строки всех трёх
-// типов: латентность, счётчики Raft и PersistV1; уровень трассировки
+// типов: латентность, счётчики Raft и PersistV2; уровень трассировки
 // на периодическую статистику не влияет.
 func TestStatsOutputEnabled(t *testing.T) {
 	t.Cleanup(leaktest.CheckTimeout(t, raft.LeaktestBudget))
@@ -111,7 +111,7 @@ func TestStatsOutputEnabled(t *testing.T) {
 		text := string(data)
 		if strings.Contains(text, "AE=") &&
 			strings.Contains(text, "ISsent=") &&
-			strings.Contains(text, `"Schema":1`) {
+			strings.Contains(text, `"Schema":2`) {
 			return
 		}
 		if time.Now().After(deadline) {

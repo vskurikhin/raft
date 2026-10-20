@@ -22,8 +22,8 @@ const (
 )
 
 // DefaultMaxPool — значение по умолчанию для количества соединений в пуле
-// на один адрес соседа у узла raftkv. Значение по умолчанию транспорта
-// в пакете raft другое и равно 2.
+// на один адрес соседа у узла raftkv.
+// Значение по умолчанию транспорта в пакете raft другое и равно 2.
 const DefaultMaxPool = 4
 
 type Values struct {
@@ -41,37 +41,34 @@ type Values struct {
 	// HeartbeatTimeout — период пульса лидера. Ноль — защитное значение:
 	// применяется raft.DefaultHeartbeatTimeout.
 	HeartbeatTimeout time.Duration
-	// MaxPool — максимальное количество соединений в пуле на один адрес
-	// соседа; ноль заменяется на DefaultMaxPool при сборке конфигурации узла.
+	// MaxPool — максимальное количество соединений в пуле на один адрес соседа;
+	// ноль заменяется на DefaultMaxPool при сборке конфигурации узла.
 	MaxPool int
 	// ReelectionTimeout — база тайм-аута выборов. Ноль — защитное значение:
 	// применяется raft.DefaultReelectionTimeout (430 мс). База должна быть
 	// строго больше окна проверки кворума 400 мс.
 	ReelectionTimeout time.Duration
-	// SnapshotInterval — интервал проверки необходимости снимка.
-	// Ноль — защитное значение: применяется дефолт конструктора.
+	// SnapshotInterval — интервал проверки необходимости создания снимка.
+	// Ноль — защитное значение: применяется значение по умолчанию в конструкторе.
 	SnapshotInterval time.Duration
-	// SnapshotThreshold — минимальное количество записей после последнего
-	// снимка, при котором создаётся новый снимок.
-	// Ноль — защитное значение: применяется дефолт конструктора.
+	// SnapshotThreshold — минимальное количество записей после последнего снимка,
+	// при котором создаётся новый снимок.
+	// Ноль — защитное значение - применяется значение по умолчанию.
 	SnapshotThreshold int
-	// StatsOutput — вывод периодической статистики узла. false отключает
-	// только публикацию (латентность, счётчики Raft, PersistV1), не прекращая
-	// секундный сбор метрик. Умолчание — true; настройка не связана
-	// с TraceLogLevel.
+	// StatsOutput — вывод периодической статистики узла.
 	StatsOutput bool
 	// TCPConnectTimeout — тайм-аут установки TCP-соединения к соседям.
-	// Ноль — защитное значение: применяется дефолт транспорта
-	// (raft.ConnectionTCPRPCTimeout, 165 мс). Связь значения с окном
-	// проверки кворума — в подсказке флага.
+	// Ноль — защитное значение: применяется значение по умолчанию транспорта
+	// (raft.ConnectionTCPRPCTimeout, 165 мс).
+	// Связь значения с окном проверки кворума — в подсказке флага.
 	TCPConnectTimeout time.Duration
 	// TCPRPCTimeout — тайм-аут TCP RPC к соседям. Ноль — защитное значение:
-	// применяется дефолт транспорта (raft.TCPRPCTimeout, 200 мс). Окно
-	// проверки кворума фиксировано 400 мс (2 × raft.TCPRPCTimeout) и флагом
+	// применяется значение по умолчанию транспорта (raft.TCPRPCTimeout, 200 мс).
+	// Окно проверки кворума фиксировано 400 мс (2 × raft.TCPRPCTimeout) и флагом
 	// не масштабируется; сумма connect + rpc ограничена 400 мс.
 	TCPRPCTimeout time.Duration
 	// InstallSnapshotTimeout — базовое значение для расчёта лимита времени передачи снимка.
-	// Если установлено 0, применяется дефолтное значение транспорта
+	// Если установлено 0, применяется значение по умолчанию транспорта
 	// (raft.InstallSnapshotTimeout, 310 мс) как защитное значение.
 	InstallSnapshotTimeout time.Duration
 	// TickerTimeout — такт тикера выборов. Ноль — защитное значение:
@@ -125,8 +122,8 @@ func ParseFlags() Values {
 		log.Fatal(err)
 	}
 
-	// Ранний отказ при недопустимых значениях флагов узла: сообщение
-	// содержит имя флага, фактическое значение и требования к допустимому диапазону.
+	// Ранний отказ при недопустимых значениях флагов узла: сообщение содержит имя флага,
+	// фактическое значение и требования к допустимому диапазону.
 	// Верхняя граница тайм‑аута не задаётся.
 	if err := validateTransportTimingFlags(*tcpConnectTimeoutFlag, *tcpRPCTimeoutFlag, *installSnapshotTimeoutFlag); err != nil {
 		log.Fatalf("invalid TCP timeout flags: %v", err)
@@ -251,22 +248,22 @@ func validateElectionQuorumInvariant(reelection time.Duration) error {
 func addSnapshotFlags(fs *flag.FlagSet) (snapshotIntervalFlag *time.Duration, snapshotThresholdFlag *int) {
 	return fs.Duration(
 			"snapshot-interval", raft.DefaultSnapshotInterval,
-			"Interval between snapshot checks (default 3s)",
+			"Interval between snapshot checks",
 		), fs.Int(
 			"snapshot-threshold", raft.DefaultSnapshotThreshold,
-			"Log entries since last snapshot to trigger a new one (default 1024)",
+			"Log entries since last snapshot to trigger a new one",
 		)
 }
 
 // addStatsOutputFlag регистрирует флаг вывода периодической статистики:
-// три строки в секунду (латентность, счётчики Raft, PersistV1). Отсутствие
+// три строки в секунду (латентность, счётчики Raft, PersistV2). Отсутствие
 // флага эквивалентно true; настройка не связана с -trace-log-level.
 func addStatsOutputFlag(fs *flag.FlagSet) *bool {
 	return fs.Bool(
-		"stats-output", true,
-		"Periodic stats output: latency, raft counters and PersistV1 "+
-			"(default true); false keeps collecting but suppresses all three "+
-			"lines; independent of -trace-log-level",
+		"stats-output", false,
+		"Periodic stats output: latency, raft counters and PersistV2;\n"+
+			"false keeps collecting but suppresses all three lines;\n"+
+			"independent of -trace-log-level",
 	)
 }
 
@@ -275,58 +272,53 @@ func addStatsOutputFlag(fs *flag.FlagSet) *bool {
 func addTimingFlags(fs *flag.FlagSet) (applyBatch, heartbeat, reelection, ticker *time.Duration) {
 	return fs.Duration(
 			"apply-batch-interval", raft.DefaultApplyBatchInterval,
-			"Leader-side safety-net apply batching interval (default 50ms); must "+
-				"not exceed reelection-timeout",
+			"Leader-side safety-net apply batching interval; must not exceed reelection-timeout",
 		), fs.Duration(
 			"heartbeat-timeout", raft.DefaultHeartbeatTimeout,
-			"Leader heartbeat interval (default 33ms). Upper bound derives from the "+
-				"fixed 400ms check-quorum timeout: beyond 100ms a leader steps down "+
-				"on a single lost packet; the 100ms bound is reachable only with "+
-				"reelection-timeout >= 10x heartbeat-timeout (with the default "+
-				"430ms the effective ceiling is 43ms)",
+			"Leader heartbeat interval.\n"+
+				"Upper bound derives from the fixed 400ms check-quorum timeout:\n"+
+				"beyond 100ms a leader steps down on a single lost packet;\n"+
+				"the 100ms bound is reachable only with reelection-timeout >= 10x heartbeat-timeout",
 		), fs.Duration(
 			"reelection-timeout", raft.DefaultReelectionTimeout,
-			"Base of the randomized election timeout, actual timeout is in "+
-				"[reelection, 2*reelection) (default 430ms); must be at least 10x "+
-				"heartbeat-timeout; also gates the pre-vote suppression window "+
-				"[reelection, 2*reelection); must be greater than 2x "+
-				"raft.TCPRPCTimeout (the fixed quorum check window; not scaled "+
-				"by -tcp-rpc-timeout)",
+			"Base of the randomized election timeout, actual timeout is in [reelection, 2*reelection);\n"+
+				"must be at least 10x heartbeat-timeout;\n"+
+				"also gates the pre-vote suppression window [reelection, 2*reelection);\n"+
+				"must be greater than 2x raft.TCPRPCTimeout\n"+
+				"(the fixed quorum check window; not scaled by -tcp-rpc-timeout)",
 		), fs.Duration(
 			"ticker-timeout", raft.DefaultTickerTimeout,
-			"Election timer polling tick (default 20ms); must be at most "+
+			"Election timer polling tick; must be at most "+
 				"reelection-timeout/10",
 		)
 }
 
-// addTransportFlags регистрирует три флага тайм-аутов TCP-транспорта и
-// возвращает их указатели.
+// addTransportFlags регистрирует три флага тайм-аутов TCP-транспорта.
 func addTransportFlags(fs *flag.FlagSet) (connect, rpc, snapshot *time.Duration) {
 	return fs.Duration(
 			"tcp-connect-timeout", raft.ConnectionTCPRPCTimeout,
-			"Timeout for establishing a TCP connection (DialTimeout); must not "+
-				"exceed -tcp-rpc-timeout (connection establishment plus "+
-				"the RPC must fit within 2x -tcp-rpc-timeout) and together with "+
-				"it must not exceed the fixed quorum check window of 400ms = 2x "+
-				"raft.TCPRPCTimeout (the window is a constant and is not "+
-				"scaled by this flag) (default 165ms)",
+			"Timeout for establishing a TCP connection (DialTimeout);\n"+
+				"must not exceed -tcp-rpc-timeout\n"+
+				"(connection establishment plus the RPC must fit within 2x -tcp-rpc-timeout)\n"+
+				"and together with it must not exceed the fixed quorum check window of 400ms = 2x\n"+
+				"raft.TCPRPCTimeout\n"+
+				"(the window is a constant and is not scaled by this flag)",
 		), fs.Duration(
 			"tcp-rpc-timeout", raft.TCPRPCTimeout,
-			"Timeout for one RPC exchange with a peer; the quorum check window "+
-				"is fixed at 400ms (2x raft.TCPRPCTimeout, a compile-time "+
-				"constant) and does NOT scale with this flag; the effective RPC "+
-				"window on a new connection is connect + rpc; the sum is capped "+
-				"by connect + rpc <= 400, so this flag is bounded above by "+
-				"400 - connect (with the default connect of 165ms, rpc <= 235ms) "+
-				"(default 200ms)",
+			"Timeout for one RPC exchange with a peer;\n"+
+				"the quorum check window is fixed at 400ms\n"+
+				"(2x raft.TCPRPCTimeout, a compile-time constant)\n"+
+				"and does NOT scale with this flag; the effective RPC window on a new connection is connect + rpc;\n"+
+				"the sum is capped by connect + rpc <= 400, so this flag is bounded above by 400 - connect\n"+
+				"(with the default connect of 165ms, rpc <= 235ms)",
 		), fs.Duration(
 			"install-snapshot-timeout", raft.InstallSnapshotTimeout,
-			"Base of the snapshot transfer deadline; the final deadline scales "+
-				"with the data volume (blocks of 256KiB); must be at least "+
-				"-tcp-rpc-timeout; the flag controls both sides of the "+
-				"transfer - the sender deadline and the receiver response window "+
-				"(max with responseTimeout), including small snapshots below "+
-				"256KiB (default 310ms)",
+			"Base of the snapshot transfer deadline;\n"+
+				"the final deadline scales with the data volume (blocks of 256KiB);\n"+
+				"must be at least -tcp-rpc-timeout;\n"+
+				"the flag controls both sides of the transfer "+
+				"- the sender deadline and the receiver response window\n"+
+				"(max with responseTimeout), including small snapshots below 256KiB",
 		)
 }
 

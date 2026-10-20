@@ -1133,6 +1133,10 @@ func TestReplicationBackoff_LeaderStateReinitialized(t *testing.T) {
 
 	cm := &ConsensusModule{}
 	cm.storage = store.NewMapStorage()
+	// Пустой журнал формируется путём полной замены — аналогично тому, как это происходит
+	// при первом сохранении. Операция noop при вступлении в лидерство позволяет
+	// безопасно заменить суффикс журнала.
+	cm.storage.RewriteLog(nil)
 	cm.shutdownCh = make(chan struct{})
 	cm.commitCh = make(chan int, 1)
 	cm.stepDown = make(chan struct{}, 1)

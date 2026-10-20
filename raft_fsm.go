@@ -47,7 +47,7 @@ type FSM interface {
 	Restore(io.ReadCloser) error
 }
 
-// FSMSnapshot — снимок состояния FSM, готовый к персистентности.
+// FSMSnapshot — снимок состояния FSM, готовый к сохранению на диск.
 // Создаётся в FSM.Snapshot(), сериализуется в SnapshotSink через Persist.
 //
 // Контракт: Release вызывается всегда, даже если Persist не был вызван.
@@ -106,7 +106,7 @@ type BatchingFSM interface {
 	// ErrBatchFSMResponseMismatch, которой отвечаются все future батча.
 	//
 	// Контракт владения и потоковая модель — как у FSM.Apply: переданные
-	// *LogEntry — собственные копии, мутировать их и payload не следует;
+	// *LogEntry — собственные копии, изменять их и payload не следует;
 	// вызов выполняется из горутины runFSM.
 	ApplyBatch([]*LogEntry) []any
 }

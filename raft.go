@@ -352,7 +352,7 @@ func NewConsensusModule(
 	id int,
 	peerIds []int,
 	transport Transport,
-	storage Storage,
+	storage LogStorage,
 	fsm FSM,
 	ready <-chan any,
 	snapshots ...SnapshotStore,
@@ -368,7 +368,7 @@ func newConsensusModule(
 	id int,
 	peerIds []int,
 	transport Transport,
-	storage Storage,
+	storage LogStorage,
 	fsm FSM,
 	ready <-chan any,
 	snapshots ...SnapshotStore,
@@ -421,9 +421,9 @@ func newConsensusModule(
 	cm.cmState.leaderID = -1
 	cm.leaderState.leadershipTransferCh = make(chan *leadershipTransferFuture, 1)
 	// Служебный начальный период нового узла: первая отметка до первого
-	// полного сохранения. При восстановлении готового хранилища период
-	// отменяется в restoreData — это не завершённое наблюдение.
-	cm.cmState.logNeedsPersist = true
+	// сохранения журнала. Свежий журнал создаётся полной заменой.
+	// При восстановлении готового хранилища период отменяется в restoreData.
+	cm.markLogRewriteDirtyLocked()
 	cm.dirty.mark(dirtyCauseInitial, 0)
 	// Инициализация полей для снимков.
 	cm.initSnapshotConfig(snapshotFrom(snapshots))
@@ -457,11 +457,12 @@ func newConsensusModule(
 
 func restoreData(cm *ConsensusModule) {
 	cm.restoreFromStorage()
-	cm.cmState.logNeedsPersist = false
+	// Восстановленный журнал уже сохранён на диске: незаписанные изменения отсутствуют.
+	cm.clearLogDirtyLocked()
 	// Служебный начальный период отменяется: постоянное состояние уже
 	// восстановлено из хранилища и долговечно. Это не завершение периода
 	// и не наблюдение «сохранено» — иначе нулевой возраст был бы
-	// подменён мнимым персистом.
+	// подменён мнимым сохранением.
 	cm.dirty.cancelInitial()
 	// Однопоточное восстановление FSM из снимка до запуска горутин.
 	// Стратегия немедленного отказа: при невосстановимом состоянии узел

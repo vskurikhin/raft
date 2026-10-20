@@ -835,7 +835,7 @@ func waitForNewLeaderExcept(t *testing.T, h *Harness, excludedID int, timeout ti
 
 // waitForStepDown опрашивает сервер id до тех пор, пока он не откажется от
 // лидерства и не перейдёт в терм wantTerm. Так как Report() захватывает
-// cm.mu, а becomeFollowerLocked (и startElectionLocked) персистят новый терм под той же
+// cm.mu, а becomeFollowerLocked (и startElectionLocked) сохраняют новый терм под той же
 // блокировкой, факт наблюдения терма wantTerm гарантирует, что терм уже
 // записан в постоянное хранилище. Это критично для проверки persist-бага:
 // сразу после возврата из функции сервер можно безопасно аварийно завершать
@@ -865,7 +865,7 @@ func waitForStepDown(t *testing.T, h *Harness, id, wantTerm int, timeout time.Du
 //  3. Переподключаем старого лидера. Он узнаёт о более высоком терме либо из
 //     RPC-ответа AppendEntries на собственные записи, либо из входящего
 //     heartbeat нового лидера — оба пути ведут в becomeFollowerLocked(newTerm),
-//     который персистит терм в постоянное хранилище. Ждём, пока сервер не
+//     который сохраняет терм в постоянное хранилище. Ждём, пока сервер не
 //     откажется от лидерства и не перейдёт в терм newTerm.
 //  4. Аварийно завершаем и перезапускаем старого лидера: если изменение терма
 //     хранилось только в памяти, после перезапуска терм был бы потерян.
@@ -874,7 +874,7 @@ func waitForStepDown(t *testing.T, h *Harness, id, wantTerm int, timeout time.Du
 // лидер узнавал новый терм только через RPC-ответ, но RPCProxy был удалён, и
 // эти методы стали no-op. Проверка остаётся корректной и без них: в кластере
 // терм нового лидера — максимальный, поэтому старый лидер не может перейти в
-// терм выше newTerm, а любой способ достижения терма newTerm персистит его.
+// терм выше newTerm, а любой способ достижения терма newTerm сохраняет его на диск.
 func TestBug_BecomeFollowerMissingPersist(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
@@ -894,7 +894,7 @@ func TestBug_BecomeFollowerMissingPersist(t *testing.T) {
 
 	// Переподключаем старого лидера и ждём, пока он узнает о более высоком
 	// терме и откажется от лидерства. В этот момент терм newTerm уже
-	// персистентен, и сервер можно безопасно аварийно завершать.
+	// сохранён на диск, и сервер можно безопасно аварийно завершать.
 	h.ReconnectPeer(origLeaderId)
 	waitForStepDown(t, h, origLeaderId, newTerm, 5*time.Second)
 
@@ -1402,7 +1402,7 @@ func TestConfiguration_GetConfigurationOnFollower(t *testing.T) {
 }
 
 // TestGetConfiguration_ReturnsCopy проверяет, что срез ConfigServers,
-// полученный через публичный API, является защитной копией: его мутация
+// полученный через публичный API, является защитной копией: его изменение
 // не влияет на следующую конфигурацию, возвращаемую GetConfiguration.
 func TestGetConfiguration_ReturnsCopy(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
@@ -1844,8 +1844,8 @@ func TestCommitmentInteg_CommitAfterReconnect(t *testing.T) {
 	otherFollower := (lid + 2) % 3
 
 	// Отключаем одного follower.
-	// remove: DisconnectPeer применяет разрыв синхронно (мутация
-	// транспортов завершена к моменту возврата).
+	// remove: DisconnectPeer применяет разрыв синхронно (изменение
+	// транспортов завершено к моменту возврата).
 	h.DisconnectPeer(follower)
 
 	// Apply с оставшимся кворумом (leader + один follower)
@@ -3387,6 +3387,9 @@ func TestRace_TermIndexMapDispatchAndConflict(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	storage := store.NewMapStorage()
+	// Пустой журнал создаётся полной заменой, как после первого сохранения:
+	// последующая замена суффикса не завершает процесс. Состояние достижимо.
+	storage.RewriteLog([]LogEntry{})
 	mock := &mockTransportConflict{replyTerm: 1, success: false, conflictTerm: 1}
 	cm := &ConsensusModule{
 		leaderState: leaderState{
