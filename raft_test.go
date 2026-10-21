@@ -23,6 +23,50 @@ func TestElectionBasic(t *testing.T) {
 	h.CheckSingleLeader()
 }
 
+// TestHarnessTestTimingProfile закрепляет, что узлы Harness создаются и
+// перезапускаются с тестовым профилем (база 430 мс) независимо от
+// продуктового умолчания DefaultReelectionTimeout. Проверяются поля
+// таймеров под cm.mu и выборка electionTimeout в [430; 860) мс до и
+// после RestartPeer.
+func TestHarnessTestTimingProfile(t *testing.T) {
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
+
+	h := NewHarness(t, 3)
+	defer h.Shutdown()
+
+	for i := 0; i < h.n; i++ {
+		re, hb, tk, ab := h.readTimerConfig(i)
+		if re != _testReelectionTimeout {
+			t.Fatalf("server %d: reelectionTimeout = %v, want %v", i, re, _testReelectionTimeout)
+		}
+		if hb != DefaultHeartbeatTimeout || tk != DefaultTickerTimeout || ab != DefaultApplyBatchInterval {
+			t.Fatalf("server %d: timing = %v/%v/%v, want 33/20/50 ms", i, hb, tk, ab)
+		}
+		// Выборка тайм-аута выборов лежит в [база; 2·база) = [430; 860) мс.
+		to := h.cluster[i].electionTimeout()
+		if to < _testReelectionTimeout || to >= 2*_testReelectionTimeout {
+			t.Fatalf("server %d: electionTimeout = %v, want in [%v; %v)", i, to, _testReelectionTimeout, 2*_testReelectionTimeout)
+		}
+	}
+
+	// Перезапуск не возвращает узел к продуктовому умолчанию.
+	lid, _ := h.CheckSingleLeader()
+	h.CrashPeer(lid)
+	h.RestartPeer(lid)
+
+	re, hb, tk, ab := h.readTimerConfig(lid)
+	if re != _testReelectionTimeout {
+		t.Fatalf("restarted server %d: reelectionTimeout = %v, want %v", lid, re, _testReelectionTimeout)
+	}
+	if hb != DefaultHeartbeatTimeout || tk != DefaultTickerTimeout || ab != DefaultApplyBatchInterval {
+		t.Fatalf("restarted server %d: timing = %v/%v/%v, want 33/20/50 ms", lid, hb, tk, ab)
+	}
+	to := h.cluster[lid].electionTimeout()
+	if to < _testReelectionTimeout || to >= 2*_testReelectionTimeout {
+		t.Fatalf("restarted server %d: electionTimeout = %v, want in [%v; %v)", lid, to, _testReelectionTimeout, 2*_testReelectionTimeout)
+	}
+}
+
 func TestElectionLeaderDisconnect(t *testing.T) {
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -75,8 +119,8 @@ func TestDisconnectAllThenRestore(t *testing.T) {
 	defer h.Shutdown()
 
 	// remove: разрыв связи выполняется сразу; минимальный election timeout
-	// (DefaultReelectionTimeout) заведомо больше времени старта узлов, поэтому
-	// лидер не успевает быть избран до разрыва.
+	// тестового профиля (_testReelectionTimeout) заведомо больше времени
+	// старта узлов, поэтому лидер не успевает быть избран до разрыва.
 	// Отключаем все серверы с самого начала. Лидера не будет.
 	for i := 0; i < 3; i++ {
 		h.DisconnectPeer(i)
@@ -340,8 +384,9 @@ func TestNoCommitWithNoQuorum(t *testing.T) {
 	// Изолируем обоих follower'ов: у лидера остаётся 1/3 — кворума нет.
 	// Прежняя схема опиралась на инвариант «время изоляции < min election
 	// timeout» (комментарий «246ms < 254ms»); фактические константы
-	// (DefaultReelectionTimeout=430ms) его нарушали — изоляция 300+93ms
-	// превышала минимальный election timeout, и тест был flaky.
+	// тестового профиля (_testReelectionTimeout=430ms) его нарушали —
+	// изоляция 300+93ms превышала минимальный election timeout, и тест
+	// был flaky.
 	// Инвариант снят: тест больше не зависит от того, начнут ли изолированные
 	// follower'ы выборы.
 	dPeer1 := (origLeaderId + 1) % 3
@@ -419,8 +464,8 @@ func TestDisconnectLeaderBriefly(t *testing.T) {
 
 	// Отключаем лидера на короткое время (меньше тайм-аута выборов у соседей).
 	// keep: timing — предмет теста. Длительность разрыва (90 мс) заведомо
-	// меньше минимального election timeout (DefaultReelectionTimeout = 430 мс),
-	// поэтому соседи не начинают выборы.
+	// меньше минимального election timeout тестового профиля
+	// (_testReelectionTimeout = 430 мс), поэтому соседи не начинают выборы.
 	h.DisconnectPeer(origLeaderId)
 	sleepMs(90)
 	h.ReconnectPeer(origLeaderId)
@@ -2448,7 +2493,7 @@ func TestNonvoter_DoesNotStartElection(t *testing.T) {
 	// keep: negative window — за окно, превышающее минимальный election
 	// timeout, неголосующий не должен стать лидером. Опрос не доказывает
 	// отсутствия события; окно осознанно временное.
-	sleepMs(int(DefaultReelectionTimeout.Milliseconds()))
+	sleepMs(int(_testReelectionTimeout.Milliseconds()))
 
 	// Nonvoter не должен быть лидером.
 	_, _, isLeader := h.cluster[demoteID].Report()
@@ -2596,7 +2641,7 @@ func TestNonvoter_DemotedVoterDoesNotStartElection(t *testing.T) {
 	// keep: negative window — за окно, превышающее минимальный election
 	// timeout, неголосующий не должен стать лидером. Опрос не доказывает
 	// отсутствия события; окно осознанно временное.
-	sleepMs(int(DefaultReelectionTimeout.Milliseconds()))
+	sleepMs(int(_testReelectionTimeout.Milliseconds()))
 
 	// Nonvoter не должен стать лидером.
 	_, _, isLeader := h.cluster[demoteID].Report()
@@ -3318,10 +3363,10 @@ func TestIntegration_TermIndexAfterLogTruncation(t *testing.T) {
 	// keep: окно без наблюдаемого состояния — victim уже отключён,
 	// поэтому после отключения лидера подключённым остаётся ровно
 	// один узел и кворума нет: ни лидер, ни фиксация не могут появиться.
-	// Бюджет — DefaultReelectionTimeout (минимальный election timeout):
-	// оставшийся узел успевает выйти из состояния «лидер известен».
+	// Бюджет — _testReelectionTimeout (минимальный election timeout тестового
+	// профиля): оставшийся узел успевает выйти из состояния «лидер известен».
 	h.DisconnectPeer(lid)
-	sleepMs(int(DefaultReelectionTimeout.Milliseconds()))
+	sleepMs(int(_testReelectionTimeout.Milliseconds()))
 	h.ReconnectPeer(lid)
 
 	for i := 0; i < 3; i++ {

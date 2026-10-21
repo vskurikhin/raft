@@ -43,7 +43,7 @@ func TestPreVote_DisconnectedFollower_NoElection(t *testing.T) {
 	h.DisconnectPeer(otherID)
 
 	// keep: budgeted negative window — проверяется, что за целый
-	// worst-case election timeout (_maxElectionTimeout = 2*DefaultReelectionTimeout)
+	// worst-case election timeout (_maxElectionTimeout = 2*_testReelectionTimeout)
 	// отключённый узел НЕ увеличил term и не сменил лидера. Опрос
 	// не доказывает отсутствия события — окно осознанно временное;
 	// его уменьшение ослабило бы assert.

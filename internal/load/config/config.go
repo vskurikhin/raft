@@ -36,16 +36,16 @@ type Values struct {
 
 func ParseFlags() Values {
 	fs := flag.NewFlagSet("load", flag.ContinueOnError)
-	concurrencyFlag := fs.Int("concurrency", 4, "Maximum number of requests in flight")
+	concurrencyFlag := fs.Int("concurrency", 2048, "Maximum number of requests in flight")
 	deletePercentFlag := fs.Int("delete-percent", 0, "")
 	durationFlag := fs.Duration("duration", 0, "Load run duration (0 = until signal)")
-	getPercentFlag := fs.Int("get-percent", 66, "")
-	keyCountFlag := fs.Int("key-count", 2000, "")
-	requestRateFlag := fs.Int("request-rate", 100, "")
+	getPercentFlag := fs.Int("get-percent", 5, "")
+	keyCountFlag := fs.Int("key-count", 15000, "")
+	requestRateFlag := fs.Int("request-rate", 600, "")
 	peersFlag := fs.String("peers", "", "Comma-separated list of peers servers (host:port)")
-	valueSizeFlag := fs.Int("value-size", 128, "Value size in bytes")
-	verifyPercentFlag := fs.Int("verify-percent", 33, "")
-	weakGetPercentFlag := fs.Int("weak-get-percent", 0, "")
+	valueSizeFlag := fs.Int("value-size", 1024, "Value size in bytes")
+	verifyPercentFlag := fs.Int("verify-percent", 5, "")
+	weakGetPercentFlag := fs.Int("weak-get-percent", 70, "")
 
 	args := make([]string, 0, len(os.Args)-1)
 	for _, arg := range os.Args[1:] {

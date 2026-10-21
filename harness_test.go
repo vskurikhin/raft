@@ -18,9 +18,16 @@ const _submitTimeout = 5 * time.Second
 // Разделение Protocol timeout / Test deadline / Poll interval.
 
 const (
+	// _testReelectionTimeout — база тайм-аута выборов тестовых приспособлений.
+	// Независима от продуктового умолчания DefaultReelectionTimeout: сценарные
+	// тесты сохраняют исходный профиль 430 мс независимо от будущей смены
+	// продуктовой базы (TASK-1010-2). Профиль 430/33/20/50 мс проходит
+	// ValidateTiming (430 >= 10·33, 20 <= 43, 50 <= 430).
+	_testReelectionTimeout = 430 * time.Millisecond
+
 	// _maxElectionTimeout — максимальный election timeout:
-	// 2*DefaultReelectionTimeout = 860ms.
-	_maxElectionTimeout = 2 * DefaultReelectionTimeout
+	// 2*_testReelectionTimeout = 860ms.
+	_maxElectionTimeout = 2 * _testReelectionTimeout
 
 	// _preVoteRound — worst-case раунда Pre-Vote (≈ _maxElectionTimeout).
 	_preVoteRound = _maxElectionTimeout
@@ -72,6 +79,19 @@ const (
 	// от бюджета ожидания.
 	_pollInterval = 10 * time.Millisecond
 )
+
+// testTimerConfig возвращает тестовый временной профиль узла:
+// база перевыборов _testReelectionTimeout и штатные пульс/тикер/батч.
+// Применяется к узлам Harness и snapshotHarness при создании и перезапуске
+// до закрытия канала готовности.
+func testTimerConfig() TimerConfig {
+	return TimerConfig{
+		ApplyBatch: DefaultApplyBatchInterval,
+		Heartbeat:  DefaultHeartbeatTimeout,
+		Reelection: _testReelectionTimeout,
+		Ticker:     DefaultTickerTimeout,
+	}
+}
 
 func init() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
@@ -201,6 +221,11 @@ func NewHarnessWithOptions(t *testing.T, n int, opts ...HarnessOption) *Harness 
 			i, peerIds, transports[i],
 			storage[i], NewCommitChannelFSM(commitChans[i]), ready,
 		)
+		// Тестовый временной профиль применяется после конструктора (до
+		// пользовательских HarnessOption) и до close(ready); setter владеет
+		// cm.mu в одной функции. Узлы работают на тестовой базе независимо
+		// от продуктового умолчания.
+		cluster[i].setTimerConfig(testTimerConfig())
 		// Опции применяются после конструктора (фоновые горутины узла уже
 		// запущены) и до close(ready); никаких изменений после запуска.
 		for _, opt := range opts {
@@ -412,6 +437,9 @@ func (h *Harness) RestartPeer(id int) {
 		id, peerIds, h.transports[id],
 		h.storage[id], NewCommitChannelFSM(h.commitChans[id]), ready,
 	)
+	// Тестовый временной профиль применяется так же, как при первичном
+	// создании: до close(ready), setter владеет cm.mu в одной функции.
+	h.cluster[id].setTimerConfig(testTimerConfig())
 	close(ready)
 	h.mu.Lock()
 	h.alive[id] = true
@@ -1141,6 +1169,15 @@ func (h *Harness) lastLogIndex(id int) int {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	return cm.cmState.lastLogIndex
+}
+
+// readTimerConfig возвращает временные параметры узла id под cm.mu.
+// Блокировка снимается в той же функции (Lock/defer Unlock).
+func (h *Harness) readTimerConfig(id int) (reelection, heartbeat, ticker, applyBatch time.Duration) {
+	cm := h.cluster[id]
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	return cm.reelectionTimeout, cm.heartbeatTimeout, cm.tickerTimeout, cm.applyBatchInterval
 }
 
 // waitForLastLogIndex ждёт, пока журнал узла id не дорастёт до индекса want:
