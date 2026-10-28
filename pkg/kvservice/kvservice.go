@@ -217,7 +217,6 @@ func (kvs *KVService) Apply(log *raft.LogEntry) any {
 	switch data := log.Data.(type) {
 	case *commandData:
 		if data == nil {
-			kvs.traceLogf("nil command data")
 			return nil
 		}
 		cmd = data.cmd
