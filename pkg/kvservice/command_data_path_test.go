@@ -84,9 +84,10 @@ func serveOneAppend(tr *transp.TCPTransport, ms *store.MapStorage, done chan<- s
 }
 
 // TestCommandDataTCPAndMapStorageEncodeCount — контролируемая доставка одной
-// команды без повторов: лидер сохраняет запись и отправляет её двум
-// соседям через TCPTransport, каждый сосед сохраняет её. Ровно 2 вызова
-// кодека на TCP и 3 в MapStorage, прочих нет.
+// команды: лидер сохраняет и переписывает запись, отправляет её двум
+// соседям через TCPTransport и повторяет отправку; соседи сохраняют
+// полученные носители. Кодек вызван ровно один раз — в конструкторе; на
+// TCP и в MapStorage вызовов нет.
 func TestCommandDataTCPAndMapStorageEncodeCount(t *testing.T) {
 	defer leaktest.CheckTimeout(t, _pathTestTimeout)()
 	const key = "tcp-map-controlled"
@@ -98,9 +99,11 @@ func TestCommandDataTCPAndMapStorageEncodeCount(t *testing.T) {
 	defer leader.Close()
 	leaderStorage := newEmptyMapStorage()
 	leaderStorage.StoreLogEntries(1, entries)
+	leaderStorage.RewriteLog(entries)
 
+	const rounds = 2
 	stop := make(chan struct{})
-	done := make(chan struct{}, 2)
+	done := make(chan struct{}, 2*rounds)
 	storages := []*store.MapStorage{newEmptyMapStorage(), newEmptyMapStorage()}
 	followers := []*transp.TCPTransport{newTestTCPTransport(t), newTestTCPTransport(t)}
 	defer func() {
@@ -110,24 +113,29 @@ func TestCommandDataTCPAndMapStorageEncodeCount(t *testing.T) {
 		}
 	}()
 	for i, tr := range followers {
-		go serveOneAppend(tr, storages[i], done, stop)
 		leader.Connect(contract.ServerID(i+1), string(tr.LocalAddr()))
 	}
 
-	for i := range storages {
-		reply, err := leader.AppendEntries(contract.ServerID(i+1), contract.AppendEntriesArgs{
-			Term: 1, Entries: entries, LeaderCommit: 1,
-		})
-		if err != nil || !reply.Success {
-			t.Fatalf("AppendEntries to %d: reply=%+v err=%v", i+1, reply, err)
+	// Второй раунд — повторная доставка того же суффикса.
+	for range rounds {
+		for i, tr := range followers {
+			go serveOneAppend(tr, storages[i], done, stop)
+		}
+		for i := range storages {
+			reply, err := leader.AppendEntries(contract.ServerID(i+1), contract.AppendEntriesArgs{
+				Term: 1, Entries: entries, LeaderCommit: 1,
+			})
+			if err != nil || !reply.Success {
+				t.Fatalf("AppendEntries to %d: reply=%+v err=%v", i+1, reply, err)
+			}
+		}
+		for range storages {
+			<-done
 		}
 	}
-	for range storages {
-		<-done
-	}
 
-	if wire, storage, other := rec.snapshot(); wire != 2 || storage != 3 || other != 0 {
-		t.Fatalf("encode calls wire=%d storage=%d other=%d, want 2/3/0", wire, storage, other)
+	if wire, storage, other := rec.snapshot(); wire != 0 || storage != 0 || other != 1 {
+		t.Fatalf("encode calls wire=%d storage=%d other=%d, want 0/0/1", wire, storage, other)
 	}
 	for i, ms := range append([]*store.MapStorage{leaderStorage}, storages...) {
 		got, ok := loadedCommand(t, ms, 1)
@@ -138,7 +146,7 @@ func TestCommandDataTCPAndMapStorageEncodeCount(t *testing.T) {
 }
 
 // TestCommandDataFileStorageRepeatedSuffix: повтор совпадающего суффикса не
-// пишет на диск, но кодек вызывается снова; после переоткрытия команда
+// пишет на диск и не вызывает кодек; после переоткрытия команда
 // восстанавливается точно.
 func TestCommandDataFileStorageRepeatedSuffix(t *testing.T) {
 	const key = "file-storage-suffix"
@@ -155,8 +163,8 @@ func TestCommandDataFileStorageRepeatedSuffix(t *testing.T) {
 	if second := fs.StoreLogEntries(1, entries); second.Writes != 0 || second.BytesWritten != 0 {
 		t.Fatalf("repeated suffix wrote to disk: %+v", second)
 	}
-	if wire, storage, other := rec.snapshot(); wire != 0 || storage != 2 || other != 0 {
-		t.Fatalf("encode calls wire=%d storage=%d other=%d, want 0/2/0", wire, storage, other)
+	if wire, storage, other := rec.snapshot(); wire != 0 || storage != 0 || other != 1 {
+		t.Fatalf("encode calls wire=%d storage=%d other=%d, want 0/0/1", wire, storage, other)
 	}
 
 	got, ok := loadedCommand(t, store.NewFileStorage(dir), 1)
@@ -310,10 +318,10 @@ func (c *testCluster) storedOnAll(key, value string) bool {
 }
 
 // TestCommandDataLiveCluster — живой кластер из трёх узлов: команда PUT
-// записана на всех узлах, кодек вызван не менее 2 раз на TCP и 3 раз в
-// хранилище (повторы AppendEntries добавляют вызовы), прочих вызовов нет.
-// Далее ответы HTTP для повторов, CAS, GET и DELETE совпадают с прежней
-// семантикой.
+// записана на всех узлах, кодек вызван один раз — при приёме на лидере;
+// TCP и хранилища, включая повторы AppendEntries, его не вызывают. Далее
+// ответы HTTP для повторов, CAS, GET и DELETE совпадают с прежней
+// семантикой, по одному вызову кодека на команду.
 func TestCommandDataLiveCluster(t *testing.T) {
 	defer leaktest.CheckTimeout(t, _pathTestTimeout)()
 	const key = "live-cluster"
@@ -328,11 +336,9 @@ func TestCommandDataLiveCluster(t *testing.T) {
 		t.Fatalf("first PUT = %+v", put)
 	}
 	waitFor(t, "the command on all nodes", func() bool { return c.storedOnAll(key, "v1") })
-	wire, storage, other := rec.snapshot()
-	if wire < 2 || storage < 3 || wire+storage < 5 || other != 0 {
-		t.Fatalf("encode calls wire=%d storage=%d other=%d, want wire>=2 storage>=3 other=0", wire, storage, other)
+	if wire, storage, other := rec.snapshot(); wire != 0 || storage != 0 || other != 1 {
+		t.Fatalf("encode calls wire=%d storage=%d other=%d, want 0/0/1", wire, storage, other)
 	}
-	t.Logf("encode calls for one PUT: wire=%d storage=%d", wire, storage)
 
 	postJSON(t, leader.handlePut, "/put/", api.PutRequest{Key: key, Value: "v2"}, &put)
 	if put != (api.PutResponse{RespStatus: api.StatusOK, KeyFound: true, PrevValue: "v1"}) {
@@ -362,7 +368,8 @@ func TestCommandDataLiveCluster(t *testing.T) {
 	if gone != (api.GetResponse{RespStatus: api.StatusOK}) {
 		t.Fatalf("GET after DELETE = %+v", gone)
 	}
-	if _, _, other := rec.snapshot(); other != 0 {
-		t.Fatalf("command encoded outside transport and storage %d times", other)
+	// Семь команд с ключом key: PUT, PUT, CAS, CAS, GET, DELETE, GET.
+	if wire, storage, other := rec.snapshot(); wire != 0 || storage != 0 || other != 7 {
+		t.Fatalf("encode calls wire=%d storage=%d other=%d, want 0/0/7", wire, storage, other)
 	}
 }
