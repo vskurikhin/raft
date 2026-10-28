@@ -50,12 +50,20 @@ func TestCommandDataGobRoundTrip(t *testing.T) {
 	}
 }
 
-// TestCommandDataEncodesEveryTime: каждая сериализация вызывает кодек
-// заново и даёт новый буфер, кэша нет.
-func TestCommandDataEncodesEveryTime(t *testing.T) {
-	const key = "encode-every-time"
+// TestCommandDataEncodesOnce: кодек вызывается один раз в конструкторе;
+// повторные GobEncode и сериализации gob отдают те же готовые байты.
+func TestCommandDataEncodesOnce(t *testing.T) {
+	const key = "encode-once"
 	rec := startEncodeRecorder(t, key)
-	data := mustCommandData(t, Command{Kind: CommandPut, Key: key, Value: "v", ID: 1})
+	want := Command{Kind: CommandPut, Key: key, Value: "v", ID: 1}
+	data := mustCommandData(t, want)
+	if wire, storage, other := rec.snapshot(); wire != 0 || storage != 0 || other != 1 {
+		t.Fatalf("constructor encode calls wire=%d storage=%d other=%d, want 0/0/1", wire, storage, other)
+	}
+	expected, err := EncodeCommand(want)
+	if err != nil {
+		t.Fatalf("EncodeCommand: %v", err)
+	}
 
 	first, err := data.GobEncode()
 	if err != nil {
@@ -65,17 +73,20 @@ func TestCommandDataEncodesEveryTime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second GobEncode: %v", err)
 	}
-	if !bytes.Equal(first, second) {
-		t.Fatal("repeated encodings differ")
+	if !bytes.Equal(first, expected) || !bytes.Equal(second, expected) {
+		t.Fatalf("GobEncode = %x / %x, want %x", first, second, expected)
 	}
-	if &first[0] == &second[0] {
-		t.Fatal("repeated encodings share a buffer")
+	if &first[0] != &second[0] {
+		t.Fatal("repeated GobEncode returned different buffers: the representation is not reused")
+	}
+	if cap(first) != len(first) {
+		t.Fatalf("GobEncode result has spare capacity %d: append would write into the carrier", cap(first)-len(first))
 	}
 	gobRoundTripEntry(t, raft.LogEntry{Data: data})
 	gobRoundTripEntry(t, raft.LogEntry{Data: data})
 
-	if wire, storage, other := rec.snapshot(); wire != 0 || storage != 0 || other != 4 {
-		t.Fatalf("encode calls wire=%d storage=%d other=%d, want 0/0/4", wire, storage, other)
+	if wire, storage, other := rec.snapshot(); wire != 0 || storage != 0 || other != 1 {
+		t.Fatalf("encode calls wire=%d storage=%d other=%d, want 0/0/1", wire, storage, other)
 	}
 }
 
@@ -94,14 +105,15 @@ func TestCommandDataGobDecodeRejectsCorruption(t *testing.T) {
 	if err := data.GobDecode([]byte("KVC1 broken")); err == nil {
 		t.Fatal("GobDecode accepted corrupt input")
 	}
-	if data.cmd != (Command{}) {
-		t.Fatalf("carrier changed on failed decode: %+v", data.cmd)
+	if data.cmd != (Command{}) || data.encoded != nil {
+		t.Fatalf("carrier changed on failed decode: %+v %x", data.cmd, data.encoded)
 	}
 }
 
 // TestCommandDataCorruptCarrierGuard — защитный путь: носитель, созданный
-// в обход конструктора, не кодируется, и gob возвращает ошибку. Из HTTP
-// такой носитель недостижим: обработчики создают его через newCommandData.
+// в обход конструктора, не имеет представления, и gob возвращает ошибку. Из
+// HTTP такой носитель недостижим: обработчики создают его через
+// newCommandData.
 func TestCommandDataCorruptCarrierGuard(t *testing.T) {
 	corrupt := &commandData{cmd: Command{Kind: CommandInvalid, Key: "k"}}
 	var buf bytes.Buffer
