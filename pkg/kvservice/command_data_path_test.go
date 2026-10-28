@@ -45,8 +45,9 @@ func newTestTCPTransport(t *testing.T) *transp.TCPTransport {
 	return tr
 }
 
-// loadedCommand возвращает команду записи index из журнала и признак,
-// что запись — носитель.
+// loadedCommand возвращает команду записи index из журнала и признак, что
+// хранилище вернуло её байтами команды (журнал версии 3, тег 3), а не
+// носителем или иным типом.
 func loadedCommand(t *testing.T, ls contract.LogStorage, index int) (Command, bool) {
 	t.Helper()
 	entries, err := ls.LoadLog()
@@ -57,13 +58,27 @@ func loadedCommand(t *testing.T, ls contract.LogStorage, index int) (Command, bo
 		if e.Index != index {
 			continue
 		}
-		data, ok := e.Data.(*commandData)
+		raw, ok := e.Data.([]byte)
 		if !ok {
 			return Command{}, false
 		}
-		return data.cmd, true
+		return logEntryCommand(raw)
 	}
 	return Command{}, false
+}
+
+// logEntryCommand возвращает команду из Data записи: живой носитель либо
+// байты команды, восстановленные хранилищем.
+func logEntryCommand(data any) (Command, bool) {
+	switch d := data.(type) {
+	case *commandData:
+		return d.cmd, true
+	case []byte:
+		cmd, err := DecodeCommand(d)
+		return cmd, err == nil
+	default:
+		return Command{}, false
+	}
 }
 
 // serveOneAppend принимает один AppendEntries, сохраняет записи ведомого и
@@ -306,7 +321,7 @@ func (c *testCluster) storedOnAll(key, value string) bool {
 		}
 		found := false
 		for _, e := range entries {
-			if data, ok := e.Data.(*commandData); ok && data.cmd.Key == key {
+			if cmd, ok := logEntryCommand(e.Data); ok && cmd.Key == key {
 				found = true
 			}
 		}

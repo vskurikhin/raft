@@ -212,17 +212,28 @@ func NewKVService(address string, id int, peerIds []int, storage raft.LogStorage
 // Apply реализует raft.FSM. Вызывается Raft'ом для каждой зафиксированной
 // записи журнала. Команда применяется к DataStore, результат сохраняется
 // в полях ResultValue/ResultFound команды и возвращается в future клиента.
+// Байты команды, восстановленные из журнала, строго декодируются; при
+// ошибке результатом записи будет ошибка errCorruptCommand, а не Command.
 func (kvs *KVService) Apply(log *raft.LogEntry) any {
 	var cmd Command
 	switch data := log.Data.(type) {
 	case *commandData:
 		if data == nil {
-			kvs.traceLogf("nil command data")
 			return nil
 		}
 		cmd = data.cmd
 	case Command:
 		cmd = data
+	case []byte:
+		// Байты вне LogCommand (например, конфигурационные) — не KV-команда.
+		if log.Type != raft.LogCommand {
+			return nil
+		}
+		decoded, err := DecodeCommand(data)
+		if err != nil {
+			return fmt.Errorf("%w at index %d: %w", errCorruptCommand, log.Index, err)
+		}
+		cmd = decoded
 	default:
 		kvs.traceLogf("unknown command type %T", log.Data)
 		return nil

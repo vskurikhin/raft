@@ -198,10 +198,11 @@ func TestFSMResultsMatchLegacyCommand(t *testing.T) {
 }
 
 // TestFSMIgnoresForeignData: nil, произвольные значения и пустой носитель
-// дают прежний ответ nil, без нулевой успешной команды.
+// дают прежний ответ nil, без нулевой успешной команды. Байты команды
+// проверяет TestFSMRejectsCorruptCommandBytes.
 func TestFSMIgnoresForeignData(t *testing.T) {
 	kvs := &KVService{ds: NewDataStore()}
-	for _, data := range []any{nil, "text", []byte("config"), 42, (*commandData)(nil), Command{Kind: CommandInvalid}} {
+	for _, data := range []any{nil, "text", 42, (*commandData)(nil), Command{Kind: CommandInvalid}} {
 		if got := kvs.Apply(&raft.LogEntry{Data: data}); got != nil {
 			t.Fatalf("Apply(%T) = %+v, want nil", data, got)
 		}

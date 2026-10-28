@@ -24,7 +24,7 @@ const v1LogFixtureHex = "524146545053540000010000000000000000006e95328e220dff830
 	"6c6f0001040102010200"
 
 // v1LogFrame возвращает реальные байты журнала версии 1 из фикстуры. Такие
-// байты обязана отвергать сборка версии 2.
+// байты обязана отвергать сборка версии 3.
 func v1LogFrame(t *testing.T) []byte {
 	t.Helper()
 	raw, err := hex.DecodeString(v1LogFixtureHex)
@@ -36,7 +36,7 @@ func v1LogFrame(t *testing.T) []byte {
 
 // rawLogPacket собирает структурно корректный пакет с произвольными байтами
 // Data: контрольные суммы и длины согласованы, содержимое Data может быть
-// недекодируемым gob. Нужен для проверки отложенного декодирования.
+// недекодируемой. Нужен для проверки отложенного декодирования.
 func rawLogPacket(t *testing.T, data ...[]byte) []byte {
 	t.Helper()
 	var body []byte
@@ -47,10 +47,10 @@ func rawLogPacket(t *testing.T, data ...[]byte) []byte {
 	return buildLogPacket(t, body, uint64(len(data)))
 }
 
-// TestLoadAllLogV2WithScalarV1 проверяет штатное сочетание: журнал версии 2
+// TestLoadAllLogV3WithScalarV1 проверяет штатное сочетание: журнал версии 3
 // и скалярные ключи версии 1 загружаются вместе, журнал читается через
 // LoadLog, зарезервированный ключ через Get недоступен.
-func TestLoadAllLogV2WithScalarV1(t *testing.T) {
+func TestLoadAllLogV3WithScalarV1(t *testing.T) {
 	dir := t.TempDir()
 	entries := []contract.LogEntry{
 		contractEntry(0, 0, contract.LogNoop, nil),
@@ -80,7 +80,7 @@ func TestLoadAllLogV2WithScalarV1(t *testing.T) {
 }
 
 // TestLoadAllRejectsLogV1 проверяет, что журнал версии 1 отвергается
-// загрузчиком версии 2 до запуска протокола: старой сборке и новой
+// загрузчиком версии 3 до запуска протокола: старой сборке и новой
 // соответствуют несовместимые форматы одной роли файла.
 func TestLoadAllRejectsLogV1(t *testing.T) {
 	dir := t.TempDir()
@@ -96,7 +96,7 @@ func TestLoadAllRejectsLogV1(t *testing.T) {
 }
 
 // TestV1LogFixtureSHA записи версии 1: байты фикстуры побайтово
-// зафиксированы хешем SHA-256 и отвергаются загрузчиком версии 2. Хеш
+// зафиксированы хешем SHA-256 и отвергаются загрузчиком версии 3. Хеш
 // предназначен для сверки в отчётах о долговечности.
 func TestV1LogFixtureSHA(t *testing.T) {
 	raw := v1LogFrame(t)
@@ -114,15 +114,15 @@ func TestV1LogFixtureSHA(t *testing.T) {
 	}
 }
 
-// TestLoadAllRejectsScalarV2 проверяет, что скалярный ключ с версией кадра 2
+// TestLoadAllRejectsScalarV3 проверяет, что скалярный ключ с версией кадра 3
 // отвергается: версии распределены по ролям файлов, скаляры остаются v1.
-func TestLoadAllRejectsScalarV2(t *testing.T) {
+func TestLoadAllRejectsScalarV3(t *testing.T) {
 	dir := t.TempDir()
 	writeDatFile(t, dir, "scalar.dat", mustEncodeFile(t, nil))
 
 	err := loadAllWithDefaultSeams(dir)
 	if err == nil {
-		t.Fatal("loadAll вернул nil на скаляре версии 2, want отказ")
+		t.Fatal("loadAll вернул nil на скаляре версии 3, want отказ")
 	}
 	if !strings.Contains(err.Error(), "scalar.dat") {
 		t.Fatalf("ошибка %q не содержит путь scalar.dat", err)
@@ -135,7 +135,7 @@ func TestLoadAllRejectsScalarV2(t *testing.T) {
 func TestLoadLogDefersDataDecode(t *testing.T) {
 	dir := t.TempDir()
 	header := encodeLogFileHeader()
-	// Структурно корректный пакет с байтами, которые не являются gob.
+	// Структурно корректный пакет с Data неизвестной версии.
 	file := append(header[:], rawLogPacket(t, []byte{0xff, 0xff, 0xff, 0xff})...)
 	writeDatFile(t, dir, _logFileName, file)
 

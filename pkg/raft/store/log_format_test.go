@@ -28,11 +28,11 @@ func registerLogCodecTestPayload() {
 	gob.Register(LogCodecTestPayload{})
 }
 
-// mustEncodeLogData кодирует одну Data потоком gob и завершает тест при
+// mustEncodeLogData кодирует одну Data записи типа typ и завершает тест при
 // ошибке.
-func mustEncodeLogData(t *testing.T, data any) []byte {
+func mustEncodeLogData(t *testing.T, typ contract.LogType, data any) []byte {
 	t.Helper()
-	encoded, err := encodeLogData(data)
+	encoded, err := encodeLogData(typ, data)
 	if err != nil {
 		t.Fatalf("кодирование Data: %v", err)
 	}
@@ -126,8 +126,8 @@ func requireSameEntries(t *testing.T, got, want []contract.LogEntry) {
 // поле и CRC байт 0..19. Вектор зафиксирован заранее и не вычисляется из
 // реализации.
 func TestLogFileHeaderGolden(t *testing.T) {
-	wantHex := "5241465450535400" + "0002" + "0018" +
-		"0000000000000000" + "5a43f8c8"
+	wantHex := "5241465450535400" + "0003" + "0018" +
+		"0000000000000000" + "cd320f09"
 
 	header := encodeLogFileHeader()
 	want := mustDecodeHex(t, wantHex)
@@ -149,12 +149,12 @@ func TestLogFileHeaderGolden(t *testing.T) {
 }
 
 // TestLogFileEmptyGolden проверяет кодирование пустого журнала: заголовок
-// файла и один пустой пакет без gob-данных.
+// файла и один пустой пакет без Data.
 func TestLogFileEmptyGolden(t *testing.T) {
-	wantHex := "5241465450535400" + "0002" + "0018" + "0000000000000000" + "5a43f8c8" +
-		"524c4232" + "00000000" + "0000000000000000" + "0000000000000000" +
-		"9a2c13fe" + "00000000" +
-		"a899011d" + "524c434d49543200"
+	wantHex := "5241465450535400" + "0003" + "0018" + "0000000000000000" + "cd320f09" +
+		"524c4233" + "00000000" + "0000000000000000" + "0000000000000000" +
+		"b418d863" + "00000000" +
+		"1df93e68" + "524c434d49543300"
 
 	file := mustEncodeFile(t, nil)
 	want := mustDecodeHex(t, wantHex)
@@ -165,8 +165,8 @@ func TestLogFileEmptyGolden(t *testing.T) {
 
 // TestLogBatchGoldenNonEmpty проверяет пакет с непустыми Data и числовыми
 // полями: смещения, big-endian и независимо пересчитанные CRC заголовка
-// пакета и footer. Байты потока gob не фиксируются: их идентификаторы типов
-// зависят от регистраций пакета, поэтому вектор намеренно не побайтовый.
+// пакета и footer. Байты команды пишутся тегом 3 без gob, поэтому Data
+// фиксируется побайтово: версия 1, тег 3 и исходные байты.
 func TestLogBatchGoldenNonEmpty(t *testing.T) {
 	registerLogCodecTestPayload()
 	entries := []contract.LogEntry{{Index: 7, Term: 3, Type: contract.LogCommand, Data: []byte("gold")}}
@@ -197,6 +197,9 @@ func TestLogBatchGoldenNonEmpty(t *testing.T) {
 	}
 	if hasNonZero(packet[49:56]) {
 		t.Fatalf("reserved записи не нулевой: %x", packet[49:56])
+	}
+	if got, want := packet[64:len(packet)-logFooterSize], []byte("\x01\x03gold"); !bytes.Equal(got, want) {
+		t.Fatalf("Data = %x, want %x", got, want)
 	}
 	dataLength := binary.BigEndian.Uint64(packet[56:64])
 	if dataLength != uint64(len(packet)-logBatchHeaderSize-32-logFooterSize) {
@@ -261,7 +264,7 @@ func TestLogDataStreamsAreIndependent(t *testing.T) {
 		t.Fatalf("число записей = %d, want %d", len(scan.entries), len(entries))
 	}
 	for i := range scan.entries {
-		value, err := decodeLogData(scan.entries[i].data)
+		value, err := decodeLogData(scan.entries[i].typ, scan.entries[i].data)
 		if err != nil {
 			t.Fatalf("независимое декодирование записи %d: %v", i, err)
 		}
@@ -272,7 +275,7 @@ func TestLogDataStreamsAreIndependent(t *testing.T) {
 }
 
 // TestScanLogFileKeepsEncodedData проверяет, что структурный разбор не
-// декодирует gob, а сохраняет закодированные байты Data точно такими,
+// декодирует Data, а сохраняет закодированные байты Data точно такими,
 // какими их создал кодировщик.
 func TestScanLogFileKeepsEncodedData(t *testing.T) {
 	entries := []contract.LogEntry{
@@ -287,7 +290,7 @@ func TestScanLogFileKeepsEncodedData(t *testing.T) {
 		t.Fatal("структурный разбор вернул хвост на целом файле")
 	}
 	for i := range scan.entries {
-		want := mustEncodeLogData(t, entries[i].Data)
+		want := mustEncodeLogData(t, entries[i].Type, entries[i].Data)
 		if !bytes.Equal(scan.entries[i].data, want) {
 			t.Fatalf("закодированные Data записи %d = %x, want %x", i, scan.entries[i].data, want)
 		}
@@ -448,9 +451,9 @@ func TestDecodeLogFileCorruption(t *testing.T) {
 }
 
 // TestDecodeLogFileExtraDataBytes проверяет, что лишние байты в области Data
-// (gob декодировал одно значение, но область не исчерпана) — повреждение.
+// после тега nil — повреждение.
 func TestDecodeLogFileExtraDataBytes(t *testing.T) {
-	data := mustEncodeLogData(t, nil)
+	data := mustEncodeLogData(t, contract.LogNoop, nil)
 	data = append(data, 0x7f)
 	body := append(buildEntryRecord(0, 0, contract.LogNoop, uint64(len(data))), data...)
 	packet := buildLogPacket(t, body, 1)

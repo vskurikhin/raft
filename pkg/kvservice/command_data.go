@@ -13,9 +13,15 @@ const _commandDataName = "raft.kv.command-data.v1"
 // значение не меняется.
 var _encodeCommandFunc = EncodeCommand
 
-// errEmptyCommandData — носитель создан в обход конструктора и не имеет
-// готового представления.
-var errEmptyCommandData = errors.New("kvservice: command data has no encoded representation")
+var (
+	// errEmptyCommandData — носитель создан в обход конструктора и не имеет
+	// готового представления.
+	errEmptyCommandData = errors.New("kvservice: command data has no encoded representation")
+
+	// errCorruptCommand — байты команды из журнала не декодируются. FSM
+	// возвращает её результатом записи вместо Command.
+	errCorruptCommand = errors.New("kvservice: corrupt command in log")
+)
 
 // commandData — закрытый неизменяемый носитель KV-команды в журнале Raft.
 // Хранит команду и её готовое представление: кодек вызывается один раз в
@@ -68,6 +74,15 @@ func (c *commandData) GobEncode() ([]byte, error) {
 		return nil, errEmptyCommandData
 	}
 	return c.encoded[:len(c.encoded):len(c.encoded)], nil
+}
+
+// RaftCommandBytes отдаёт хранилищу журнала готовое представление команды:
+// журнал версии 3 пишет его тегом 3 без gob. Вызывается под блокировками
+// консенсус-модуля и хранилища, поэтому только читает носитель: без кодека,
+// блокировок, каналов и ввода-вывода. Хранилище копирует байты в кадр и не
+// изменяет их; срез ограничен по ёмкости, как в GobEncode.
+func (c *commandData) RaftCommandBytes() []byte {
+	return c.encoded[:len(c.encoded):len(c.encoded)]
 }
 
 // GobDecode реализует gob.GobDecoder. gob передаёт срез своего внутреннего

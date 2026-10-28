@@ -328,14 +328,14 @@ func (c *testCluster) leaderIndex(t *testing.T) int {
 	return -1
 }
 
-// logHasKey сообщает, что журнал узла содержит носитель с ключом key.
+// logHasKey сообщает, что журнал узла содержит команду с ключом key.
 func logHasKey(ms *store.MapStorage, key string) bool {
 	entries, err := ms.LoadLog()
 	if err != nil {
 		return false
 	}
 	for _, e := range entries {
-		if data, ok := e.Data.(*commandData); ok && data.cmd.Key == key {
+		if cmd, ok := logEntryCommand(e.Data); ok && cmd.Key == key {
 			return true
 		}
 	}
