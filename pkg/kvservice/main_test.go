@@ -11,5 +11,8 @@ func TestMain(m *testing.M) {
 		_, _ = os.Stderr.WriteString("kvservice: trace configuration failed: " + err.Error() + "\n")
 		os.Exit(1)
 	}
+	// Подмена кодека до запуска тестов: вызовы считаются по путям.
+	_encodeCommandFunc = recordingEncodeCommand
+	registerGobTypes()
 	os.Exit(m.Run())
 }

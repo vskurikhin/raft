@@ -3,7 +3,6 @@ package kvservice
 
 import (
 	"context"
-	"encoding/gob"
 	"errors"
 	"fmt"
 	"io"
@@ -157,7 +156,7 @@ type Config struct {
 // KVService реализует raft.FSM: зафиксированные записи журнала применяются
 // непосредственно к DataStore через метод Apply.
 func New(cfg *Config, readyChan <-chan any) *KVService {
-	gob.Register(Command{})
+	registerGobTypes()
 
 	// Контракт трассировки: SetTrace должен быть вызван
 	// строго до создания первого сервиса. Флаг гарантирует
@@ -214,8 +213,17 @@ func NewKVService(address string, id int, peerIds []int, storage raft.LogStorage
 // записи журнала. Команда применяется к DataStore, результат сохраняется
 // в полях ResultValue/ResultFound команды и возвращается в future клиента.
 func (kvs *KVService) Apply(log *raft.LogEntry) any {
-	cmd, ok := log.Data.(Command)
-	if !ok {
+	var cmd Command
+	switch data := log.Data.(type) {
+	case *commandData:
+		if data == nil {
+			kvs.traceLogf("nil command data")
+			return nil
+		}
+		cmd = data.cmd
+	case Command:
+		cmd = data
+	default:
 		kvs.traceLogf("unknown command type %T", log.Data)
 		return nil
 	}
@@ -414,6 +422,18 @@ func (kvs *KVService) sendHTTPResponse(w http.ResponseWriter, v any) {
 	}
 }
 
+// applyCommand проверяет команду до Apply и передаёт в Raft её закрытый
+// носитель. Ошибка проверки возвращается клиенту ответом 400, и тогда
+// результат false: Apply не вызывается.
+func (kvs *KVService) applyCommand(w http.ResponseWriter, cmd *Command) (raft.ApplyFuture, bool) {
+	data, err := newCommandData(cmd)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return nil, false
+	}
+	return kvs.rs.Apply(data, _requestTimeout), true
+}
+
 func (kvs *KVService) handleVerifyLeader(w http.ResponseWriter, _ *http.Request) {
 	// Вердикт о лидерстве актуален только на момент кворумного
 	// подтверждения ReadIndex — запрещаем хранение ответа кешами.
@@ -488,7 +508,10 @@ func (kvs *KVService) handleCAS(w http.ResponseWriter, req *http.Request) {
 		ID:           kvs.id,
 	}
 
-	future := kvs.rs.Apply(cmd, _requestTimeout)
+	future, ok := kvs.applyCommand(w, &cmd)
+	if !ok {
+		return
+	}
 
 	select {
 	case err := <-future.ErrorCh():
@@ -537,7 +560,10 @@ func (kvs *KVService) handleDelete(w http.ResponseWriter, req *http.Request) {
 		ID:   kvs.id,
 	}
 
-	future := kvs.rs.Apply(cmd, _requestTimeout)
+	future, ok := kvs.applyCommand(w, &cmd)
+	if !ok {
+		return
+	}
 
 	select {
 	case err := <-future.ErrorCh():
@@ -586,7 +612,10 @@ func (kvs *KVService) handleGet(w http.ResponseWriter, req *http.Request) {
 		ID:   kvs.id,
 	}
 
-	future := kvs.rs.Apply(cmd, _requestTimeout)
+	future, ok := kvs.applyCommand(w, &cmd)
+	if !ok {
+		return
+	}
 
 	select {
 	case err := <-future.ErrorCh():
@@ -636,7 +665,10 @@ func (kvs *KVService) handlePut(w http.ResponseWriter, req *http.Request) {
 		ID:    kvs.id,
 	}
 
-	future := kvs.rs.Apply(cmd, _requestTimeout)
+	future, ok := kvs.applyCommand(w, &cmd)
+	if !ok {
+		return
+	}
 
 	select {
 	case err := <-future.ErrorCh():
