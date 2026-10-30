@@ -639,14 +639,23 @@ func TestApplyNoQuorumThenNewLeader(t *testing.T) {
 
 // --- Benchmarks ---
 
+// leaderRoleB возвращает true, если узел уже избран лидером. Короткий
+// помощник чтения роли под cm.mu (Lock/defer Unlock в одной функции);
+// блокировка не удерживается при ожидании.
+func leaderRoleB(cm *ConsensusModule) bool {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	return cm.cmState.state == Leader
+}
+
 func waitForLeaderB(t testing.TB, cm *ConsensusModule) {
 	t.Helper()
-	deadline := time.After(800 * time.Millisecond)
+	// Окно покрывает верхнюю границу продуктового таймера выборов
+	// [DefaultReelectionTimeout; 2·DefaultReelectionTimeout) с запасом 500 мс
+	// (ADR-1010-09): 1360 мс на базисе, 2000 мс после смены умолчания на 750 мс.
+	deadline := time.After(2*DefaultReelectionTimeout + 500*time.Millisecond)
 	for {
-		cm.mu.Lock()
-		isLeader := cm.cmState.state == Leader
-		cm.mu.Unlock()
-		if isLeader {
+		if leaderRoleB(cm) {
 			return
 		}
 		select {

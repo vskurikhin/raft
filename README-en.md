@@ -174,17 +174,18 @@ editing the Makefile, for example `make start-raft DURATION=1m`:
 |------------------------|-------------------------|------------------|
 | `APPLY_BATCH_INTERVAL` | `-apply-batch-interval` | 50               |
 | `HEARTBEAT_TIMEOUT`    | `-heartbeat-timeout`    | 45               |
-| `REELECTION_TIMEOUT`   | `-reelection-timeout`   | 500              |
+| `REELECTION_TIMEOUT`   | `-reelection-timeout`   | 750              |
 | `TICKER_TIMEOUT`       | `-ticker-timeout`       | 20               |
 | `TRACE_LOG_LEVEL`      | `-trace-log-level`      | 0                |
-| `CONCURRENCY`          | `-concurrency`          | 8                |
+| `CONCURRENCY`          | `-concurrency`          | 2048             |
 | `DELETE_PERCENT`       | `-delete-percent`       | 0                |
 | `DURATION`             | `-duration`             | 5m               |
-| `GET_PERCENT`          | `-get-percent`          | 75               |
-| `REQUEST_RATE`         | `-request-rate`         | 200              |
-| `VALUE_SIZE`           | `-value-size`           | 128              |
-| `VERIFY_PERCENT`       | `-verify-percent`       | 33               |
-| `WEAK_GET_PERCENT`     | `-weak-get-percent`     | 0                |
+| `GET_PERCENT`          | `-get-percent`          | 5                |
+| `KEY_COUNT`            | `-key-count`            | 15000            |
+| `REQUEST_RATE`         | `-request-rate`         | 600              |
+| `VALUE_SIZE`           | `-value-size`           | 1024             |
+| `VERIFY_PERCENT`       | `-verify-percent`       | 5                |
+| `WEAK_GET_PERCENT`     | `-weak-get-percent`     | 70               |
 | `STAND`                | —                       | empty            |
 
 The `STAND` variable sets a prefix for stand artifact file names
@@ -222,16 +223,26 @@ Default values of the node timing parameters:
 | Parameter                                      | Node (flag default) | Stand (Makefile) |
 |------------------------------------------------|---------------------|------------------|
 | Heartbeat period (`-heartbeat-timeout`)        | 33 ms               | 45 ms            |
-| Election timeout base (`-reelection-timeout`)  | 430 ms              | 500 ms           |
+| Election timeout base (`-reelection-timeout`)  | 750 ms              | 750 ms           |
 | Election ticker tick (`-ticker-timeout`)       | 20 ms               | 20 ms            |
 | Apply batch interval (`-apply-batch-interval`) | 50 ms               | 50 ms            |
 | Trace level (`-trace-log-level`)               | 1                   | 0                |
+
+The election timeout base is the same for the node and the stand
+(750 ms) and equals the node default; the stand differs from the node
+defaults only in the heartbeat period (45 ms versus 33 ms) and the trace
+level (0 versus 1). The generator's duration on the stand is 5 minutes
+(`DURATION=5m`), whereas the `loadkv` program's own default is 0, that
+is, running until the stop signal.
 
 The parameters are tied by the invariant
 `reelection-timeout ≥ 10·heartbeat-timeout` (as well as
 `ticker-timeout ≤ reelection-timeout/10`,
 `apply-batch-interval ≤ reelection-timeout`, and
 `reelection-timeout > 2 × raft.TCPRPCTimeout = 400 ms`).
+With a base of 750 ms the heartbeat ceiling set by the invariant is
+75 ms; the absolute upper bound of the heartbeat range, 100 ms, applies
+independently.
 The check runs at startup with a fail-fast strategy: an invalid
 combination terminates the process before any work starts, and the
 message lists every violation.
@@ -268,20 +279,24 @@ The `-trace-log-level` flag sets the trace threshold of the consensus
 module. A message of level l is printed when l < threshold; the message
 layer constants are 0/1/2/4/8/16. The flag works as follows:
 
-* with `-trace-log-level=0`, the consensus module’s per-second
-  statistics output to stdout is fully disabled: neither the latency
-  line nor the counters line is printed;
-* with a value ≥ 1, both lines are printed once per second — the
-  latency report and the counters report;
-* higher threshold steps add layers of trace messages without turning
-  off the previous ones: 1 — key events (role and term changes,
-  voting), 2 — the flow of the election and leader loops, 3 —
-  progress events (election win, commit index advance), 5 — pre-vote
-  and snapshot delivery, 9 — replication (AppendEntries, heartbeat),
-  17 — full log dump;
+* with `-trace-log-level=0`, no trace messages are printed;
+* a value ≥ 1 adds layers of trace messages without turning off the
+  previous ones: 1 — key events (role and term changes, voting), 2 —
+  the flow of the election and leader loops, 3 — progress events
+  (election win, commit index advance), 5 — pre-vote and snapshot
+  delivery, 9 — replication (AppendEntries, heartbeat), 17 — full log
+  dump;
 * the default value of the flag (in the compiled binary) is 1; the
-  Makefile sets `TRACE_LOG_LEVEL=0` for the stand, so the per-second
-  statistics output to stdout is disabled.
+  Makefile sets `TRACE_LOG_LEVEL=0` for the stand.
+
+The consensus module's periodic stats output (three lines per second —
+latency, Raft counters, and the PersistV2 JSON document) is governed by
+a separate `-stats-output` flag and is **independent of**
+`-trace-log-level`. By default `-stats-output=false`: the stats lines
+are not printed, while the per-second metric collection keeps running.
+The stand does not pass `-stats-output`, so the nodes' periodic stats
+are not published on the stand; changing only the trace level does not
+turn the stats lines on.
 
 Trace files are set by the flags `-trace-cm-log-file` and
 `-trace-kv-log-file` (empty value — the standard error stream).
@@ -295,8 +310,8 @@ the `INFO` level; on the stand they are written to `trace/loadkv.out`.
 The example below illustrates the format: its values are illustrative
 and do not come from a single run.
 
-    rps: seconds=3 mean=200.0 median=200.0 stddev=10.0 min=190 max=210 total=600
-    ops: done=29903 (get=75.2% put=24.8% verify=0.0% weak-get=0.0% delete=0.0% delete-verify=0.0%)
+    rps: seconds=3 mean=600.0 median=600.0 stddev=10.0 min=590 max=610 total=1800
+    ops: done=29903 (get=5.0% put=23.8% verify=1.2% weak-get=70.0% delete=0.0% delete-verify=0.0%)
 
 The `rps:` line contains statistics of the per-second operation rate.
 Every second the generator prints an `RPS=` line and stores its value
