@@ -380,6 +380,13 @@ only the generator: `raftkv` nodes and protocols are unaffected.
 * [docs/API-ConsensusModule.md](docs/API-ConsensusModule.md) —
   consensus module API reference (package `raft`); an English twin
   `docs/API-ConsensusModule-en.md` exists;
+* [docs/API-Data-v3.md](docs/API-Data-v3.md) — the byte `Data`
+  contract (`Apply([]byte)`, KVC1 command, log version 3, AppendEntries
+  network representation); an English twin `docs/API-Data-v3-en.md`
+  exists;
+* [docs/Data-v3-migration.md](docs/Data-v3-migration.md) — moving to
+  the byte `Data` contract on a clean cluster, backup, and rollback; an
+  English twin `docs/Data-v3-migration-en.md` exists;
 * [docs/Flags.md](docs/Flags.md) — command-line flag reference for
   raftkv and loadkv; an English twin `docs/Flags-en.md` exists;
 * [docs/API-HTTP.md](docs/API-HTTP.md) — HTTP API reference of the KV

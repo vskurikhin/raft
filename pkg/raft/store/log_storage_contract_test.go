@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"errors"
 	"slices"
 	"sync"
@@ -197,7 +198,7 @@ func runLogStorageContract(t *testing.T, newStorage func(t *testing.T) contract.
 		if err != nil {
 			t.Fatalf("LoadLog: %v", err)
 		}
-		loaded[0].Data.([]byte)[0] = 0xee
+		loaded[0].Data[0] = 0xee
 		loaded[0].Index = 99
 
 		again, err := storage.LoadLog()
@@ -208,46 +209,37 @@ func runLogStorageContract(t *testing.T, newStorage func(t *testing.T) contract.
 		requireSameEntries(t, again, want)
 	})
 
-	t.Run("владение вложенным графом Data", func(t *testing.T) {
-		registerLogNestedData()
+	t.Run("владение байтами Data", func(t *testing.T) {
 		storage := newStorage(t)
-		items := []int{1, 2}
 		blob := []byte{3, 4}
 		storage.RewriteLog([]contract.LogEntry{
-			contractEntry(0, 0, contract.LogCommand, logNestedData{Items: items, Blob: blob}),
+			contractEntry(0, 0, contract.LogCommand, blob),
 		})
 
 		// Изменение входа после возврата не меняет сохранённое значение.
-		items[0] = 9
 		blob[0] = 9
 		got, err := storage.LoadLog()
 		if err != nil {
 			t.Fatalf("LoadLog: %v", err)
 		}
-		first, ok := got[0].Data.(logNestedData)
-		if !ok {
-			t.Fatalf("Data = %T, want logNestedData", got[0].Data)
-		}
-		if first.Items[0] != 1 || first.Blob[0] != 3 {
-			t.Fatalf("сохранённое значение повреждено входом: %+v", first)
+		if !bytes.Equal(got[0].Data, []byte{3, 4}) {
+			t.Fatalf("сохранённое значение повреждено входом: %x", got[0].Data)
 		}
 
 		// Изменение результата не меняет хранилище.
-		first.Items[0] = 7
-		first.Blob[0] = 7
+		got[0].Data[0] = 7
 		again, err := storage.LoadLog()
 		if err != nil {
 			t.Fatalf("повторный LoadLog: %v", err)
 		}
-		second := again[0].Data.(logNestedData)
-		if second.Items[0] != 1 || second.Blob[0] != 3 {
-			t.Fatalf("хранилище изменено результатом LoadLog: %+v", second)
+		if !bytes.Equal(again[0].Data, []byte{3, 4}) {
+			t.Fatalf("хранилище изменено результатом LoadLog: %x", again[0].Data)
 		}
 	})
 }
 
 // contractEntry собирает запись журнала для контрактных случаев.
-func contractEntry(index, term int, logType contract.LogType, data any) contract.LogEntry {
+func contractEntry(index, term int, logType contract.LogType, data []byte) contract.LogEntry {
 	return contract.LogEntry{Index: index, Term: term, Type: logType, Data: data}
 }
 
@@ -312,19 +304,14 @@ func (s *contractTestStorage) LoadLog() ([]contract.LogEntry, error) {
 	return cloneContractEntries(s.entries), nil
 }
 
-// cloneContractEntries копирует записи и их вложенные изменяемые значения,
-// чтобы приспособление не делило данные с вызывающим.
+// cloneContractEntries копирует записи и их байты Data, чтобы
+// приспособление не делило данные с вызывающим. nil остаётся nil.
 func cloneContractEntries(entries []contract.LogEntry) []contract.LogEntry {
 	out := make([]contract.LogEntry, len(entries))
 	for i := range entries {
 		out[i] = entries[i]
-		switch data := entries[i].Data.(type) {
-		case []byte:
-			out[i].Data = slices.Clone(data)
-		case logNestedData:
-			data.Items = slices.Clone(data.Items)
-			data.Blob = slices.Clone(data.Blob)
-			out[i].Data = data
+		if entries[i].Data != nil {
+			out[i].Data = slices.Clone(entries[i].Data)
 		}
 	}
 	return out

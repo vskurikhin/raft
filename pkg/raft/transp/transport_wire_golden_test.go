@@ -21,21 +21,23 @@ type wireProbe struct {
 
 // TestWireLabelsGolden — постоянный эталонный тест меток gob.
 //
-// Метки десяти RPC-типов закреплены в init() (transport_tcp.go) полным
+// Метки одиннадцати RPC-типов закреплены в init() (transport_tcp.go) полным
 // путём импорта корневого пакета github.com/vskurikhin/raft и являются
 // частью контракта: изменение или удаление метки
 // (например, «исправление» на contract.<ИмяТипа>) нарушило бы
-// декодирование RPC между узлами разных версий кластера.
-// Эталонные метки хранятся в testdata/wire_labels.txt
-// (по одной строке на каждый тип).
+// декодирование RPC между узлами разных версий кластера. Метка
+// AppendEntriesArgs сохранена только для явного отказа прежнего сетевого
+// представления AppendEntries; рабочее представление — AppendEntriesBytesV1
+// (см. ADR-1013-07). Эталонные метки хранятся в
+// testdata/wire_labels.txt (по одной строке на каждый тип).
 //
 // Тест для каждого типа кодирует значение через интерфейсное поле и
 // требует вхождения байт эталонной метки в кодированный поток. При
 // несовпадении — fatal с ожидаемой и фактической метками.
 func TestWireLabelsGolden(t *testing.T) {
 	labels := readWireLabels(t)
-	if len(labels) != 10 {
-		t.Fatalf("testdata/wire_labels.txt содержит %d строк, want 10", len(labels))
+	if len(labels) != 11 {
+		t.Fatalf("testdata/wire_labels.txt содержит %d строк, want 11", len(labels))
 	}
 
 	tests := []struct {
@@ -43,6 +45,7 @@ func TestWireLabelsGolden(t *testing.T) {
 		value any
 	}{
 		{"AppendEntriesArgs", contract.AppendEntriesArgs{}},
+		{"AppendEntriesBytesV1", appendEntriesBytesV1{}},
 		{"AppendEntriesReply", contract.AppendEntriesReply{}},
 		{"RequestVoteArgs", contract.RequestVoteArgs{}},
 		{"RequestVoteReply", contract.RequestVoteReply{}},

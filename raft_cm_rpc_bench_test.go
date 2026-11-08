@@ -13,11 +13,12 @@ import (
 const (
 	benchAppendInitialLog = 100
 	benchAppendBatch      = 16
-	// benchAppendData — небольшая полезная нагрузка записей батча.
-	// Содержимое данных не влияет на измеряемый путь обработчика:
-	// записи типа LogCommand не разбираются и не применяются.
-	benchAppendData = "cmd"
 )
+
+// benchAppendData — небольшая полезная нагрузка записей батча.
+// Содержимое данных не влияет на измеряемый путь обработчика:
+// записи типа LogCommand не разбираются и не применяются.
+var benchAppendData = []byte("cmd")
 
 // newAppendEntriesBenchCM собирает ведомого с журналом из n записей
 // (индексы 1..n, терм 1, тип LogCommand) прямой инициализацией структуры,

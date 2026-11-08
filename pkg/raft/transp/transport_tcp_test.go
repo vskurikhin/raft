@@ -617,7 +617,7 @@ func TestTCPGobRegistration(t *testing.T) {
 			PrevLogIndex: -1,
 			PrevLogTerm:  -1,
 			Entries: []raft.LogEntry{
-				{Index: 0, Term: 1, Type: raft.LogCommand, Data: "test"},
+				{Index: 0, Term: 1, Type: raft.LogCommand, Data: []byte("test")},
 			},
 			LeaderCommit: -1,
 		}

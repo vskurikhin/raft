@@ -382,6 +382,13 @@ ok/bad` есть только в строке `done:`.
 * [docs/API-ConsensusModule.md](docs/API-ConsensusModule.md) —
   справочник API консенсус-модуля (пакет `raft`), есть английский
   двойник `docs/API-ConsensusModule-en.md`;
+* [docs/API-Data-v3.md](docs/API-Data-v3.md) — байтовый контракт
+  `Data` (`Apply([]byte)`, команда KVC1, журнал версии 3, сетевое
+  представление AppendEntries), есть английский двойник
+  `docs/API-Data-v3-en.md`;
+* [docs/Data-v3-migration.md](docs/Data-v3-migration.md) — переход
+  на байтовый контракт `Data` на чистом кластере, бэкап и откат, есть
+  английский двойник `docs/Data-v3-migration-en.md`;
 * [docs/Flags.md](docs/Flags.md) — справочник флагов командной строки
   raftkv и loadkv, есть английский двойник `docs/Flags-en.md`;
 * [docs/API-HTTP.md](docs/API-HTTP.md) — справочник HTTP API

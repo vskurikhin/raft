@@ -2,26 +2,12 @@ package store
 
 import (
 	"bytes"
-	"encoding/gob"
 	"errors"
 	"sync"
 	"testing"
 
 	"github.com/vskurikhin/raft/pkg/raft/contract"
 )
-
-// logNestedData — зарегистрированный тип Data с вложенными изменяемыми
-// значениями: проверяет, что хранилище не удерживает граф вызывающего.
-type logNestedData struct {
-	Items []int
-	Blob  []byte
-}
-
-// registerLogNestedData регистрирует тестовый тип в gob. Повторная
-// регистрация того же типа безопасна.
-func registerLogNestedData() {
-	gob.Register(logNestedData{})
-}
 
 // TestFileStorageLogCounters проверяет наблюдаемые байты и число записей:
 // обычное добавление учитывает только свой пакет, замена и усечение — размер
@@ -100,44 +86,35 @@ func TestFileStorageStoreLogEntriesMissingJournal(t *testing.T) {
 	}
 }
 
-// TestFileStorageLogNestedDataIndependence проверяет независимость вложенного
-// изменяемого графа: изменение входа после записи и результата LoadLog не
-// затрагивает хранилище.
-func TestFileStorageLogNestedDataIndependence(t *testing.T) {
-	registerLogNestedData()
+// TestFileStorageLogBytesIndependence проверяет независимость владения
+// байтами: изменение входа после записи и результата LoadLog не затрагивает
+// хранилище.
+func TestFileStorageLogBytesIndependence(t *testing.T) {
 	fs := NewFileStorage(t.TempDir())
 
-	items := []int{7, 8}
 	blob := []byte{1, 2, 3}
 	fs.RewriteLog([]contract.LogEntry{
-		contractEntry(0, 0, contract.LogCommand, logNestedData{Items: items, Blob: blob}),
+		contractEntry(0, 0, contract.LogCommand, blob),
 	})
 
 	// Изменение входа после возврата не меняет сохранённое значение.
-	items[0] = 99
 	blob[0] = 99
 	got, err := fs.LoadLog()
 	if err != nil {
 		t.Fatalf("LoadLog: %v", err)
 	}
-	first, ok := got[0].Data.(logNestedData)
-	if !ok {
-		t.Fatalf("Data = %T, want logNestedData", got[0].Data)
-	}
-	if first.Items[0] != 7 || first.Blob[0] != 1 {
-		t.Fatalf("сохранённое значение повреждено входом: %+v", first)
+	if !bytes.Equal(got[0].Data, []byte{1, 2, 3}) {
+		t.Fatalf("сохранённое значение повреждено входом: %x", got[0].Data)
 	}
 
 	// Изменение результата LoadLog не меняет хранилище и следующий результат.
-	first.Items[0] = 42
-	first.Blob[0] = 42
+	got[0].Data[0] = 42
 	again, err := fs.LoadLog()
 	if err != nil {
 		t.Fatalf("повторный LoadLog: %v", err)
 	}
-	second := again[0].Data.(logNestedData)
-	if second.Items[0] != 7 || second.Blob[0] != 1 {
-		t.Fatalf("хранилище изменено результатом LoadLog: %+v", second)
+	if !bytes.Equal(again[0].Data, []byte{1, 2, 3}) {
+		t.Fatalf("хранилище изменено результатом LoadLog: %x", again[0].Data)
 	}
 }
 

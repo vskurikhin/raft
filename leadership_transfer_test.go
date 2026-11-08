@@ -291,7 +291,7 @@ func TestLeadershipTransfer_ApplyBlocked(t *testing.T) {
 	waitForTransferInProgress(t, h, origLeaderID, _commitBudgetAfterFailover)
 
 	// Apply во время catch-up должен вернуть ErrLeadershipTransferInProgress.
-	future := h.cluster[origLeaderID].Apply(44, 0)
+	future := h.cluster[origLeaderID].Apply(intCommandBytes(44), 0)
 	if err := future.Error(); err != ErrLeadershipTransferInProgress {
 		t.Fatalf("got %v, want ErrLeadershipTransferInProgress", err)
 	}

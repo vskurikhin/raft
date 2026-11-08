@@ -82,7 +82,7 @@ func TestPersistCounters_AppendEntriesCommitAdvance(t *testing.T) {
 	before := persistenceSnapshotOf(cm)
 	scalarsBefore := storage.WriteCount()
 
-	entries := []LogEntry{{Index: 0, Term: 1, Type: LogCommand, Data: "k0=v0"}}
+	entries := []LogEntry{{Index: 0, Term: 1, Type: LogCommand, Data: []byte("k0=v0")}}
 	var reply AppendEntriesReply
 	if err := cm.AppendEntries(aeArgs(-1, -1, 0, entries), &reply); err != nil {
 		t.Fatalf("AppendEntries: %v", err)
@@ -277,7 +277,7 @@ func TestPersistCounters_ElectionLeaderAppendApply(t *testing.T) {
 			candidate.logCalls, candidate.scalarCalls)
 	}
 
-	future := cm.Apply("k0=v0", 0)
+	future := cm.Apply([]byte("k0=v0"), 0)
 	if err := future.Error(); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
@@ -349,7 +349,7 @@ func TestPersistCounters_TakeSnapshot(t *testing.T) {
 	const numCommands = 10
 	for i := 0; i < numCommands; i++ {
 		cmd := "k" + itoa(i) + "=v" + itoa(i)
-		if err := cm.Apply(cmd, 0).Error(); err != nil {
+		if err := cm.Apply([]byte(cmd), 0).Error(); err != nil {
 			t.Fatalf("Apply %q: %v", cmd, err)
 		}
 	}

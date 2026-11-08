@@ -232,7 +232,7 @@ func (h *snapshotHarness) RestartPeer(id int) {
 
 // SubmitToServer отправляет команду серверу и возвращает индекс.
 func (h *snapshotHarness) SubmitToServer(serverID int, cmd string) int {
-	future := h.cluster[serverID].Apply(cmd, 0)
+	future := h.cluster[serverID].Apply([]byte(cmd), 0)
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- future.Error()
@@ -910,7 +910,7 @@ func TestSnapshot_MultipleSnapshots(t *testing.T) {
 	var phase1Idx int
 	for i := 0; i < 15; i++ {
 		cmd := fmt.Sprintf("k%d=v%d", i, i)
-		future := cm.Apply(cmd, 0)
+		future := cm.Apply([]byte(cmd), 0)
 		if err := future.Error(); err != nil {
 			t.Fatalf("Apply %q failed: %v", cmd, err)
 		}
@@ -925,7 +925,7 @@ func TestSnapshot_MultipleSnapshots(t *testing.T) {
 	var wantIdx int
 	for i := 15; i < 30; i++ {
 		cmd := fmt.Sprintf("k%d=v%d", i, i)
-		future := cm.Apply(cmd, 0)
+		future := cm.Apply([]byte(cmd), 0)
 		if err := future.Error(); err != nil {
 			t.Fatalf("Apply %q failed: %v", cmd, err)
 		}
@@ -1012,7 +1012,7 @@ func TestSnapshot_RestartRestoresFSM(t *testing.T) {
 	const numCommands = 30
 	for i := 0; i < numCommands; i++ {
 		cmd := fmt.Sprintf("k%d=v%d", i, i)
-		future := cm.Apply(cmd, 0)
+		future := cm.Apply([]byte(cmd), 0)
 		if err := future.Error(); err != nil {
 			t.Fatalf("Apply %q failed: %v", cmd, err)
 		}
@@ -1070,7 +1070,7 @@ func TestSnapshot_RestartRestoresFSM(t *testing.T) {
 	// Узел работоспособен после restore: новая команда проходит и
 	// продвижение commitIndex доигрывает суффикс лога (k29).
 	waitForLeader(t, cm2, 5*time.Second)
-	future := cm2.Apply("k30=v30", 0)
+	future := cm2.Apply([]byte("k30=v30"), 0)
 	if err := future.Error(); err != nil {
 		t.Fatalf("Apply k30 after restart failed: %v", err)
 	}

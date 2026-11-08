@@ -1,6 +1,8 @@
 package raft
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
 	"log"
 	"strings"
@@ -721,6 +723,24 @@ func waitCond(desc string, budget time.Duration, cond func() bool, diag func() s
 	)
 }
 
+// intCommandBytes кодирует числовой идентификатор команды тестового
+// приспособления в байты фиксации: CommitEntry.Data имеет тип []byte.
+func intCommandBytes(cmd int) []byte {
+	b := make([]byte, 8)
+	binary.BigEndian.PutUint64(b, uint64(cmd))
+	return b
+}
+
+// intCommandValue декодирует числовой идентификатор команды из байтов
+// фиксации; неканоническая длина — ошибка приспособления.
+func intCommandValue(t testing.TB, data []byte) int {
+	t.Helper()
+	if len(data) != 8 {
+		t.Fatalf("commits data %x is not an int command", data)
+	}
+	return int(binary.BigEndian.Uint64(data))
+}
+
 // committedOn возвращает (nc, converged):
 //   - nc — число подключённых узлов, у которых команда cmd присутствует
 //     в h.commits (в любой позиции);
@@ -747,7 +767,7 @@ func (h *Harness) committedOn(cmd int) (nc int, converged bool) {
 			lenEqual = false
 		}
 		for c := range h.commits[i] {
-			if v, ok := h.commits[i][c].Data.(int); ok && v == cmd {
+			if bytes.Equal(h.commits[i][c].Data, intCommandBytes(cmd)) {
 				nc++
 				break
 			}
@@ -766,8 +786,7 @@ func (h *Harness) committedOn(cmd int) (nc int, converged bool) {
 			if !h.connected[i] {
 				continue
 			}
-			v, ok := h.commits[i][c].Data.(int)
-			if !ok || v != cmd {
+			if !bytes.Equal(h.commits[i][c].Data, intCommandBytes(cmd)) {
 				same = false
 				break
 			}
@@ -811,7 +830,7 @@ func (h *Harness) commitValuesOn(cmd int) (nc int, lengthsConverged bool) {
 			lengthsEqual = false
 		}
 		for c := range h.commits[i] {
-			if v, ok := h.commits[i][c].Data.(int); ok && v == cmd {
+			if bytes.Equal(h.commits[i][c].Data, intCommandBytes(cmd)) {
 				nc++
 				break
 			}
@@ -841,7 +860,7 @@ func (h *Harness) checkCommittedValues(cmd int) {
 		nc++
 		found := false
 		for c := range h.commits[i] {
-			if v, ok := h.commits[i][c].Data.(int); ok && v == cmd {
+			if bytes.Equal(h.commits[i][c].Data, intCommandBytes(cmd)) {
 				found = true
 				break
 			}
@@ -902,10 +921,7 @@ func (h *Harness) CheckCommitted(cmd int) (nc int, index int) {
 		cmdAtC := -1
 		for i := 0; i < h.n; i++ {
 			if h.connected[i] {
-				cmdOfN, ok := h.commits[i][c].Data.(int)
-				if !ok {
-					h.t.Fatalf("commits[%d][%d]: data %T is not int", i, c, h.commits[i][c].Data)
-				}
+				cmdOfN := intCommandValue(h.t, h.commits[i][c].Data)
 				if cmdAtC >= 0 {
 					if cmdOfN != cmdAtC {
 						h.t.Errorf("got %d, want %d at h.commits[%d][%d]", cmdOfN, cmdAtC, i, c)
@@ -1210,10 +1226,7 @@ func (h *Harness) CheckNotCommitted(cmd int) {
 	for i := 0; i < h.n; i++ {
 		if h.connected[i] {
 			for c := 0; c < len(h.commits[i]); c++ {
-				gotCmd, ok := h.commits[i][c].Data.(int)
-				if !ok {
-					h.t.Fatalf("commits[%d][%d]: data %T is not int", i, c, h.commits[i][c].Data)
-				}
+				gotCmd := intCommandValue(h.t, h.commits[i][c].Data)
 				if gotCmd == cmd {
 					h.t.Errorf("found %d at commits[%d][%d], expected none", cmd, i, c)
 				}
@@ -1223,8 +1236,8 @@ func (h *Harness) CheckNotCommitted(cmd int) {
 }
 
 // SubmitToServer отправляет команду серверу и дожидается фиксации.
-func (h *Harness) SubmitToServer(serverId int, cmd any) int {
-	future := h.cluster[serverId].Apply(cmd, 0)
+func (h *Harness) SubmitToServer(serverId int, cmd int) int {
+	future := h.cluster[serverId].Apply(intCommandBytes(cmd), 0)
 
 	errCh := make(chan error, 1)
 	go func() {

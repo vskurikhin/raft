@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -22,7 +23,7 @@ func TestSendBatch_SkipsMissingPrefix(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	cm := &ConsensusModule{}
-	cm.cmState.log = []LogEntry{{Index: 5, Term: 1, Type: LogCommand, Data: "k=v"}}
+	cm.cmState.log = []LogEntry{{Index: 5, Term: 1, Type: LogCommand, Data: []byte("k=v")}}
 	cm.cmState.lastLogIndex = 5
 	cm.cmState.lastLogTerm = 1
 	cm.leaderState.inflight = make(map[int]*logFuture)
@@ -112,7 +113,7 @@ func TestSendBatch_CopyNotAliasedWithLog(t *testing.T) {
 	// 0..k — писатель raft_cm_rpc.go:149 перезаписывает слоты батча in-place.
 	entries := make([]LogEntry, k+1)
 	for i := 0; i <= k; i++ {
-		entries[i] = LogEntry{Index: i, Term: 2, Type: LogCommand, Data: fmt.Sprintf("rewritten-%d", i)}
+		entries[i] = LogEntry{Index: i, Term: 2, Type: LogCommand, Data: []byte(fmt.Sprintf("rewritten-%d", i))}
 	}
 	var reply2 AppendEntriesReply
 	if err := cm.AppendEntries(AppendEntriesArgs{
@@ -151,7 +152,7 @@ func TestSendBatch_CopyNotAliasedWithLog(t *testing.T) {
 		t.Fatalf("применено %d записей, ожидалось %d", len(applied), len(expected))
 	}
 	for i := range expected {
-		if applied[i] != expected[i] {
+		if string(applied[i].([]byte)) != expected[i] {
 			t.Fatalf("applied[%d] = %v, want %v (алиасинг не устранён)", i, applied[i], expected[i])
 		}
 	}
@@ -168,10 +169,10 @@ func TestFSMRetainedEntryImmutable(t *testing.T) {
 	cm.fsmMutateCh = make(chan []*commitTuple, _batchApplyBuffer)
 	cm.leaderState.inflight = make(map[int]*logFuture)
 	cm.cmState.log = []LogEntry{
-		{Index: 0, Term: 1, Type: LogCommand, Data: "v0"},
-		{Index: 1, Term: 1, Type: LogCommand, Data: "v1"},
-		{Index: 2, Term: 1, Type: LogCommand, Data: "v2"},
-		{Index: 3, Term: 1, Type: LogCommand, Data: "v3"},
+		{Index: 0, Term: 1, Type: LogCommand, Data: []byte("v0")},
+		{Index: 1, Term: 1, Type: LogCommand, Data: []byte("v1")},
+		{Index: 2, Term: 1, Type: LogCommand, Data: []byte("v2")},
+		{Index: 3, Term: 1, Type: LogCommand, Data: []byte("v3")},
 	}
 	cm.cmState.lastLogIndex = k
 	cm.cmState.lastLogTerm = 1
@@ -184,7 +185,7 @@ func TestFSMRetainedEntryImmutable(t *testing.T) {
 
 	// Конфликтная перезапись слота 0 (писатель raft_cm_rpc.go:149).
 	cm.mu.Lock()
-	cm.cmState.log[0] = LogEntry{Index: 0, Term: 2, Type: LogCommand, Data: "rewritten"}
+	cm.cmState.log[0] = LogEntry{Index: 0, Term: 2, Type: LogCommand, Data: []byte("rewritten")}
 	cm.mu.Unlock()
 
 	//Сжимаем журнал. Заменяет backing array (make+copy).
@@ -193,7 +194,7 @@ func TestFSMRetainedEntryImmutable(t *testing.T) {
 	cm.mu.Unlock()
 
 	// Удержанный объект и его payload неизменны.
-	if retained.Index != 0 || retained.Term != 1 || retained.Data != "v0" {
+	if retained.Index != 0 || retained.Term != 1 || string(retained.Data) != "v0" {
 		t.Fatalf("удержанная запись изменилась после перезаписи+компактирования: %+v", retained)
 	}
 }
@@ -243,7 +244,7 @@ func TestCompactLogs_PendingBatchUnchanged(t *testing.T) {
 		t.Fatalf("применено %d записей, ожидалось %d", len(applied), len(expected))
 	}
 	for i := range expected {
-		if applied[i] != expected[i] {
+		if string(applied[i].([]byte)) != expected[i] {
 			t.Fatalf("applied[%d] = %v, want %v после компактирования", i, applied[i], expected[i])
 		}
 	}
@@ -344,7 +345,7 @@ func submitToCurrentLeader(t *testing.T, h *Harness, cmd int) {
 	deadline := time.Now().Add(submitBudget)
 	for attempt := 1; ; attempt++ {
 		lid, _ := h.CheckSingleLeader()
-		err := waitFuture(t, h.cluster[lid].Apply(cmd, 0), _commitBudgetAfterFailover)
+		err := waitFuture(t, h.cluster[lid].Apply(intCommandBytes(cmd), 0), _commitBudgetAfterFailover)
 		if err == nil {
 			return
 		}
@@ -418,7 +419,7 @@ func newAliasTestCM(k int) *ConsensusModule {
 			Index: i,
 			Term:  1,
 			Type:  LogCommand,
-			Data:  fmt.Sprintf("original-%d", i),
+			Data:  []byte(fmt.Sprintf("original-%d", i)),
 		})
 	}
 	cm.cmState.lastLogIndex = k
@@ -592,7 +593,7 @@ func commitToApplyLatency(t *testing.T, leader *ConsensusModule, cmd int) time.D
 		<-stopped
 	}()
 
-	if err := leader.Apply(cmd, time.Second).Error(); err != nil {
+	if err := leader.Apply(intCommandBytes(cmd), time.Second).Error(); err != nil {
 		t.Fatalf("Apply %d: %v", cmd, err)
 	}
 	appliedAt := time.Now()
@@ -626,7 +627,7 @@ func TestApplyOnCommit_BatchingPreserved(t *testing.T) {
 		wg.Add(1)
 		go func(cmd int) {
 			defer wg.Done()
-			if err := cm.Apply(cmd, time.Second).Error(); err != nil {
+			if err := cm.Apply(intCommandBytes(cmd), time.Second).Error(); err != nil {
 				t.Errorf("Apply %d: %v", cmd, err)
 			}
 		}(i)
@@ -657,7 +658,7 @@ func TestApplyOnCommit_SafetyTickApplies(t *testing.T) {
 	leader := h.cluster[leaderID]
 
 	cmd := 8100
-	if err := leader.Apply(cmd, time.Second).Error(); err != nil {
+	if err := leader.Apply(intCommandBytes(cmd), time.Second).Error(); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
 	h.WaitForCommit(cmd, 3)
@@ -667,7 +668,7 @@ func TestApplyOnCommit_SafetyTickApplies(t *testing.T) {
 		defer h.mu.Unlock()
 		n := 0
 		for _, entry := range h.commits[leaderID] {
-			if entry.Data == cmd {
+			if bytes.Equal(entry.Data, intCommandBytes(cmd)) {
 				n++
 			}
 		}
@@ -709,7 +710,7 @@ func TestApplyOnCommit_ConcurrentApplyWithLeaderChange(t *testing.T) {
 			defer wg.Done()
 			// Ошибки закономерны: во время передачи лидерства команды
 			// отклоняются. Предмет проверки — отсутствие гонок и зависаний.
-			future := h.cluster[leaderID].Apply(cmd, time.Second)
+			future := h.cluster[leaderID].Apply(intCommandBytes(cmd), time.Second)
 			select {
 			case <-future.ErrorCh():
 			case <-time.After(_leaderElectionBudget):
