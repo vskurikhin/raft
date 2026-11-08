@@ -22,7 +22,7 @@ Invariants"); values are expressed as a whole number of milliseconds.
 |-------------------------|---------|----------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `-apply-batch-interval` | 50 ms   | duration | [1 ms; 5000 ms], whole ms, ≤ reelection-timeout                                                                                                                     |
 | `-heartbeat-timeout`    | 33 ms   | duration | [5 ms; 100 ms], whole ms; 100 = ⌊400/4⌋                                                                                                                             |
-| `-reelection-timeout`   | 430 ms  | duration | [200 ms; 30 000 ms], whole ms, ≥ 10·heartbeat-timeout, > 2 × raft.TCPRPCTimeout = 400 ms (the quorum check window is fixed and is not scaled by `-tcp-rpc-timeout`) |
+| `-reelection-timeout`   | 750 ms  | duration | [200 ms; 30 000 ms], whole ms, ≥ 10·heartbeat-timeout, > 2 × raft.TCPRPCTimeout = 400 ms (the quorum check window is fixed and is not scaled by `-tcp-rpc-timeout`) |
 | `-ticker-timeout`       | 20 ms   | duration | [1 ms; 1000 ms], whole ms, ≤ reelection-timeout/10                                                                                                                  |
 
 - `-apply-batch-interval` — the interval at which the leader loop
@@ -96,7 +96,7 @@ requires the base to be at least `-tcp-rpc-timeout`.
 | `-data-dir`  | "" → `data/node-N` (cmd/main.go) | path               | —                         |
 | `-http-addr` | `:8880`                          | address            | —                         |
 | `-rpc-addr`  | `:9990`                          | address            | —                         |
-| `-max-pool`  | 4 (DefaultMaxPool)               | connections        | ≥ 0; 0 is replaced with 4 |
+| `-max-pool`  | 16 (DefaultMaxPool)              | connections        | ≥ 0; 0 is replaced with 16 |
 | `-number`    | −1                               | node number        | —                         |
 | `-peers`     | ""                               | `id=host:port,...` | fail-fast parsing         |
 
@@ -105,12 +105,14 @@ requires the base to be at least `-tcp-rpc-timeout`.
   is the value of the `-number` flag.
 - `-http-addr` — the address of the node's HTTP interface.
 - `-rpc-addr` — the address of the node's RPC server.
-- `-max-pool` — the maximum number of pooled connections per peer
-  address. A negative value aborts startup; zero is replaced with the
-  node default 4 (`DefaultMaxPool`, `cmd/main.go`). The transport's
+- `-max-pool` — the maximum number of connections kept in the pool per
+  peer address. A negative value aborts startup; zero is replaced with
+  the node default 16 (`DefaultMaxPool`, `cmd/main.go`). The transport's
   own default (2 connections, `pkg/raft/transp`) is not used when
   starting the node — the zero is replaced before the transport is
-  created.
+  created. The pool is the upper bound on connections returned to it per
+  address, not a limit on the total number of simultaneously active
+  connections: when the pool is empty, a new connection is opened.
 - `-number` — the node number; passed to the configuration as the node
   identifier (ServerID) and used in the default data path.
 - `-peers` — the cluster peer list: `id=host:port` items separated by
@@ -139,17 +141,18 @@ requires the base to be at least `-tcp-rpc-timeout`.
 
 | Flag            | Default | Unit | Bounds |
 |-----------------|---------|------|--------|
-| `-stats-output` | true    | bool | —      |
+| `-stats-output` | false   | bool | —      |
 
 - `-stats-output` — periodic node stats output: once a second three
-  lines are written to standard output — latency, Raft counters and
-  `PersistV1` with JSON. The setting is **independent of
+  lines are written to standard output — latency, Raft counters and the
+  `PersistV2` JSON document. The setting is **independent of
   `-trace-log-level`**: the three lines are printed at any trace level,
-  including 0. A value of `false` disables publication of all three
-  lines only; the per-second collection, including the latency window
-  reset, keeps running. Event tracing, startup messages and error
-  messages of other subsystems are not affected. The default is true;
-  changing it at runtime is not supported.
+  including 0, when the flag is set. The default is false: the stats
+  lines are not published, while the per-second collection, including
+  the latency window reset, keeps running. Changing only the trace level
+  does not turn the stats lines on. Event tracing, startup messages and
+  error messages of other subsystems are not affected. Changing it at
+  runtime is not supported.
 
 ### Profiling
 
@@ -212,7 +215,8 @@ invariant is reported as `invalid election/quorum timing: …`.
 
 Examples:
 
-- A valid combination: `-heartbeat-timeout=40ms
+- A valid explicit combination (user values, not defaults):
+  `-heartbeat-timeout=40ms
   -reelection-timeout=430ms` — 430 ≥ 10·40 = 400 and 40 ≤ 100 hold;
   with the default ticker of 20 ms and batch of 50 ms, 20 ≤ 430/10 =
   43 and 50 ≤ 430 also hold.
@@ -238,13 +242,18 @@ the stand profile, and the transport default.
 | Parameter                                                               | Node flag default | Stand value (Makefile) |
 |-------------------------------------------------------------------------|-------------------|------------------------|
 | Heartbeat period (`-heartbeat-timeout` / `HEARTBEAT_TIMEOUT`)           | 33 ms             | 45 ms                  |
-| Election timeout base (`-reelection-timeout` / `REELECTION_TIMEOUT`)    | 430 ms            | 500 ms                 |
+| Election timeout base (`-reelection-timeout` / `REELECTION_TIMEOUT`)    | 750 ms            | 750 ms                 |
 | Election ticker tick (`-ticker-timeout` / `TICKER_TIMEOUT`)             | 20 ms             | 20 ms                  |
 | Apply batch interval (`-apply-batch-interval` / `APPLY_BATCH_INTERVAL`) | 50 ms             | 50 ms                  |
 | Trace level (`-trace-log-level` / `TRACE_LOG_LEVEL`)                    | 1                 | 0                      |
 
-The stand profile is valid: 500 ≥ 10·45 = 450, 45 ≤ 100, 20 ≤ 500/10 =
-50, 50 ≤ 500, 500 > 2 · raft.TCPRPCTimeout = 400 — from the constant.
+The election timeout base is the same for the stand and the node
+(750 ms) and equals the node default; the stand differs from the node
+defaults only in the heartbeat period (45 ms versus 33 ms) and the trace
+level (0 versus 1).
+
+The stand profile is valid: 750 ≥ 10·45 = 450, 45 ≤ 100, 20 ≤ 750/10 =
+75, 50 ≤ 750, 750 > 2 · raft.TCPRPCTimeout = 400 — from the constant.
 
 Running the stand with the node defaults (the full set of variables —
 so that the recipe does not depend on the current values of the
@@ -252,15 +261,15 @@ so that the recipe does not depend on the current values of the
 
 ```bash
 make start-raft APPLY_BATCH_INTERVAL=50 HEARTBEAT_TIMEOUT=33 \
-  REELECTION_TIMEOUT=430 TICKER_TIMEOUT=20
+  REELECTION_TIMEOUT=750 TICKER_TIMEOUT=20
 ```
 
 Raising the heartbeat is bounded from above by the invariant
 `reelection-timeout ≥ 10·heartbeat-timeout`: for a given reelection
-base the heartbeat ceiling equals reelection-timeout/10. With the node
-default of 430 ms the ceiling is 43 ms; with the stand value of
-500 ms it is 50 ms (the stand heartbeat of 45 ms keeps a 5 ms margin).
-The range's own upper bound of 100 ms applies independently of this.
+base the heartbeat ceiling equals reelection-timeout/10. With the base
+of 750 ms the ceiling is 75 ms (the stand heartbeat of 45 ms keeps a
+30 ms margin). The range's own upper bound of 100 ms applies
+independently of this.
 
 ## loadkv Load Generator Flags
 
@@ -270,16 +279,16 @@ described in the subsection "Share Semantics".
 
 | Flag                | Default          | Unit                   | Bounds                                     |
 |---------------------|------------------|------------------------|--------------------------------------------|
-| `-concurrency`      | 4                | requests               | —                                          |
+| `-concurrency`      | 2048             | requests               | —                                          |
 | `-delete-percent`   | 0                | %                      | share ladder                               |
 | `-duration`         | 0 = until signal | duration               | —                                          |
-| `-get-percent`      | 66               | %                      | share ladder                               |
-| `-key-count`        | 2000             | keys                   | —                                          |
+| `-get-percent`      | 5                | %                      | share ladder                               |
+| `-key-count`        | 15000            | keys                   | —                                          |
 | `-peers`            | ""               | `host:port,...` (HTTP) | —                                          |
-| `-request-rate`     | 100              | 1/s                    | ≥ 1, otherwise rejected (cmd/load/main.go) |
-| `-value-size`       | 128              | bytes                  | —                                          |
-| `-verify-percent`   | 33               | %                      | —                                          |
-| `-weak-get-percent` | 0                | %                      | share ladder                               |
+| `-request-rate`     | 600              | 1/s                    | ≥ 1, otherwise rejected (cmd/load/main.go) |
+| `-value-size`       | 1024             | bytes                  | —                                          |
+| `-verify-percent`   | 5                | %                      | —                                          |
+| `-weak-get-percent` | 70               | %                      | share ladder                               |
 
 - `-concurrency` — the maximum number of requests in flight.
 - `-duration` — the run duration; zero means run until the stop signal
@@ -330,23 +339,29 @@ Node timing parameters are given as a number of milliseconds — the
 |------------------------|-----------------------------------------|------------------|
 | `APPLY_BATCH_INTERVAL` | `-apply-batch-interval`                 | 50               |
 | `HEARTBEAT_TIMEOUT`    | `-heartbeat-timeout`                    | 45               |
-| `REELECTION_TIMEOUT`   | `-reelection-timeout`                   | 500              |
+| `REELECTION_TIMEOUT`   | `-reelection-timeout`                   | 750              |
 | `TICKER_TIMEOUT`       | `-ticker-timeout`                       | 20               |
 | `TRACE_LOG_LEVEL`      | `-trace-log-level`                      | 0                |
-| `CONCURRENCY`          | `-concurrency`                          | 8                |
+| `CONCURRENCY`          | `-concurrency`                          | 2048             |
 | `DELETE_PERCENT`       | `-delete-percent`                       | 0                |
 | `DURATION`             | `-duration`                             | 5m               |
-| `GET_PERCENT`          | `-get-percent`                          | 75               |
-| `REQUEST_RATE`         | `-request-rate`                         | 200              |
-| `VALUE_SIZE`           | `-value-size`                           | 128              |
-| `VERIFY_PERCENT`       | `-verify-percent`                       | 33               |
-| `WEAK_GET_PERCENT`     | `-weak-get-percent`                     | 0                |
+| `GET_PERCENT`          | `-get-percent`                          | 5                |
+| `KEY_COUNT`            | `-key-count`                            | 15000            |
+| `REQUEST_RATE`         | `-request-rate`                         | 600              |
+| `VALUE_SIZE`           | `-value-size`                           | 1024             |
+| `VERIFY_PERCENT`       | `-verify-percent`                       | 5                |
+| `WEAK_GET_PERCENT`     | `-weak-get-percent`                     | 70               |
 | `STAND`                | — (prefix of stand artifact file names) | empty            |
 
-The stand defaults of the remaining generator flags differ from the
-binary defaults: `CONCURRENCY` 8 versus 4, `GET_PERCENT` 75 versus 66,
-`REQUEST_RATE` 200 versus 100. The `-key-count` flag is not passed by
-the `start-raft` target — the binary default applies.
+The generator parameters the stand passes to the flags match the binary
+defaults: `CONCURRENCY` 2048, `GET_PERCENT` 5, `KEY_COUNT` 15000,
+`REQUEST_RATE` 600, `VALUE_SIZE` 1024, `VERIFY_PERCENT` 5,
+`WEAK_GET_PERCENT` 70, `DELETE_PERCENT` 0. The stand differs from the
+binary defaults in the duration (`DURATION=5m` versus `-duration` 0) and
+in the node timing parameters: the heartbeat period 45 ms versus 33 ms
+and the trace level 0 versus 1; the reelection base of 750 ms is common.
+The `start-raft` target passes the `-key-count` flag explicitly
+(`KEY_COUNT=15000`).
 
 ## Version synchronization
 

@@ -355,7 +355,7 @@ func TestScalarCache_SetCalledOnEveryPersist(t *testing.T) {
 	assertRecordedSets(t, rec.callsSnapshot(), scalarWant)
 
 	// Режим полной замены: журнал идёт последним, пятая операция.
-	cm.cmState.log = []LogEntry{{Index: 0, Term: 1, Type: LogCommand, Data: "k0=v0"}}
+	cm.cmState.log = []LogEntry{{Index: 0, Term: 1, Type: LogCommand, Data: []byte("k0=v0")}}
 	cm.markLogRewriteDirtyLocked()
 	rec.calls = nil
 	persistToStorageForTest(cm)
@@ -482,7 +482,7 @@ func TestScalarCache_StateChangeBetweenAECommitAndAEFinish(t *testing.T) {
 	var reply AppendEntriesReply
 	go func() {
 		aeDone <- cm.AppendEntries(aeArgs(-1, -1, 0,
-			[]LogEntry{{Index: 0, Term: 1, Type: LogCommand, Data: "k0=v0"}}), &reply)
+			[]LogEntry{{Index: 0, Term: 1, Type: LogCommand, Data: []byte("k0=v0")}}), &reply)
 	}()
 
 	// Ждём, пока AppendEntries пройдёт ae_commit (журнал на диске) и

@@ -23,8 +23,8 @@ const (
 
 // DefaultMaxPool — значение по умолчанию для количества соединений в пуле
 // на один адрес соседа у узла raftkv.
-// Значение по умолчанию транспорта в пакете raft другое и равно 2.
-const DefaultMaxPool = 4
+// Значение по умолчанию транспорта в пакете transp другое и равно 2.
+const DefaultMaxPool = 16
 
 type Values struct {
 	HTTPAddress net.Addr
@@ -45,7 +45,7 @@ type Values struct {
 	// ноль заменяется на DefaultMaxPool при сборке конфигурации узла.
 	MaxPool int
 	// ReelectionTimeout — база тайм-аута выборов. Ноль — защитное значение:
-	// применяется raft.DefaultReelectionTimeout (430 мс). База должна быть
+	// применяется raft.DefaultReelectionTimeout (750 мс). База должна быть
 	// строго больше окна проверки кворума 400 мс.
 	ReelectionTimeout time.Duration
 	// SnapshotInterval — интервал проверки необходимости создания снимка.
@@ -257,7 +257,7 @@ func addSnapshotFlags(fs *flag.FlagSet) (snapshotIntervalFlag *time.Duration, sn
 
 // addStatsOutputFlag регистрирует флаг вывода периодической статистики:
 // три строки в секунду (латентность, счётчики Raft, PersistV2). Отсутствие
-// флага эквивалентно true; настройка не связана с -trace-log-level.
+// флага эквивалентно false; настройка не связана с -trace-log-level.
 func addStatsOutputFlag(fs *flag.FlagSet) *bool {
 	return fs.Bool(
 		"stats-output", false,

@@ -1,19 +1,20 @@
 package store
 
-// Файл пакетного журнала версии 2. Формат состоит из неизменяемого
-// заголовка файла и последовательности пакетов;
-// все многобайтовые числовые поля заголовков записаны в порядке big-endian,
-// контрольная сумма — CRC-32C.
+// Файл пакетного журнала версии 3. Формат состоит из неизменяемого
+// заголовка файла и последовательности пакетов; все многобайтовые
+// числовые поля заголовков записаны в порядке big-endian, контрольная
+// сумма — CRC-32C. От версии 2 отличаются номер версии, сигнатуры пакета
+// и footer и представление Data.
 //
 //	заголовок файла, 24 байта:
 //	  0..7   magic = "RAFTPST\0"
-//	  8..9   version = 2 (uint16)
+//	  8..9   version = 3 (uint16)
 //	  10..11 headerSize = 24 (uint16)
 //	  12..19 reserved = 0 (8 байт)
 //	  20..23 CRC-32C байт 0..19
 //	пакет: заголовок 32 байта, тело и footer 12 байт
 //	  заголовок пакета, 32 байта:
-//	    0..3   magic = "RLB2"
+//	    0..3   magic = "RLB3"
 //	    4..7   reserved = 0
 //	    8..15  bodyLength (uint64)
 //	    16..23 entryCount (uint64)
@@ -24,12 +25,25 @@ package store
 //	    dataLength uint64 | data
 //	  footer, 12 байт:
 //	    CRC-32C(весь заголовок пакета 32 байта || тело) uint32 |
-//	    marker[8] = "RLCMIT2\0"
+//	    marker[8] = "RLCMIT3\0"
 //
-// Data кодируется отдельным потоком gob как обёртка struct{ Data any }:
-// каждая запись независима, nil и встроенный []byte сохраняются, а типы
-// пользователя регистрирует потребитель. Кодек не выполняет ввода-вывода
-// и не зависит от корневого пакета или пакета kvservice.
+// Data версии 1: version uint8 = 1, tag uint8, затем payload; длину payload
+// задаёт dataLength записи. Поддерживаются только байтовые теги:
+//
+//	1 — nil []byte, payload пуст;
+//	2 — не-nil []byte (в том числе пустой); непустой — только у записей,
+//	    отличных от LogCommand;
+//	3 — непустые байты команды записи LogCommand.
+//
+// Теги 0 и 4 зарезервированы историческим форматом и отвергаются: encoder
+// их не пишет, декодер считает повреждением.
+//
+// Кодирование каноническое: одно и то же значение с тем же типом записи
+// всегда даёт одни и те же байты, поэтому живые и восстановленные байты
+// команды сравниваются побайтово. Тип записи хранится в заголовке записи
+// и при чтении Data проверяется. Байты тега 3 store не разбирает: их
+// формат проверяет FSM приложения. Кодек не выполняет ввода-вывода и не
+// зависит от корневого пакета или пакета kvservice.
 //
 // CRC-32C — полином Кастаньоли:
 // f(x) = x³² + x²⁸ + x²⁷ + x²⁶ + x²⁵ + x²³ + x²² + x²⁰ + x¹⁹ + x¹⁸ + x¹⁴ + x¹³ + x¹¹ + x¹⁰ + x⁹ + x⁸ + x⁶ + 1
@@ -37,7 +51,6 @@ package store
 import (
 	"bytes"
 	"encoding/binary"
-	"encoding/gob"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -61,18 +74,36 @@ const (
 	logFooterSize = 12
 
 	// logFileVersion — версия формата журнала.
-	logFileVersion uint16 = 2
+	logFileVersion uint16 = 3
+
+	// logDataVersion — версия представления Data внутри записи.
+	logDataVersion byte = 1
+
+	// logDataHeaderSize — версия и тег перед payload Data.
+	logDataHeaderSize = 2
+)
+
+// Теги Data версии 1. Теги 0 и 4 зарезервированы и не поддерживаются.
+const (
+	// logDataTagNilBytes — nil []byte.
+	logDataTagNilBytes byte = 1
+
+	// logDataTagBytes — не-nil []byte.
+	logDataTagBytes byte = 2
+
+	// logDataTagCommand — непустые байты команды записи LogCommand.
+	logDataTagCommand byte = 3
 )
 
 // logFileMagic — сигнатура заголовка файла: "RAFTPST" и завершающий ноль.
 var logFileMagic = [8]byte{'R', 'A', 'F', 'T', 'P', 'S', 'T', 0x00}
 
 // logBatchMagic — сигнатура заголовка пакета.
-var logBatchMagic = [4]byte{'R', 'L', 'B', '2'}
+var logBatchMagic = [4]byte{'R', 'L', 'B', '3'}
 
-// logCommitMarker — маркер конца пакета: "RLCMIT2" и завершающий ноль.
+// logCommitMarker — маркер конца пакета: "RLCMIT3" и завершающий ноль.
 // Смысл слова COMMIT в маркере не связан с индексом фиксации Raft.
-var logCommitMarker = [8]byte{'R', 'L', 'C', 'M', 'I', 'T', '2', 0x00}
+var logCommitMarker = [8]byte{'R', 'L', 'C', 'M', 'I', 'T', '3', 0x00}
 
 var (
 	// errLogCorrupt — маркерная ошибка повреждения журнала. Сюда относятся
@@ -130,13 +161,6 @@ type logFileScan struct {
 	tail bool
 }
 
-// logDataEnvelope — обёртка одной записи Data. Поле экспортировано: gob
-// кодирует только экспортированные поля и через интерфейсное поле сохраняет
-// конкретный тип.
-type logDataEnvelope struct {
-	Data any
-}
-
 // encodeLogFileHeader возвращает неизменяемый 24-байтовый заголовок файла
 // журнала. Заголовок не зависит от содержимого и никогда не перезаписывается
 // после публикации файла.
@@ -180,8 +204,8 @@ type encodedLogEntry struct {
 	data  []byte
 }
 
-// encodeLogEntries проверяет записи и кодирует Data каждой из них отдельным
-// потоком gob. Валидация выполняется до выделения и кодирования.
+// encodeLogEntries проверяет записи и кодирует Data каждой из них с учётом
+// типа записи. Валидация выполняется до выделения и кодирования.
 func encodeLogEntries(entries []contract.LogEntry) ([]encodedLogEntry, error) {
 	if err := checkLogEntries(entries); err != nil {
 		return nil, err
@@ -189,15 +213,11 @@ func encodeLogEntries(entries []contract.LogEntry) ([]encodedLogEntry, error) {
 	encoded := make([]encodedLogEntry, len(entries))
 	for i := range entries {
 		entry := &entries[i]
-		data, err := encodeLogData(entry.Data)
-		if err != nil {
-			return nil, fmt.Errorf("encode entry at index %d: %w", entry.Index, err)
-		}
 		encoded[i] = encodedLogEntry{
 			index: entry.Index,
 			term:  entry.Term,
 			typ:   entry.Type,
-			data:  data,
+			data:  encodeLogData(entry.Type, entry.Data),
 		}
 	}
 	return encoded, nil
@@ -245,7 +265,7 @@ func encodeLogBatchHeader(bodyLength, entryCount uint64) [logBatchHeaderSize]byt
 }
 
 // encodeLogBodyEncoded собирает тело пакета из записей с готовой Data:
-// для каждой записи служебные поля и уже закодированный поток gob.
+// для каждой записи служебные поля и уже закодированная Data.
 func encodeLogBodyEncoded(entries []encodedLogEntry) []byte {
 	size := 0
 	for i := range entries {
@@ -277,30 +297,74 @@ func encodeLogFooter(header, body []byte) [logFooterSize]byte {
 	return footer
 }
 
-// encodeLogData кодирует одну Data отдельным потоком gob в обёртке с
-// интерфейсным полем. Новый кодировщик на запись исключает межзаписное
-// состояние; nil кодируется как пустое интерфейсное значение.
-func encodeLogData(data any) ([]byte, error) {
-	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(logDataEnvelope{Data: data}); err != nil {
-		return nil, fmt.Errorf("encode log Data: %w", err)
+// encodeLogData кодирует одну Data канонически по типу записи: nil — тег 1;
+// непустые байты LogCommand — тег 3; остальные не-nil байты (в том числе
+// пустые и байты не-команд) — тег 2. Отдельного кодирования полей и
+// обёрток нет: запись хранит уже готовые байты.
+func encodeLogData(typ contract.LogType, data []byte) []byte {
+	switch {
+	case data == nil:
+		return logDataFrame(logDataTagNilBytes, nil)
+	case typ == contract.LogCommand && len(data) > 0:
+		return logDataFrame(logDataTagCommand, data)
+	default:
+		return logDataFrame(logDataTagBytes, data)
 	}
-	return buf.Bytes(), nil
 }
 
-// decodeLogData декодирует одну Data тем же потоком gob. Новый декодер на
-// каждую запись сохраняет независимость потоков; Data-область обязана быть
-// исчерпана ровно одним значением, иначе это повреждение.
-func decodeLogData(data []byte) (any, error) {
-	reader := bytes.NewReader(data)
-	var envelope logDataEnvelope
-	if err := gob.NewDecoder(reader).Decode(&envelope); err != nil {
-		return nil, fmt.Errorf("decode log Data: %w", err)
+// logDataFrame собирает Data из версии, тега и копии payload.
+func logDataFrame(tag byte, payload []byte) []byte {
+	data := make([]byte, logDataHeaderSize+len(payload))
+	data[0] = logDataVersion
+	data[1] = tag
+	copy(data[logDataHeaderSize:], payload)
+	return data
+}
+
+// decodeLogData декодирует одну Data с учётом типа записи. Теги 1 и 2
+// возвращают собственную копию: тег 1 — nil срез, тег 2 — не-nil копию
+// payload. Неизвестная версия, зарезервированные теги 0 и 4, лишние байты
+// у тега 1, пустой тег 3, тег 3 вне LogCommand и неканонический непустой
+// тег 2 у LogCommand — повреждение.
+func decodeLogData(typ contract.LogType, data []byte) ([]byte, error) {
+	if len(data) < logDataHeaderSize {
+		return nil, fmt.Errorf("decode log Data: %w: Data is %d bytes, shorter than the %d-byte header",
+			errLogCorrupt, len(data), logDataHeaderSize)
 	}
-	if reader.Len() != 0 {
-		return nil, fmt.Errorf("%w: Data contains %d extra bytes", errLogCorrupt, reader.Len())
+	if data[0] != logDataVersion {
+		return nil, fmt.Errorf("decode log Data: %w: unsupported Data version %d", errLogCorrupt, data[0])
 	}
-	return envelope.Data, nil
+	tag, payload := data[1], data[logDataHeaderSize:]
+	switch tag {
+	case logDataTagNilBytes:
+		if len(payload) != 0 {
+			return nil, fmt.Errorf("decode log Data: %w: Data tag %d has %d extra bytes", errLogCorrupt, tag, len(payload))
+		}
+		return nil, nil
+	case logDataTagBytes:
+		if typ == contract.LogCommand && len(payload) > 0 {
+			return nil, fmt.Errorf("decode log Data: %w: non-canonical Data tag %d for non-empty command bytes",
+				errLogCorrupt, tag)
+		}
+		return cloneBytes(payload), nil
+	case logDataTagCommand:
+		if typ != contract.LogCommand {
+			return nil, fmt.Errorf("decode log Data: %w: Data tag %d in entry of type %d", errLogCorrupt, tag, typ)
+		}
+		if len(payload) == 0 {
+			return nil, fmt.Errorf("decode log Data: %w: empty command bytes", errLogCorrupt)
+		}
+		return cloneBytes(payload), nil
+	default:
+		return nil, fmt.Errorf("decode log Data: %w: unsupported Data tag %d", errLogCorrupt, tag)
+	}
+}
+
+// cloneBytes возвращает не-nil копию: пустой срез остаётся пустым, а не nil.
+func cloneBytes(payload []byte) []byte {
+	out := make([]byte, len(payload))
+	copy(out, payload)
+	return out
 }
 
 // checkLogEntries проверяет записи перед кодированием: неотрицательные
@@ -326,7 +390,7 @@ func checkLogEntries(entries []contract.LogEntry) error {
 }
 
 // scanLogFile структурно разбирает всё содержимое файла журнала, не
-// декодируя gob Data: проверяются заголовок файла, заголовки и footer
+// декодируя Data: проверяются заголовок файла, заголовки и footer
 // пакетов, контрольные суммы, длины, число записей, тип, зарезервированные
 // поля, непрерывность индексов и полнота пакета. Ошибка возвращается при
 // повреждении; неполный последний пакет после целой базы отбрасывается
@@ -409,7 +473,7 @@ func decodeLogFile(data []byte) ([]contract.LogEntry, int, error) {
 	entries := make([]contract.LogEntry, 0, len(scan.entries))
 	for i := range scan.entries {
 		raw := &scan.entries[i]
-		value, err := decodeLogData(raw.data)
+		value, err := decodeLogData(raw.typ, raw.data)
 		if err != nil {
 			return nil, 0, fmt.Errorf("%w: entry at index %d: %w", errLogCorrupt, raw.index, err)
 		}

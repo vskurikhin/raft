@@ -42,8 +42,8 @@ func TestStage3FixtureSHA(t *testing.T) {
 
 // TestRoleVersionMismatchSubprocess подтверждает фактическим выводом
 // дочернего процесса разделение версий по ролям файлов: пакетный журнал
-// версии 2, помещённый в скалярную роль, отвергается скалярным читателем
-// («unsupported frame version 2»), а реальные байты журнала предыдущего
+// версии 3, помещённый в скалярную роль, отвергается скалярным читателем
+// («unsupported frame version 3»), а реальные байты журнала предыдущего
 // этапа отвергаются загрузчиком журнала («unsupported log version 1»).
 // Каждый случай выполняется в отдельном временном каталоге: рабочие данные и
 // прошлые результаты не затрагиваются.
@@ -53,7 +53,7 @@ func TestRoleVersionMismatchSubprocess(t *testing.T) {
 		return
 	}
 
-	t.Run("версия 2 в скалярной роли", func(t *testing.T) {
+	t.Run("версия 3 в скалярной роли", func(t *testing.T) {
 		dir := t.TempDir()
 		fs := NewFileStorage(dir)
 		fs.RewriteLog([]contract.LogEntry{contractEntry(0, 0, contract.LogNoop, nil)})
@@ -64,8 +64,8 @@ func TestRoleVersionMismatchSubprocess(t *testing.T) {
 		}
 
 		out := runStoreRoleHelper(t, dir)
-		if !strings.Contains(out, "unsupported frame version 2") {
-			t.Fatalf("сообщение не подтверждает отказ версии 2 в скалярной роли:\n%s", out)
+		if !strings.Contains(out, "unsupported frame version 3") {
+			t.Fatalf("сообщение не подтверждает отказ версии 3 в скалярной роли:\n%s", out)
 		}
 	})
 

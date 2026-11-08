@@ -103,7 +103,7 @@ func applyClusterCommand(t *testing.T, nodes []*clusterNode, cmd string) {
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		leader := waitForClusterLeader(t, nodes)
-		future := leader.cm.Apply(cmd, 0)
+		future := leader.cm.Apply([]byte(cmd), 0)
 		if err := future.Error(); err == nil {
 			return
 		}

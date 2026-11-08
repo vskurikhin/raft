@@ -19,6 +19,7 @@ import (
 	"github.com/vskurikhin/raft/pkg/kvclient"
 	"github.com/vskurikhin/raft/pkg/kvservice"
 	"github.com/vskurikhin/raft/pkg/raft/store"
+	"github.com/vskurikhin/raft/pkg/raft/transp"
 )
 
 func init() {
@@ -32,9 +33,16 @@ const (
 	// корневого харнесса, 10 мс).
 	_pollInterval = 10 * time.Millisecond
 
+	// _testReelectionTimeout — база тайм-аута выборов тестовых приспособлений.
+	// Независима от продуктового умолчания raft.DefaultReelectionTimeout:
+	// системные сценарии сохраняют исходный профиль 430 мс независимо от
+	// будущей смены продуктовой базы (TASK-1010-2). Профиль 430/33/20/50 мс
+	// проходит ValidateTiming (430 >= 10·33, 20 <= 43, 50 <= 430).
+	_testReelectionTimeout = 430 * time.Millisecond
+
 	// _maxElectionTimeout — максимальный тайм-аут выборов:
-	// 2*DefaultReelectionTimeout = 860 мс.
-	_maxElectionTimeout = 2 * raft.DefaultReelectionTimeout
+	// 2*_testReelectionTimeout = 860 мс.
+	_maxElectionTimeout = 2 * _testReelectionTimeout
 
 	// _maxReplicationBackoff — потолок задержки повторов репликации
 	// (1000 мс). Дублирует не экспортированное значение пакета raft;
@@ -140,7 +148,7 @@ func NewHarness(t *testing.T, n int) *Harness {
 		}
 
 		storage[i] = store.NewMapStorage()
-		kvss[i] = kvservice.NewKVService(":0", i, peerIds, storage[i], ready)
+		kvss[i] = newKVServiceWithTestProfile(t, i, peerIds, storage[i], ready)
 		alive[i] = true
 	}
 
@@ -181,6 +189,29 @@ func NewHarness(t *testing.T, n int) *Harness {
 		ctxCancel:      ctxCancel,
 	}
 	return h
+}
+
+// newKVServiceWithTestProfile создаёт KVService на тестовом временном
+// профиле (база перевыборов _testReelectionTimeout), независимо от
+// продуктового умолчания raft.DefaultReelectionTimeout. TCP-транспорт
+// создаётся тем же способом, что в прежней обёртке NewKVService
+// (transp.NewTCPTransport(":0", ...)); ошибка проверяется. Владение
+// транспортом передаётся существующему Server, закрываемому Shutdown.
+func newKVServiceWithTestProfile(t *testing.T, id int, peerIds []int, storage *store.MapStorage, ready chan any) *kvservice.KVService {
+	t.Helper()
+	transport, err := transp.NewTCPTransport(":0", transp.TCPTimeouts{}, 0)
+	if err != nil {
+		t.Fatalf("newKVServiceWithTestProfile(%d): failed to create TCP transport: %v", id, err)
+	}
+	return kvservice.New(&kvservice.Config{
+		Config: raft.Config{
+			ReelectionTimeout: _testReelectionTimeout,
+			ServerID:          id,
+			PeerIds:           peerIds,
+			Storage:           storage,
+			Transport:         transport,
+		},
+	}, ready)
 }
 
 func (h *Harness) DisconnectServiceFromPeers(id int) {
@@ -294,7 +325,7 @@ func (h *Harness) RestartService(id int) {
 		}
 	}
 	ready := make(chan any)
-	h.kvCluster[id] = kvservice.NewKVService(":0", id, peerIds, h.storage[id], ready)
+	h.kvCluster[id] = newKVServiceWithTestProfile(h.t, id, peerIds, h.storage[id], ready)
 	// Рестарт на ":0" даёт НОВЫЙ порт: адрес сервиса обязан быть обновлён,
 	// иначе клиенты, собранные из kvServiceAddrs, обращались бы к порту
 	// прежней инкарнации.

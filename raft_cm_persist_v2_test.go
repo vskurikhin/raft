@@ -52,7 +52,7 @@ func TestPersistV2_JournalStatsFromStoreResult(t *testing.T) {
 	cm.cmState.votedFor = -1
 	cm.cmState.lastSnapshotIndex = -1
 	cm.cmState.lastSnapshotTerm = -1
-	cm.cmState.log = []LogEntry{{Index: 0, Term: 1, Type: LogCommand, Data: "k0=v0"}}
+	cm.cmState.log = []LogEntry{{Index: 0, Term: 1, Type: LogCommand, Data: []byte("k0=v0")}}
 	cm.markLogRewriteDirtyLocked()
 
 	cm.mu.Lock()
@@ -250,15 +250,15 @@ func TestSuffixPersistDurableAfterReopen(t *testing.T) {
 	dir := t.TempDir()
 	cm, _ := newAEDurabilityCM(dir)
 	cm.cmState.log = []LogEntry{
-		{Index: 0, Term: 1, Type: LogCommand, Data: "k0=v0"},
-		{Index: 1, Term: 1, Type: LogCommand, Data: "k1=v1"},
+		{Index: 0, Term: 1, Type: LogCommand, Data: []byte("k0=v0")},
+		{Index: 1, Term: 1, Type: LogCommand, Data: []byte("k1=v1")},
 	}
 	cm.storage.RewriteLog(cm.cmState.log)
 	cm.clearLogDirtyLocked()
 	cm.cmState.lastLogIndex = 1
 	cm.cmState.lastLogTerm = 1
 
-	cm.cmState.log = append(cm.cmState.log, LogEntry{Index: 2, Term: 1, Type: LogCommand, Data: "k2=v2"})
+	cm.cmState.log = append(cm.cmState.log, LogEntry{Index: 2, Term: 1, Type: LogCommand, Data: []byte("k2=v2")})
 	cm.markLogSuffixDirtyLocked(2)
 	cm.mu.Lock()
 	cm.persistToStorageLocked(persistSourceApply)
@@ -268,7 +268,7 @@ func TestSuffixPersistDurableAfterReopen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadLog после переоткрытия: %v", err)
 	}
-	if len(onDisk) != 3 || onDisk[2].Index != 2 || onDisk[2].Data != "k2=v2" {
+	if len(onDisk) != 3 || onDisk[2].Index != 2 || string(onDisk[2].Data) != "k2=v2" {
 		t.Fatalf("журнал на диске = %+v, want три записи с последней k2=v2", onDisk)
 	}
 }
