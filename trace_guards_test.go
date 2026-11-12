@@ -42,8 +42,9 @@ import (
 //   - ровно пять ссылочных мест совпадают с реестром (файл, функция,
 //     уровень, формат, выражения и типы аргументов);
 //   - failedAETrace вычисляется только внутри guard ступени репликации;
-//   - пять KV-мест elapsed обёрнуты if _traceKV > 0, остальные шесть
-//     вызовов KV не обёрнуты.
+//   - пять KV-мест elapsed обёрнуты if _traceKV > 0, остальные пять
+//     вызовов KV не обёрнуты (ветка unknown command type удалена вместе
+//     с контрактом Apply(any): Data всегда байты).
 //
 // Отрицательные примеры изменяют разобранное дерево в памяти и обязаны
 // быть отвергнуты: изменение уровня guard, перенос вызова в else, новая
@@ -1101,8 +1102,8 @@ func checkKVTraceGuards(t *testing.T) []string {
 			errs = append(errs, fmt.Sprintf("KV %q: вызов вне охвата не должен быть обёрнут", call.format))
 		}
 	}
-	if len(calls) != 11 {
-		errs = append(errs, fmt.Sprintf("KV: вызовов %d, ожидалось 11", len(calls)))
+	if len(calls) != 10 {
+		errs = append(errs, fmt.Sprintf("KV: вызовов %d, ожидалось 10", len(calls)))
 	}
 	if wrapped != len(kvGuardFormats) {
 		errs = append(errs, fmt.Sprintf("KV: обёрнуто %d мест, ожидалось %d", wrapped, len(kvGuardFormats)))

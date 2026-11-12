@@ -30,6 +30,11 @@
 `LogNoop` (вступительная запись лидера), `LogConfiguration` (изменение
 состава кластера).
 
+Номер `ProtocolVersion` при переходе на байтовый `Data` не менялся, но
+сетевое представление AppendEntries и формат журнала сменились: узлы
+прежней и новой сборки несовместимы, в кластере работает одна сборка
+([API-Data-v3.md](API-Data-v3.md), [Data-v3-migration.md](Data-v3-migration.md)).
+
 Право голоса — значения `ServerSuffrage`: `Voter` (голосующий),
 `Nonvoter` (неголосующий; не может быть избран лидером).
 
@@ -165,8 +170,8 @@ Follower ──тайм-аут выборов──▶ PreCandidate ──кво
 ## 7. Клиентский путь
 
 ```go
-func (cm *ConsensusModule) Apply(command any, timeout time.Duration) ApplyFuture
-func (s *Server) Apply(cmd any, timeout time.Duration) ApplyFuture
+func (cm *ConsensusModule) Apply(command []byte, timeout time.Duration) ApplyFuture
+func (s *Server) Apply(cmd []byte, timeout time.Duration) ApplyFuture
 ```
 
 `Apply` отправляет команду в Raft и возвращает
@@ -175,7 +180,27 @@ func (s *Server) Apply(cmd any, timeout time.Duration) ApplyFuture
 future с ошибкой `contract.ErrEnqueueTimeout`.
 На не-лидере — `ErrNotLeader`, во время передачи лидерства — `ErrLeadershipTransferInProgress`,
 после остановки узла — `contract.ErrRaftShutdown`.
-Команда сохраняется по ссылке: вызывающий не должен изменять её после вызова.
+
+Команда — готовые байты прикладного представления: Raft их не разбирает и
+не кодирует повторно. До публикации записи в журнал `Apply` создаёт
+собственную копию байтов (`cloneLogData`, `raft_cm_leader.go`), сохраняя
+различие между `nil` и пустым срезом, отличным от `nil`. Пока `Apply` не вернул
+управление, вызывающий не меняет буфер; после возврата буфер можно менять
+и использовать повторно, даже если future ещё не завершён. Пустой срез и
+`nil` — допустимые и различимые данные записи `LogCommand`; смысл им
+придаёт машина состояний. Например, KV-сервис кодирует команду один раз
+и передаёт байты:
+
+```go
+data, err := kvservice.EncodeCommand(cmd) // формат KVC1, pkg/raft/codec
+if err != nil {
+	return err
+}
+future := server.Apply(data, timeout)
+```
+
+Формат байтов команды KV-сервиса, представление `Data` в журнале и в
+сети — [API-Data-v3.md](API-Data-v3.md).
 
 ```go
 func (cm *ConsensusModule) VerifyLeader() Future
@@ -296,7 +321,7 @@ func New(cfg *Config, ready <-chan any) *Server
 
 ```go
 func (s *Server) Serve()
-func (s *Server) Apply(cmd any, timeout time.Duration) ApplyFuture
+func (s *Server) Apply(cmd []byte, timeout time.Duration) ApplyFuture
 func (s *Server) ConnectToPeer(peerID int, addr net.Addr) error
 func (s *Server) ConnectToPeerWithTimeout(peerID int, addr net.Addr, _ time.Duration) error
 func (s *Server) DisconnectPeer(peerID int) error
@@ -382,14 +407,15 @@ func SetTrace(cfg TraceConfig) error
 
 ```go
 type CommitEntry struct {
-	Data any
+	Data  []byte
 	Index int
-	Term int
+	Term  int
 }
 ```
 
-Данные, которые Raft отправляет в канал фиксации: команда, индекс журнала
-и терм фиксации.
+Данные, которые Raft отправляет в канал фиксации: байты команды, индекс
+журнала и терм фиксации. `Data` только для чтения: потребитель может
+удерживать срез, а для изменения обязан сделать собственную копию.
 
 ### CMState
 
@@ -407,7 +433,9 @@ func (f *CommitChannelFSM) Snapshot() (FSMSnapshot, error)
 ```
 
 Обёртка канала фиксации в интерфейс `FSM` для обратной совместимости с
-тестовой инфраструктурой: передаёт `log.Data` в канал. Test-only: канал
+тестовой инфраструктурой: передаёт `log.Data` в канал без копирования.
+Исходный буфер вызывающего к этому моменту уже отделён копией в `Apply`,
+а опубликованные байты неизменяемы (`raft_fsm.go`). Test-only: канал
 обязан иметь читателя при живом узле (`Apply` не должен блокироваться
 навсегда, иначе `Stop` зависнет).
 
@@ -424,8 +452,11 @@ type FSM interface {
 Машина состояний клиента: `Apply` применяет зафиксированную запись,
 `Snapshot` возвращает снимок состояния (быстрый захват; сериализация —
 в `FSMSnapshot.Persist`), `Restore` восстанавливает состояние из снимка,
-сбрасывая предыдущее. Записи передаются как собственные копии; изменять
-payload после передачи нельзя.
+сбрасывая предыдущее. FSM получает копию структуры `LogEntry`
+(`raft_cm_apply.go`), но байты `Data` общие с журналом и транспортом и
+доступны только для чтения: FSM, в том числе в `ApplyBatch`, не меняет
+`Data`. Сигнатуры `FSM`, `BatchingFSM` и `ApplyFuture` при переходе на
+`[]byte` не менялись: результат `Apply` по-прежнему `any`.
 
 ```go
 type BatchingFSM interface {
@@ -550,7 +581,7 @@ func (d *SnapshotFuture) ErrorCh() <-chan error
 | `TimeoutNowRequest` / `TimeoutNowResponse`           | contract | Запрос и ответ немедленного начала выборов (передача лидерства).           |
 | `RPC`                                                | contract | Входящий RPC-запрос из `Consumer()`: команда, поток данных, канал ответа.  |
 | `RPCResponse`                                        | contract | Ответ на RPC: `Reply` либо `Error`.                                        |
-| `LogEntry`                                           | contract | Запись журнала: индекс, терм, тип, данные.                                 |
+| `LogEntry`                                           | contract | Запись журнала: индекс, терм, тип, данные `Data []byte`.                   |
 | `LogType`                                            | contract | Тип записи журнала (см. раздел 1).                                         |
 | `Configuration`                                      | contract | Состав кластера.                                                           |
 | `ConfigServer`                                       | contract | Один сервер конфигурации: идентификатор, адрес, право голоса.              |

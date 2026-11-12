@@ -36,7 +36,7 @@ func TestFileStorage_RestartRestoresState(t *testing.T) {
 	// Записываем несколько команд (int — не требует gob.Register(Command{})).
 	const numCommands = 10
 	for i := 0; i < numCommands; i++ {
-		future := cm1.Apply(i, 0)
+		future := cm1.Apply(intCommandBytes(i), 0)
 		if err := future.Error(); err != nil {
 			t.Fatalf("Apply(%d) failed: %v", i, err)
 		}

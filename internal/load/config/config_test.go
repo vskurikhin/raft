@@ -21,26 +21,32 @@ func TestParseFlagsDefaults(t *testing.T) {
 
 	v := ParseFlags()
 
-	if v.Concurrency != 4 {
-		t.Errorf("Concurrency = %d, want 4", v.Concurrency)
+	if v.Concurrency != 2048 {
+		t.Errorf("Concurrency = %d, want 2048", v.Concurrency)
+	}
+	if v.DeletePercent != 0 {
+		t.Errorf("DeletePercent = %d, want 0", v.DeletePercent)
 	}
 	if v.Duration != 0 {
 		t.Errorf("Duration = %v, want 0", v.Duration)
 	}
-	if v.ValueSize != 128 {
-		t.Errorf("ValueSize = %d, want 128", v.ValueSize)
+	if v.GetPercent != 5 {
+		t.Errorf("GetPercent = %d, want 5", v.GetPercent)
 	}
-	if v.GetPercent != 66 {
-		t.Errorf("GetPercent = %d, want 66", v.GetPercent)
+	if v.KeyCount != 15000 {
+		t.Errorf("KeyCount = %d, want 15000", v.KeyCount)
 	}
-	if v.KeyCount != 2000 {
-		t.Errorf("KeyCount = %d, want 2000", v.KeyCount)
+	if v.RequestRate != 600 {
+		t.Errorf("RequestRate = %d, want 600", v.RequestRate)
 	}
-	if v.RequestRate != 100 {
-		t.Errorf("RequestRate = %d, want 100", v.RequestRate)
+	if v.ValueSize != 1024 {
+		t.Errorf("ValueSize = %d, want 1024", v.ValueSize)
 	}
-	if v.VerifyPercent != 33 {
-		t.Errorf("VerifyPercent = %d, want 33", v.VerifyPercent)
+	if v.VerifyPercent != 5 {
+		t.Errorf("VerifyPercent = %d, want 5", v.VerifyPercent)
+	}
+	if v.WeakGetPercent != 70 {
+		t.Errorf("WeakGetPercent = %d, want 70", v.WeakGetPercent)
 	}
 	if len(v.Peers) != 0 {
 		t.Errorf("len(Peers) = %d, want 0", len(v.Peers))
@@ -58,6 +64,7 @@ func TestParseFlagsExplicit(t *testing.T) {
 		"-peers", ":8881,:8882",
 		"-value-size", "1024",
 		"-verify-percent", "10",
+		"-weak-get-percent", "0",
 	)
 
 	v := ParseFlags()
@@ -82,6 +89,9 @@ func TestParseFlagsExplicit(t *testing.T) {
 	}
 	if v.VerifyPercent != 10 {
 		t.Errorf("VerifyPercent = %d, want 10", v.VerifyPercent)
+	}
+	if v.WeakGetPercent != 0 {
+		t.Errorf("WeakGetPercent = %d, want 0", v.WeakGetPercent)
 	}
 	if len(v.Peers) != 2 {
 		t.Fatalf("len(Peers) = %d, want 2", len(v.Peers))

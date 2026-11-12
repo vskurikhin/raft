@@ -1,4 +1,5 @@
 github.com/vskurikhin/raft.AppendEntriesArgs
+github.com/vskurikhin/raft.AppendEntriesBytesV1
 github.com/vskurikhin/raft.AppendEntriesReply
 github.com/vskurikhin/raft.RequestVoteArgs
 github.com/vskurikhin/raft.RequestVoteReply
