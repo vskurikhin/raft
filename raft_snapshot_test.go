@@ -118,6 +118,10 @@ func newSnapshotHarness(t *testing.T, n int) *snapshotHarness {
 			storage[i], fsms[i], ready,
 			stores[i],
 		)
+		// Тестовый временной профиль применяется после конструктора и до
+		// close(ready); setter владеет cm.mu в одной функции. Узлы работают
+		// на тестовой базе 430 мс независимо от продуктового умолчания.
+		cluster[i].setTimerConfig(testTimerConfig())
 		alive[i] = true
 		connected[i] = true
 	}
@@ -216,6 +220,9 @@ func (h *snapshotHarness) RestartPeer(id int) {
 		id, peerIds, &snapshotCountingTransport{InmemTransport: h.transports[id], counters: h.isCounters},
 		h.storage[id], fsm, ready, stor,
 	)
+	// Тестовый временной профиль применяется так же, как при первичном
+	// создании: до close(ready), setter владеет cm.mu в одной функции.
+	h.cluster[id].setTimerConfig(testTimerConfig())
 	close(ready)
 	h.alive[id] = true
 	h.connected[id] = true
@@ -225,7 +232,7 @@ func (h *snapshotHarness) RestartPeer(id int) {
 
 // SubmitToServer отправляет команду серверу и возвращает индекс.
 func (h *snapshotHarness) SubmitToServer(serverID int, cmd string) int {
-	future := h.cluster[serverID].Apply(cmd, 0)
+	future := h.cluster[serverID].Apply([]byte(cmd), 0)
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- future.Error()
@@ -403,7 +410,7 @@ func TestSnapshot_NoSnapshotStore(t *testing.T) {
 	}
 	// keep: timing — окно является предметом проверки в этом месте;
 	// наблюдаемого признака состояния здесь нет.
-	sleepMs(int(DefaultReelectionTimeout.Milliseconds()))
+	sleepMs(int(_testReelectionTimeout.Milliseconds()))
 
 	// Проверяем, что lastSnapshotIndex == -1 на всех узлах.
 	for i := 0; i < h.n; i++ {
@@ -787,6 +794,36 @@ func (h *snapshotHarness) waitForSingleLeader() int {
 	return -1
 }
 
+// waitForReElection ждёт повторного выбора лидера после аварийного останова
+// (используется только после CrashPeer в TestSnapshot_LeaderCrash). Бюджет —
+// _leaderElectionBudget (2580 мс при тестовой базе 430 мс): два интервала
+// выборов и раунд pre-vote. Немедленный первый опрос, паузы до 66 мс в
+// пределах оставшегося времени, единое предельное время; -1 при его
+// истечении. Исходный waitForSingleLeader и его прочие вызовы сохраняются.
+func (h *snapshotHarness) waitForReElection() int {
+	deadline := time.Now().Add(_leaderElectionBudget)
+	for {
+		for i := 0; i < h.n; i++ {
+			if !h.connected[i] {
+				continue
+			}
+			_, _, isLeader := h.cluster[i].Report()
+			if isLeader {
+				return i
+			}
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return -1
+		}
+		pause := 2 * DefaultHeartbeatTimeout // 66 мс
+		if pause > remaining {
+			pause = remaining
+		}
+		time.Sleep(pause)
+	}
+}
+
 // TestSnapshot_MultipleSnapshots проверяет, что при множественных снимках
 // InmemSnapshot хранит только последний, а журнал сжимается.
 //
@@ -873,7 +910,7 @@ func TestSnapshot_MultipleSnapshots(t *testing.T) {
 	var phase1Idx int
 	for i := 0; i < 15; i++ {
 		cmd := fmt.Sprintf("k%d=v%d", i, i)
-		future := cm.Apply(cmd, 0)
+		future := cm.Apply([]byte(cmd), 0)
 		if err := future.Error(); err != nil {
 			t.Fatalf("Apply %q failed: %v", cmd, err)
 		}
@@ -888,7 +925,7 @@ func TestSnapshot_MultipleSnapshots(t *testing.T) {
 	var wantIdx int
 	for i := 15; i < 30; i++ {
 		cmd := fmt.Sprintf("k%d=v%d", i, i)
-		future := cm.Apply(cmd, 0)
+		future := cm.Apply([]byte(cmd), 0)
 		if err := future.Error(); err != nil {
 			t.Fatalf("Apply %q failed: %v", cmd, err)
 		}
@@ -975,7 +1012,7 @@ func TestSnapshot_RestartRestoresFSM(t *testing.T) {
 	const numCommands = 30
 	for i := 0; i < numCommands; i++ {
 		cmd := fmt.Sprintf("k%d=v%d", i, i)
-		future := cm.Apply(cmd, 0)
+		future := cm.Apply([]byte(cmd), 0)
 		if err := future.Error(); err != nil {
 			t.Fatalf("Apply %q failed: %v", cmd, err)
 		}
@@ -1033,7 +1070,7 @@ func TestSnapshot_RestartRestoresFSM(t *testing.T) {
 	// Узел работоспособен после restore: новая команда проходит и
 	// продвижение commitIndex доигрывает суффикс лога (k29).
 	waitForLeader(t, cm2, 5*time.Second)
-	future := cm2.Apply("k30=v30", 0)
+	future := cm2.Apply([]byte("k30=v30"), 0)
 	if err := future.Error(); err != nil {
 		t.Fatalf("Apply k30 after restart failed: %v", err)
 	}
@@ -1077,8 +1114,9 @@ func TestSnapshot_LeaderCrash(t *testing.T) {
 	h.CrashPeer(leaderID)
 	t.Logf("leader %d crashed", leaderID)
 
-	// Ждём нового лидера.
-	newLeaderID := h.waitForSingleLeader()
+	// Ждём нового лидера: отдельное ожидание повторного выбора по ADR-1010-08
+	// (бюджет _leaderElectionBudget = 2580 мс при тестовой базе 430 мс).
+	newLeaderID := h.waitForReElection()
 	if newLeaderID < 0 {
 		t.Fatal("no leader elected after crash")
 	}
@@ -1459,7 +1497,7 @@ func TestSnapshot_InstallIdempotency(t *testing.T) {
 	before := h.installSnapshotCount(followerID)
 	// keep: timing — окно является предметом проверки в этом месте;
 	// наблюдаемого признака состояния здесь нет.
-	sleepMs(2 * int(DefaultReelectionTimeout.Milliseconds()))
+	sleepMs(2 * int(_testReelectionTimeout.Milliseconds()))
 	if n := h.installSnapshotCount(followerID); n != before {
 		t.Fatalf("InstallSnapshot storm: count %d -> %d", before, n)
 	}

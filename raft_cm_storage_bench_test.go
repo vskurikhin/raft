@@ -120,7 +120,7 @@ func benchLogEntries(entries, totalBytes int) []LogEntry {
 			Index: i,
 			Term:  1,
 			Type:  LogCommand,
-			Data:  fmt.Sprintf("%0*d", payload, i),
+			Data:  []byte(fmt.Sprintf("%0*d", payload, i)),
 		})
 	}
 	return log

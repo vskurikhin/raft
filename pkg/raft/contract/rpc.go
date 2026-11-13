@@ -137,10 +137,13 @@ const (
 	LogConfiguration
 )
 
-// LogEntry — запись журнала репликации Raft.
+// LogEntry — запись журнала репликации Raft. Data — готовые байты команды:
+// для записи типа LogCommand это прикладное представление команды, для
+// остальных типов — байты значения. Опубликованные байты неизменяемы:
+// журнал, транспорт и машина состояний их только читают.
 type LogEntry struct {
 	Index int
 	Term  int
 	Type  LogType
-	Data  any
+	Data  []byte
 }
