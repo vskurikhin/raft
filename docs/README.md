@@ -17,3 +17,7 @@
 | [API-Data-v3.md](API-Data-v3.md) / [English version](API-Data-v3-en.md)                          | Байтовый контракт `Data`: `Apply([]byte)` и владение байтами, формат команды KVC1 (`pkg/raft/codec`), теги Data в журнале версии 3, сетевое представление AppendEntries, ошибка команды в FSM, оставшиеся gob-форматы.                                    |
 | [Data-v3-migration.md](Data-v3-migration.md) / [English version](Data-v3-migration-en.md)       | Переход на байтовый контракт `Data`: только чистый кластер одной сборки, проверенный бэкап, откат к паре «исполняемый файл + бэкап», потеря новых записей при откате.                                                                                 |
 | [API-HTTP.md](API-HTTP.md) / [English version](API-HTTP-en.md)                                  | HTTP API KV-сервиса: 6 маршрутов, форматы запросов и ответов, модель статусов `RespStatus`, гарантии и повторы, транспортные коды, поведение штатного Go-клиента.                                                                                   |
+
+## Выпуски
+
+* [Release Notes 1.3.0](Release-Notes-v1.3.0.md) — изменения, совместимость и состояние квалификации (на английском).

@@ -77,6 +77,7 @@ runs over the educational directories are not performed (see the
 ├── pkg/api/                 — REST API request and response types
 ├── pkg/kvclient/            — Go client for the KV service
 ├── pkg/kvservice/           — KV service: HTTP API, DataStore, the Raft state machine
+├── pkg/raft/codec/          — versioned KVC1 command codec
 ├── pkg/raft/contract/       — domain types, interfaces, and RPC structures
 ├── pkg/raft/store/          — log and snapshot stores
 └── pkg/raft/transp/         — TCP and in-process transports
@@ -256,7 +257,7 @@ and the remaining flags are described only there.
 ```sh
 go test . ./pkg/...      # working packages: the root package and pkg/...
 go test -race . ./pkg/...
-make test-stress COUNT=3 # sequential runs under -race
+make test-stress COUNT=10 # one invocation by owner decision; save the full log and exit code
 ```
 
 Root package tests use real timers and are slow to run — this is
@@ -370,11 +371,13 @@ runs of earlier versions. At the same `-request-rate`, summary numbers
 may also differ from runs of versions before 1.2.0 and are unsuitable
 for direct comparison with them.
 
-The format of the `run:` and `done:` lines is unchanged. The set of
-generator flags and their defaults is unchanged. The change affects
-only the generator: `raftkv` nodes and protocols are unaffected.
+In version 1.2.0, the format of the `run:` and `done:` lines, generator
+flags and their defaults remained unchanged. That change affected only
+the generator: `raftkv` nodes and protocols were unaffected.
 
 ## Documentation
+
+* [Release Notes 1.3.0](docs/Release-Notes-v1.3.0.md) — changes, compatibility, and qualification status (English).
 
 * [docs/README.md](docs/README.md) — documentation index;
 * [docs/API-ConsensusModule.md](docs/API-ConsensusModule.md) —
