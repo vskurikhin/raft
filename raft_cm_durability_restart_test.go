@@ -56,7 +56,7 @@ func TestAppendEntriesDurableAfterRestart(t *testing.T) {
 	dir := t.TempDir()
 	cm, _ := newAEDurabilityCM(dir)
 
-	entries := []LogEntry{{Index: 0, Term: 1, Type: LogCommand, Data: "k0=v0"}}
+	entries := []LogEntry{{Index: 0, Term: 1, Type: LogCommand, Data: []byte("k0=v0")}}
 	var reply AppendEntriesReply
 	if err := cm.AppendEntries(aeArgs(-1, -1, -1, entries), &reply); err != nil {
 		t.Fatalf("AppendEntries: %v", err)
@@ -109,9 +109,9 @@ func TestRestartSnapshotKeyGapFullLog(t *testing.T) {
 	inner := store.NewFileStorage(dir)
 	full := []LogEntry{
 		{Index: 0, Term: 0, Type: LogNoop},
-		{Index: 1, Term: 1, Type: LogCommand, Data: "k1=v1"},
-		{Index: 2, Term: 1, Type: LogCommand, Data: "k2=v2"},
-		{Index: 3, Term: 1, Type: LogCommand, Data: "k3=v3"},
+		{Index: 1, Term: 1, Type: LogCommand, Data: []byte("k1=v1")},
+		{Index: 2, Term: 1, Type: LogCommand, Data: []byte("k2=v2")},
+		{Index: 3, Term: 1, Type: LogCommand, Data: []byte("k3=v3")},
 	}
 	inner.RewriteLog(full)
 	inner.Set("currentTerm", gobEncode(t, 1))
@@ -189,9 +189,9 @@ func TestRestartNewSnapshotKeysFullLogKept(t *testing.T) {
 	inner := store.NewFileStorage(dir)
 	full := []LogEntry{
 		{Index: 0, Term: 0, Type: LogNoop},
-		{Index: 1, Term: 1, Type: LogCommand, Data: "k1=v1"},
-		{Index: 2, Term: 1, Type: LogCommand, Data: "k2=v2"},
-		{Index: 3, Term: 1, Type: LogCommand, Data: "k3=v3"},
+		{Index: 1, Term: 1, Type: LogCommand, Data: []byte("k1=v1")},
+		{Index: 2, Term: 1, Type: LogCommand, Data: []byte("k2=v2")},
+		{Index: 3, Term: 1, Type: LogCommand, Data: []byte("k3=v3")},
 	}
 	inner.RewriteLog(full)
 	inner.Set("currentTerm", gobEncode(t, 1))
@@ -243,7 +243,7 @@ func TestRepeatedCMRestartNoLeaks(t *testing.T) {
 
 	dir := t.TempDir()
 	base, _ := newAEDurabilityCM(dir)
-	entries := []LogEntry{{Index: 0, Term: 1, Type: LogCommand, Data: "k0=v0"}}
+	entries := []LogEntry{{Index: 0, Term: 1, Type: LogCommand, Data: []byte("k0=v0")}}
 	var reply AppendEntriesReply
 	if err := base.AppendEntries(aeArgs(-1, -1, -1, entries), &reply); err != nil {
 		t.Fatalf("AppendEntries: %v", err)

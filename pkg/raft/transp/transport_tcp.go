@@ -39,10 +39,14 @@ const (
 //nolint:gochecknoinits
 func init() {
 	// Метки закреплены полным путём импорта корневого пакета
-	// github.com/vskurikhin/raft.
-	// Метки осознанно сохраняют путь корневого пакета;
-	// заменять их на contract.<ИмяТипа> нельзя.
+	// github.com/vskurikhin/raft; заменять их на contract.<ИмяТипа>
+	// нельзя. Девять меток, начиная с ответа AppendEntriesReply,
+	// неизменны. Метка AppendEntriesArgs сохранена только для явного
+	// отказа прежнего сетевого представления в handleCommand:
+	// регистрация не означает совместимости. Рабочее представление
+	// AppendEntries — AppendEntriesBytesV1.
 	gob.RegisterName("github.com/vskurikhin/raft.AppendEntriesArgs", contract.AppendEntriesArgs{})
+	gob.RegisterName("github.com/vskurikhin/raft.AppendEntriesBytesV1", appendEntriesBytesV1{})
 	gob.RegisterName("github.com/vskurikhin/raft.AppendEntriesReply", contract.AppendEntriesReply{})
 	gob.RegisterName("github.com/vskurikhin/raft.RequestVoteArgs", contract.RequestVoteArgs{})
 	gob.RegisterName("github.com/vskurikhin/raft.RequestVoteReply", contract.RequestVoteReply{})
@@ -201,14 +205,18 @@ func (t *TCPTransport) SetHeartbeatHandler(fn func(contract.RPC)) {
 	t.heartbeatFn = fn
 }
 
-// AppendEntries отправляет AppendEntries указанному узлу через пул соединений.
+// AppendEntries отправляет AppendEntries указанному узлу через пул
+// соединений. Перед сетевой отправкой запрос переводится в частное
+// представление с явным признаком присутствия Data; поля команды не
+// кодируются повторно — передаются готовые байты.
 //
 //nolint:gocritic
 func (t *TCPTransport) AppendEntries(
 	peerID contract.ServerID, args contract.AppendEntriesArgs,
 ) (contract.AppendEntriesReply, error) {
 	var reply contract.AppendEntriesReply
-	err := t.genericRPC(peerID, _rpcAppendEntries, &args, &reply)
+	wire := appendEntriesToWire(&args)
+	err := t.genericRPC(peerID, _rpcAppendEntries, &wire, &reply)
 	return reply, err
 }
 
@@ -582,6 +590,26 @@ func (t *TCPTransport) handleConn(conn net.Conn) {
 // закрывает соединение.
 var errSnapshotStreamStale = errors.New("snapshot response window expired with unread snapshot data")
 
+// normalizeRPCCommand приводит декодированный аргумент RPC к публичному
+// контракту. Для AppendEntries это проверка действующего сетевого
+// представления: неверный тип (включая прежний AppendEntriesArgs),
+// неизвестная версия и противоречивый признак присутствия Data возвращают
+// ошибку до обработчиков Raft, heartbeat fast-path и consumerCh.
+func normalizeRPCCommand(reqType byte, cmd any) (any, error) {
+	if reqType != _rpcAppendEntries {
+		return cmd, nil
+	}
+	wire, ok := cmd.(appendEntriesBytesV1)
+	if !ok {
+		return nil, fmt.Errorf("raft: unsupported AppendEntries wire type %T", cmd)
+	}
+	args, err := appendEntriesFromWire(&wire)
+	if err != nil {
+		return nil, err
+	}
+	return args, nil
+}
+
 // handleCommand декодирует и отправляет один RPC-запрос из входящего потока.
 // Возвращает ошибку, если декодирование не удалось — вызывающий закрывает соединение.
 // r — bufio.Reader, из которого был создан dec.
@@ -596,10 +624,12 @@ func (t *TCPTransport) handleCommand(r *bufio.Reader, _ net.Conn, dec *gob.Decod
 
 	respCh := make(chan contract.RPCResponse, 1)
 
-	cmd := req.Args
+	cmd, err := normalizeRPCCommand(req.Type, req.Args)
+	if err != nil {
+		return err
+	}
+
 	switch v := cmd.(type) {
-	case contract.AppendEntriesArgs:
-		cmd = &v
 	case contract.RequestVoteArgs:
 		cmd = &v
 	case contract.TimeoutNowRequest:

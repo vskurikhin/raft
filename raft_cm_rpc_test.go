@@ -115,7 +115,7 @@ func TestAppendEntries_StaleTermFollower_NoStateChange(t *testing.T) {
 	cm.cmState.lastLogIndex = 0
 	cm.cmState.lastLogTerm = 2
 	cm.cmState.commitIndex = 0
-	cm.cmState.log = []LogEntry{{Index: 0, Term: 2, Type: LogCommand, Data: "x"}}
+	cm.cmState.log = []LogEntry{{Index: 0, Term: 2, Type: LogCommand, Data: []byte("x")}}
 	cm.cmState.termIndexMap = map[int]int{2: 0}
 	cm.cmState.leaderID = 9
 	cm.cmState.leaderLastContact = time.Unix(54321, 0)
@@ -264,7 +264,7 @@ func TestAppendEntries_HigherTerm_StepsDownInHandler(t *testing.T) {
 	cm.cmState.lastLogIndex = 0
 	cm.cmState.lastLogTerm = 2
 	cm.cmState.commitIndex = 0
-	cm.cmState.log = []LogEntry{{Index: 0, Term: 2, Type: LogCommand, Data: "x"}}
+	cm.cmState.log = []LogEntry{{Index: 0, Term: 2, Type: LogCommand, Data: []byte("x")}}
 	cm.cmState.termIndexMap = map[int]int{2: 0}
 	cm.cmState.electionTimerDone = make(chan struct{})
 	defer close(cm.shutdownCh)

@@ -36,7 +36,7 @@ func TestLeaderApplyBatch_GroupCommitDrainsQueuedCommands(t *testing.T) {
 
 	futures := make([]*logFuture, 0, queued)
 	for i := 0; i < queued; i++ {
-		queuedFuture, ok := cm.Apply(i, time.Second).(*logFuture)
+		queuedFuture, ok := cm.Apply(intCommandBytes(i), time.Second).(*logFuture)
 		if !ok {
 			t.Fatalf("Apply(%d) не поставил команду в очередь", i)
 		}
@@ -107,7 +107,7 @@ func TestLeaderApplyBatch_NotLeaderStopsLoop(t *testing.T) {
 	heartbeatTicker := time.NewTicker(DefaultHeartbeatTimeout)
 	defer heartbeatTicker.Stop()
 
-	queuedFuture, ok := cm.Apply(1, time.Second).(*logFuture)
+	queuedFuture, ok := cm.Apply(intCommandBytes(1), time.Second).(*logFuture)
 	if !ok {
 		t.Fatal("Apply не поставил команду в очередь")
 	}

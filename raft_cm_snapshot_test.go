@@ -73,7 +73,7 @@ func TestRunSnapshots_TakeSnapshotErrorDoesNotCrash(t *testing.T) {
 	// применения выставляем явно: тест не должен зависеть от того, успела ли
 	// машина состояний применить noop-запись лидера.
 	cm.cmState.fsmAppliedIndex = 0
-	cm.cmState.log = []LogEntry{{Index: 10, Term: 1, Type: LogCommand, Data: "k=v"}}
+	cm.cmState.log = []LogEntry{{Index: 10, Term: 1, Type: LogCommand, Data: []byte("k=v")}}
 	cm.mu.Unlock()
 	cm.SetSnapshotConfig(2, 1, 20*time.Millisecond)
 
@@ -472,7 +472,7 @@ func TestSnapshotContent_MatchesMetaIndex(t *testing.T) {
 	byIndex := make(commandIndexMap, numCommands)
 	for i := 0; i < numCommands; i++ {
 		key := fmt.Sprintf("k%d", i)
-		future := cm.Apply(key+"="+fmt.Sprintf("v%d", i), 0)
+		future := cm.Apply([]byte(key+"="+fmt.Sprintf("v%d", i)), 0)
 		if err := future.Error(); err != nil {
 			t.Fatalf("Apply %s: %v", key, err)
 		}
@@ -521,12 +521,12 @@ func TestSnapshotIndexProperty_BothSelectBranches(t *testing.T) {
 		firstCmd := fmt.Sprintf("a%d=v%d", i, i)
 		secondCmd := fmt.Sprintf("b%d=v%d", i, i)
 
-		first := cm.Apply(firstCmd, 0)
+		first := cm.Apply([]byte(firstCmd), 0)
 		entered++
 		waitForCondition(t, 5*time.Second, "runFSM entered Apply for the first command",
 			func() bool { return fsm.enteredCount() >= entered })
 
-		second := cm.Apply(secondCmd, 0)
+		second := cm.Apply([]byte(secondCmd), 0)
 		waitForCondition(t, 5*time.Second, "second batch buffered in fsmMutateCh",
 			func() bool { return len(cm.fsmMutateCh) > 0 })
 
@@ -626,7 +626,7 @@ func TestSnapshot_RestartFromSnapshotProducesNewSnapshot(t *testing.T) {
 
 	const numCommands = 10
 	for i := 0; i < numCommands; i++ {
-		if err := cm.Apply(fmt.Sprintf("k%d=v%d", i, i), 0).Error(); err != nil {
+		if err := cm.Apply([]byte(fmt.Sprintf("k%d=v%d", i, i)), 0).Error(); err != nil {
 			t.Fatalf("Apply k%d: %v", i, err)
 		}
 	}
@@ -662,7 +662,7 @@ func TestSnapshot_RestartFromSnapshotProducesNewSnapshot(t *testing.T) {
 	waitForLeader(t, cm2, 5*time.Second)
 	cm2.SetSnapshotConfig(4, 2, 50*time.Millisecond)
 	for i := numCommands; i < numCommands+10; i++ {
-		if err := cm2.Apply(fmt.Sprintf("k%d=v%d", i, i), 0).Error(); err != nil {
+		if err := cm2.Apply([]byte(fmt.Sprintf("k%d=v%d", i, i)), 0).Error(); err != nil {
 			t.Fatalf("Apply k%d after restart: %v", i, err)
 		}
 	}
@@ -737,7 +737,7 @@ func TestSnapshot_UnappliedBatchesReplayedAfterRestart(t *testing.T) {
 	const appliedCommands = 5
 	for i := 0; i < appliedCommands; i++ {
 		fsm.release(1)
-		if err := cm.Apply(fmt.Sprintf("k%d=v%d", i, i), 0).Error(); err != nil {
+		if err := cm.Apply([]byte(fmt.Sprintf("k%d=v%d", i, i)), 0).Error(); err != nil {
 			t.Fatalf("Apply k%d: %v", i, err)
 		}
 	}
@@ -757,7 +757,7 @@ func TestSnapshot_UnappliedBatchesReplayedAfterRestart(t *testing.T) {
 	// машины состояний ранее (noop и пр.).
 	baseDispatched, _ := readWatermarks(cm)
 	for i := appliedCommands; i < appliedCommands+pendingCommands; i++ {
-		cm.Apply(fmt.Sprintf("k%d=v%d", i, i), 0)
+		cm.Apply([]byte(fmt.Sprintf("k%d=v%d", i, i)), 0)
 	}
 	// Инвариант: отметка применения растёт только при обработке
 	// фиксации, а фиксация возможна лишь после записи журнала на диск
@@ -840,7 +840,7 @@ func newFsmSnapshotCM(fsmApplied, dispatched, lastSnapshotIndex int) *ConsensusM
 	cm.cmState.lastSnapshotIndex = lastSnapshotIndex
 	cm.cmState.lastSnapshotTerm = 1
 	cm.cmState.termIndexMap = make(map[int]int)
-	cm.cmState.log = []LogEntry{{Index: fsmApplied, Term: 1, Type: LogCommand, Data: "k=v"}}
+	cm.cmState.log = []LogEntry{{Index: fsmApplied, Term: 1, Type: LogCommand, Data: []byte("k=v")}}
 	cm.cmState.lastLogIndex = fsmApplied
 	cm.cmState.lastLogTerm = 1
 	return cm
@@ -979,7 +979,7 @@ func TestSnapshotIndexNotAheadOfFSM_Deterministic(t *testing.T) {
 
 			// Батч 1: шлюз открыт, применение завершается полностью.
 			tc.gated.release(1)
-			first := cm.Apply("k0=v0", 0)
+			first := cm.Apply([]byte("k0=v0"), 0)
 			if err := first.Error(); err != nil {
 				t.Fatalf("Apply k0: %v", err)
 			}
@@ -987,7 +987,7 @@ func TestSnapshotIndexNotAheadOfFSM_Deterministic(t *testing.T) {
 
 			// Батч 2: пропусков в шлюзе нет — runFSM входит в Apply и
 			// останавливается внутри него.
-			second := cm.Apply("k1=v1", 0)
+			second := cm.Apply([]byte("k1=v1"), 0)
 			waitForCondition(t, 5*time.Second, "runFSM entered Apply for the second command",
 				func() bool { return tc.gated.enteredCount() >= 2 })
 
@@ -1086,7 +1086,7 @@ func TestFsmAppliedIndex_FreshStartAdvancesOnFirstBatch(t *testing.T) {
 	waitForLeader(t, cm, 5*time.Second)
 
 	fsm.release(1)
-	future := cm.Apply("k0=v0", 0)
+	future := cm.Apply([]byte("k0=v0"), 0)
 	if err := future.Error(); err != nil {
 		t.Fatalf("Apply k0: %v", err)
 	}

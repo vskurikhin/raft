@@ -108,10 +108,10 @@ func TestDefaultTCPRPCTimeoutBarrier(t *testing.T) {
 }
 
 // TestDefaultTimingBarrier закрепляет контракт дефолтов тайминговых
-// параметров: Default* равны 33/20/430/50 мс, формула verify-перерассылки
+// параметров: Default* равны 33/20/750/50 мс, формула verify-перерассылки
 // на умолчании даёт ровно 24 мс, а задержка повторов репликации на умолчании
 // совпадает с историческими числами (66 мс и ровно 1000 мс). Выборка
-// electionTimeout() на CM с умолчанием лежит в [430; 860) мс и кратна
+// electionTimeout() на CM с умолчанием лежит в [750; 1500) мс и кратна
 // миллисекунде.
 func TestDefaultTimingBarrier(t *testing.T) {
 	if DefaultHeartbeatTimeout != 33*time.Millisecond {
@@ -120,8 +120,8 @@ func TestDefaultTimingBarrier(t *testing.T) {
 	if DefaultTickerTimeout != 20*time.Millisecond {
 		t.Fatalf("DefaultTickerTimeout = %v, want 20ms", DefaultTickerTimeout)
 	}
-	if DefaultReelectionTimeout != 430*time.Millisecond {
-		t.Fatalf("DefaultReelectionTimeout = %v, want 430ms", DefaultReelectionTimeout)
+	if DefaultReelectionTimeout != 750*time.Millisecond {
+		t.Fatalf("DefaultReelectionTimeout = %v, want 750ms", DefaultReelectionTimeout)
 	}
 	if DefaultApplyBatchInterval != 50*time.Millisecond {
 		t.Fatalf("DefaultApplyBatchInterval = %v, want 50ms", DefaultApplyBatchInterval)
@@ -141,17 +141,102 @@ func TestDefaultTimingBarrier(t *testing.T) {
 	if got := replicationBackoffDelay(DefaultHeartbeatTimeout, 5); got != 1000*time.Millisecond {
 		t.Fatalf("delay(DefaultHB, 5) = %v, want exactly 1000ms", got)
 	}
-	// Выборка electionTimeout() на CM с умолчанием: диапазон [430; 860) мс,
+	// Выборка electionTimeout() на CM с умолчанием: диапазон [750; 1500) мс,
 	// все значения кратны миллисекунде.
 	cm := &ConsensusModule{}
 	for i := 0; i < 1000; i++ {
 		got := cm.electionTimeout()
-		if got < 430*time.Millisecond || got >= 860*time.Millisecond {
-			t.Fatalf("electionTimeout() = %v вне диапазона [430ms, 860ms) на выборке %d", got, i)
+		if got < 750*time.Millisecond || got >= 1500*time.Millisecond {
+			t.Fatalf("electionTimeout() = %v вне диапазона [750ms, 1500ms) на выборке %d", got, i)
 		}
 		if got%time.Millisecond != 0 {
 			t.Fatalf("electionTimeout() = %v не кратно миллисекунде на выборке %d", got, i)
 		}
+	}
+}
+
+// TestServeReelectionTimeoutNormalization проверяет маршрут нормализации
+// временных полей (AC): нулевой конфиг Server после Serve и созданный
+// обычным конструктором CM фактически получают DefaultReelectionTimeout
+// (750 мс), а явное допустимое значение 430 мс сохраняется. Проверки не
+// используют Harness с тестовым профилем и освобождают ресурсы по штатному
+// жизненному циклу (Shutdown).
+func TestServeReelectionTimeoutNormalization(t *testing.T) {
+	newServer := func(t *testing.T, reelection time.Duration) *Server {
+		t.Helper()
+		commitChan := make(chan CommitEntry)
+		readerDone := make(chan any)
+		go func() {
+			defer close(readerDone)
+			for range commitChan {
+			}
+		}()
+
+		ready := make(chan any)
+		transport, err := transp.NewTCPTransport("127.0.0.1:0", transp.TCPTimeouts{}, 0)
+		if err != nil {
+			t.Fatalf("NewTCPTransport: %v", err)
+		}
+		s := New(&Config{
+			Fsm:               NewCommitChannelFSM(commitChan),
+			PeerIds:           []int{},
+			ReelectionTimeout: reelection,
+			ServerID:          1,
+			Storage:           store.NewMapStorage(),
+			Transport:         transport,
+		}, ready)
+		s.Serve()
+		close(ready)
+		t.Cleanup(func() {
+			s.Shutdown()
+			close(commitChan)
+			<-readerDone
+		})
+		return s
+	}
+
+	t.Run("zero config defaults to 750ms", func(t *testing.T) {
+		s := newServer(t, 0)
+		if s.cm.reelectionTimeout != DefaultReelectionTimeout {
+			t.Fatalf("cm.reelectionTimeout = %v, want DefaultReelectionTimeout (%v)", s.cm.reelectionTimeout, DefaultReelectionTimeout)
+		}
+		if s.cm.reelectionTimeout != 750*time.Millisecond {
+			t.Fatalf("cm.reelectionTimeout = %v, want 750ms", s.cm.reelectionTimeout)
+		}
+	})
+
+	t.Run("explicit 430ms preserved", func(t *testing.T) {
+		s := newServer(t, 430*time.Millisecond)
+		if s.cm.reelectionTimeout != 430*time.Millisecond {
+			t.Fatalf("cm.reelectionTimeout = %v, want 430ms", s.cm.reelectionTimeout)
+		}
+	})
+}
+
+// TestNewConsensusModuleReelectionTimeoutNormalization проверяет, что
+// обычный конструктор ConsensusModule инициализирует временные поля
+// продуктовым умолчанием (750 мс) без какого-либо тестового профиля.
+func TestNewConsensusModuleReelectionTimeoutNormalization(t *testing.T) {
+	transport, err := transp.NewTCPTransport("127.0.0.1:0", transp.TCPTimeouts{}, 0)
+	if err != nil {
+		t.Fatalf("NewTCPTransport: %v", err)
+	}
+	ready := make(chan any)
+	cm := NewConsensusModule(1, nil, transport, store.NewMapStorage(), NewCommitChannelFSM(make(chan CommitEntry, 8)), ready)
+	close(ready)
+	t.Cleanup(func() {
+		cm.Stop()
+		transport.Close()
+	})
+
+	cm.mu.Lock()
+	got := cm.reelectionTimeout
+	cm.mu.Unlock()
+	if got != DefaultReelectionTimeout {
+		t.Fatalf("cm.reelectionTimeout = %v, want DefaultReelectionTimeout (%v)", got, DefaultReelectionTimeout)
+	}
+	if got != 750*time.Millisecond {
+		t.Fatalf("cm.reelectionTimeout = %v, want 750ms", got)
 	}
 }
 

@@ -113,7 +113,7 @@ func TestRestoreFromSnapshotStore_RestoresFSMAndIndex(t *testing.T) {
 	const numCommands = 10
 	for i := 0; i < numCommands; i++ {
 		cmd := "k" + itoa(i) + "=v" + itoa(i)
-		future := cm1.Apply(cmd, 0)
+		future := cm1.Apply([]byte(cmd), 0)
 		if err := future.Error(); err != nil {
 			t.Fatalf("Apply %q failed: %v", cmd, err)
 		}
@@ -174,7 +174,7 @@ func TestRestoreFromSnapshotStore_RestoresFSMAndIndex(t *testing.T) {
 	// кластере продвижение происходит при фиксации новой команды —
 	// применяем k10 и проверяем, что replay применил суффикс.
 	waitForLeader(t, cm2, 5*time.Second)
-	future := cm2.Apply("k10=v10", 0)
+	future := cm2.Apply([]byte("k10=v10"), 0)
 	if err := future.Error(); err != nil {
 		t.Fatalf("Apply k10 after restart failed: %v", err)
 	}
@@ -293,7 +293,7 @@ func TestRestoreFromSnapshotStore_SelfHealsStalePersistKey(t *testing.T) {
 
 	for i := 0; i < 10; i++ {
 		cmd := "k" + itoa(i) + "=v" + itoa(i)
-		future := cm1.Apply(cmd, 0)
+		future := cm1.Apply([]byte(cmd), 0)
 		if err := future.Error(); err != nil {
 			t.Fatalf("Apply %q failed: %v", cmd, err)
 		}

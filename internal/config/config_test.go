@@ -168,6 +168,34 @@ func TestParseFlagsStatsOutputFalse(t *testing.T) {
 	}
 }
 
+// TestParseFlagsStatsOutputDefaultFalse — без флага StatsOutput равен false:
+// умолчание узла не выводит периодическую статистику.
+func TestParseFlagsStatsOutputDefaultFalse(t *testing.T) {
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
+
+	os.Args = []string{"raft", "-number", "1"}
+
+	v := ParseFlags()
+	if v.StatsOutput {
+		t.Errorf("StatsOutput = true, want default false")
+	}
+}
+
+// TestParseFlagsStatsOutputTrue — явное -stats-output=true доезжает
+// до Values.StatsOutput.
+func TestParseFlagsStatsOutputTrue(t *testing.T) {
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
+
+	os.Args = []string{"raft", "-number", "1", "-stats-output=true"}
+
+	v := ParseFlags()
+	if !v.StatsOutput {
+		t.Errorf("StatsOutput = false, want true (явное включение)")
+	}
+}
+
 // TestAddStatsOutputFlagRejectsInvalidValue — небулево значение обязано
 // отклоняться штатной ошибкой парсера флагов, без log.Fatal: проверяется
 // регистрация флага на отдельном наборе.
@@ -358,8 +386,8 @@ func TestParseFlagsMaxPoolDefaults(t *testing.T) {
 	if v.MaxPool != DefaultMaxPool {
 		t.Errorf("MaxPool = %d, want default %d", v.MaxPool, DefaultMaxPool)
 	}
-	if DefaultMaxPool != 4 {
-		t.Errorf("DefaultMaxPool = %d, want 4", DefaultMaxPool)
+	if DefaultMaxPool != 16 {
+		t.Errorf("DefaultMaxPool = %d, want 16", DefaultMaxPool)
 	}
 }
 
@@ -657,6 +685,8 @@ func TestParseFlagsSnapshot(t *testing.T) {
 
 // TestParseFlagsTimingDefaults проверяет дефолты четырёх временных флагов:
 // без флага поля Values равны экспортированным дефолтам пакета raft.
+// Дополнительно закреплён независимый числовой барьер 750 мс для базы
+// перевыборов — алиасное сравнение одно не доказывает значение контракта.
 func TestParseFlagsTimingDefaults(t *testing.T) {
 	origArgs := os.Args
 	t.Cleanup(func() { os.Args = origArgs })
@@ -678,6 +708,9 @@ func TestParseFlagsTimingDefaults(t *testing.T) {
 		if tc.got != tc.want {
 			t.Errorf("%s = %v, want default %v", tc.name, tc.got, tc.want)
 		}
+	}
+	if raft.DefaultReelectionTimeout != 750*time.Millisecond {
+		t.Errorf("raft.DefaultReelectionTimeout = %v, want 750ms", raft.DefaultReelectionTimeout)
 	}
 }
 
@@ -707,6 +740,30 @@ func TestParseFlagsTiming(t *testing.T) {
 	}
 	if v.ApplyBatchInterval != 60*time.Millisecond {
 		t.Errorf("ApplyBatchInterval = %v, want 60ms", v.ApplyBatchInterval)
+	}
+}
+
+// TestValidateTimingFlags_TargetProfiles проверяет, что целевые временные
+// профили узла — оба допустимых пульса (33 и 45 мс) при базе перевыборов
+// 750 мс, тикере 20 мс и батче 50 мс — проходят существующую валидацию.
+// Это подтверждает совместимость новых умолчаний с обеими конфигурациями
+// стенда (Makefile) и узла без ослабления проверок границ.
+func TestValidateTimingFlags_TargetProfiles(t *testing.T) {
+	profiles := []struct {
+		name              string
+		heartbeat, ticker time.Duration
+		reelection        time.Duration
+		applyBatch        time.Duration
+	}{
+		{"node defaults", 33 * time.Millisecond, 20 * time.Millisecond, 750 * time.Millisecond, 50 * time.Millisecond},
+		{"stand profile", 45 * time.Millisecond, 20 * time.Millisecond, 750 * time.Millisecond, 50 * time.Millisecond},
+	}
+	for _, tc := range profiles {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validateTimingFlags(tc.heartbeat, tc.ticker, tc.reelection, tc.applyBatch); err != nil {
+				t.Errorf("validateTimingFlags(%v/%v/%v/%v) = %v, want nil", tc.heartbeat, tc.ticker, tc.reelection, tc.applyBatch, err)
+			}
+		})
 	}
 }
 
@@ -760,7 +817,7 @@ func TestParseFlagsTimingHelp(t *testing.T) {
 	help := buf.String()
 	for _, want := range []string{
 		// Профиль умолчаний и производные потолка пульса.
-		"400ms", "100ms", "430ms",
+		"400ms", "100ms", "750ms",
 		"must not exceed -tcp-rpc-timeout",
 		"must be at least -tcp-rpc-timeout",
 		// Межпараметрические связи временных флагов.

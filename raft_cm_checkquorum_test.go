@@ -178,7 +178,7 @@ func TestCheckQuorum_ApplyErrorsAfterStepDown(t *testing.T) {
 	leader := h.cluster[leaderID]
 
 	h.DisconnectPeer(leaderID)
-	pending := leader.Apply(42, time.Second)
+	pending := leader.Apply(intCommandBytes(42), time.Second)
 
 	select {
 	case err := <-pending.ErrorCh():
@@ -191,7 +191,7 @@ func TestCheckQuorum_ApplyErrorsAfterStepDown(t *testing.T) {
 
 	waitForState(t, leader, checkQuorumBudget, Follower, PreCandidate, Candidate)
 
-	if err := leader.Apply(43, time.Second).Error(); !errors.Is(err, ErrNotLeader) {
+	if err := leader.Apply(intCommandBytes(43), time.Second).Error(); !errors.Is(err, ErrNotLeader) {
 		t.Errorf("Apply after step down = %v, want %v", err, ErrNotLeader)
 	}
 }
@@ -211,7 +211,7 @@ func TestCheckQuorum_UncommittedLimitBoundsLog(t *testing.T) {
 
 	// Изолированный лидер фиксацию не продвигает: журнал растёт до предела.
 	for i := 0; i < _maxUncommittedEntries+_leaderBatchSize; i++ {
-		leader.Apply(i, time.Second)
+		leader.Apply(intCommandBytes(i), time.Second)
 		if uncommittedLogLen(leader) >= _maxUncommittedEntries {
 			break
 		}
@@ -232,7 +232,7 @@ func TestCheckQuorum_UncommittedLimitBoundsLog(t *testing.T) {
 		t.Fatalf("state = %v, want Leader (check-quorum must be disabled in this test)", state)
 	}
 
-	rejected := leader.Apply(-1, time.Second)
+	rejected := leader.Apply(intCommandBytes(-1), time.Second)
 	select {
 	case err := <-rejected.ErrorCh():
 		if !errors.Is(err, ErrTooManyUncommittedEntries) {
@@ -260,7 +260,7 @@ func TestCheckQuorum_ServiceEntriesBypassLimit(t *testing.T) {
 	h.DisconnectPeer(leaderID)
 
 	for i := 0; i < _maxUncommittedEntries+_leaderBatchSize; i++ {
-		leader.Apply(i, time.Second)
+		leader.Apply(intCommandBytes(i), time.Second)
 		if uncommittedLogLen(leader) >= _maxUncommittedEntries {
 			break
 		}
@@ -391,7 +391,7 @@ func TestCheckQuorum_LeadershipRegainedAfterStepDown(t *testing.T) {
 	// Цикл лидера жив: новая запись доходит до фиксации. Оставшийся в канале
 	// токен шага вниз завершил бы цикл сразу после вступления в лидерство,
 	// и фиксация стала бы невозможной.
-	committed := orig.Apply(4242, time.Second)
+	committed := orig.Apply(intCommandBytes(4242), time.Second)
 	select {
 	case err := <-committed.ErrorCh():
 		if err != nil {

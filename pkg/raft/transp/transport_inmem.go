@@ -78,8 +78,12 @@ func (t *InmemTransport) AppendEntries(
 		return zero, err
 	}
 	respCh := make(chan contract.RPCResponse, 1)
+	// Получатель не делит изменяемый граф отправителя: записи и байты
+	// Data копируются на границе отправки, различие nil/пустой срез
+	// сохраняется. Контракт владения одинаков с TCP-транспортом.
+	sent := copyAppendEntriesArgs(&args)
 	select {
-	case peer.consumerCh <- contract.RPC{Command: &args, RespChan: respCh}:
+	case peer.consumerCh <- contract.RPC{Command: sent, RespChan: respCh}:
 	case <-t.shutdownCh:
 		return zero, contract.ErrRaftShutdown
 	case <-peer.shutdownCh:
@@ -384,4 +388,45 @@ func (t *InmemTransport) getPeer(peerID contract.ServerID) (*InmemTransport, err
 		return nil, contract.ErrNotReachable
 	}
 	return peer, nil
+}
+
+// copyAppendEntriesArgs создаёт глубокую копию запроса AppendEntries:
+// срез записей и байты Data принадлежат получателю, различие nil и
+// непустого пустого среза сохраняется.
+func copyAppendEntriesArgs(args *contract.AppendEntriesArgs) *contract.AppendEntriesArgs {
+	if args.Entries == nil {
+		return &contract.AppendEntriesArgs{
+			RPCHeader:    args.RPCHeader,
+			Term:         args.Term,
+			LeaderID:     args.LeaderID,
+			PrevLogIndex: args.PrevLogIndex,
+			PrevLogTerm:  args.PrevLogTerm,
+			Entries:      nil,
+			LeaderCommit: args.LeaderCommit,
+		}
+	}
+	entries := make([]contract.LogEntry, len(args.Entries))
+	for i := range args.Entries {
+		entry := &args.Entries[i]
+		var data []byte
+		if entry.Data != nil {
+			data = make([]byte, len(entry.Data))
+			copy(data, entry.Data)
+		}
+		entries[i] = contract.LogEntry{
+			Index: entry.Index,
+			Term:  entry.Term,
+			Type:  entry.Type,
+			Data:  data,
+		}
+	}
+	return &contract.AppendEntriesArgs{
+		RPCHeader:    args.RPCHeader,
+		Term:         args.Term,
+		LeaderID:     args.LeaderID,
+		PrevLogIndex: args.PrevLogIndex,
+		PrevLogTerm:  args.PrevLogTerm,
+		Entries:      entries,
+		LeaderCommit: args.LeaderCommit,
+	}
 }

@@ -14,7 +14,8 @@ func TestValidateTiming_Boundaries(t *testing.T) {
 		name string
 		tc   TimerConfig
 	}{
-		{"defaults", TimerConfig{Heartbeat: 33 * time.Millisecond, Ticker: 20 * time.Millisecond, Reelection: 430 * time.Millisecond, ApplyBatch: 50 * time.Millisecond}},
+		{"defaults", TimerConfig{Heartbeat: 33 * time.Millisecond, Ticker: 20 * time.Millisecond, Reelection: 750 * time.Millisecond, ApplyBatch: 50 * time.Millisecond}},
+		{"legacy 430 profile", TimerConfig{Heartbeat: 33 * time.Millisecond, Ticker: 20 * time.Millisecond, Reelection: 430 * time.Millisecond, ApplyBatch: 50 * time.Millisecond}},
 		{"pre-change defaults", TimerConfig{Heartbeat: 33 * time.Millisecond, Ticker: 21 * time.Millisecond, Reelection: 381 * time.Millisecond, ApplyBatch: 50 * time.Millisecond}},
 		{"MinHeartbeatTimeout", TimerConfig{Heartbeat: MinHeartbeatTimeout, Ticker: 20 * time.Millisecond, Reelection: 430 * time.Millisecond, ApplyBatch: 50 * time.Millisecond}},
 		{"MaxHeartbeatTimeout", TimerConfig{Heartbeat: MaxHeartbeatTimeout, Ticker: 21 * time.Millisecond, Reelection: 1000 * time.Millisecond, ApplyBatch: 50 * time.Millisecond}},

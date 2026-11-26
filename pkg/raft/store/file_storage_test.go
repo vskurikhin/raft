@@ -71,9 +71,9 @@ func TestFileStorage_RestartSimulation(t *testing.T) {
 	fs1.Set("currentTerm", gobEncode(t, 3))
 	fs1.Set("votedFor", gobEncode(t, 2))
 	log := []raft.LogEntry{
-		{Index: 1, Term: 1, Data: 10},
-		{Index: 2, Term: 1, Data: 20},
-		{Index: 3, Term: 2, Data: 30},
+		{Index: 1, Term: 1, Data: []byte{10}},
+		{Index: 2, Term: 1, Data: []byte{20}},
+		{Index: 3, Term: 2, Data: []byte{30}},
 	}
 	fs1.RewriteLog(log)
 	fs1.Set("lastSnapshotIndex", gobEncode(t, 0))
@@ -104,7 +104,8 @@ func TestFileStorage_RestartSimulation(t *testing.T) {
 		t.Fatalf("log length = %d, want %d", len(restoredLog), len(log))
 	}
 	for i := range log {
-		if restoredLog[i] != log[i] {
+		if restoredLog[i].Index != log[i].Index || restoredLog[i].Term != log[i].Term ||
+			restoredLog[i].Type != log[i].Type || !bytes.Equal(restoredLog[i].Data, log[i].Data) {
 			t.Fatalf("log[%d] = %+v, want %+v", i, restoredLog[i], log[i])
 		}
 	}
@@ -236,7 +237,7 @@ func TestFileStorage_GobCompatibility(t *testing.T) {
 	fs.Set("lastSnapshotIndex", gobEncode(t, 4))
 	fs.Set("lastSnapshotTerm", gobEncode(t, 3))
 	log := []raft.LogEntry{
-		{Index: 1, Term: 1, Type: raft.LogCommand, Data: 100},
+		{Index: 1, Term: 1, Type: raft.LogCommand, Data: []byte{100}},
 		{Index: 2, Term: 1, Type: raft.LogNoop, Data: nil},
 	}
 	fs.RewriteLog(log)
@@ -258,7 +259,8 @@ func TestFileStorage_GobCompatibility(t *testing.T) {
 		t.Fatalf("log length = %d, want %d", len(restoredLog), len(log))
 	}
 	for i := range log {
-		if restoredLog[i] != log[i] {
+		if restoredLog[i].Index != log[i].Index || restoredLog[i].Term != log[i].Term ||
+			restoredLog[i].Type != log[i].Type || !bytes.Equal(restoredLog[i].Data, log[i].Data) {
 			t.Fatalf("log[%d] = %+v, want %+v", i, restoredLog[i], log[i])
 		}
 	}

@@ -194,10 +194,10 @@ func (s *Server) Serve() {
 }
 
 // Apply отправляет команду в Raft-кластер и возвращает ApplyFuture.
-//
-// Обязательство отправителя: объект команды cmd сохраняется по ссылке;
-// вызывающий не должен изменять переданную команду после вызова Apply.
-func (s *Server) Apply(cmd any, timeout time.Duration) ApplyFuture {
+// Команда — готовые байты прикладного представления; ConsensusModule
+// создаёт собственную копию до публикации в журнал, поэтому после
+// возврата Apply вызывающий может менять буфер.
+func (s *Server) Apply(cmd []byte, timeout time.Duration) ApplyFuture {
 	return s.cm.Apply(cmd, timeout)
 }
 

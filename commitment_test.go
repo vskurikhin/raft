@@ -850,7 +850,7 @@ func TestCommitmentE2E_FourNodes_TwoDownNoCommit(t *testing.T) {
 	h.DisconnectPeer(f2)
 
 	cmd := 1001
-	future := h.cluster[lid].Apply(cmd, 0)
+	future := h.cluster[lid].Apply(intCommandBytes(cmd), 0)
 
 	// Команда не фиксируется при 2/4: кворум 3/4 недостижим. Лидер,
 	// потерявший контакт с кворумом, шагает вниз и отклоняет ожидающую
@@ -866,7 +866,7 @@ func TestCommitmentE2E_FourNodes_TwoDownNoCommit(t *testing.T) {
 
 	newLid, _ := h.WaitForSingleLeader(_leaderElectionBudget)
 	restored := 1011
-	if err := waitFuture(t, h.cluster[newLid].Apply(restored, 0), 3*time.Second); err != nil {
+	if err := waitFuture(t, h.cluster[newLid].Apply(intCommandBytes(restored), 0), 3*time.Second); err != nil {
 		t.Fatalf("Apply failed after reconnect: %v", err)
 	}
 	// После реконнекта подключены все 4 узла: assert CheckCommittedN
@@ -888,7 +888,7 @@ func TestCommitmentE2E_FourNodes_OneDownStillCommits(t *testing.T) {
 	h.DisconnectPeer(down)
 
 	cmd := 1002
-	future := h.cluster[lid].Apply(cmd, 0)
+	future := h.cluster[lid].Apply(intCommandBytes(cmd), 0)
 	if err := waitFuture(t, future, 3*time.Second); err != nil {
 		t.Fatalf("Apply failed with 3/4 alive: %v", err)
 	}
@@ -907,7 +907,7 @@ func TestCommitmentE2E_TwoNodes_FollowerDownNoCommit(t *testing.T) {
 	h.DisconnectPeer(follower)
 
 	cmd := 1003
-	future := h.cluster[lid].Apply(cmd, 0)
+	future := h.cluster[lid].Apply(intCommandBytes(cmd), 0)
 
 	// При 1/2 фиксация невозможна (кворум 2/2): лидер шагает вниз по потере
 	// контакта и отклоняет ожидающую запись.
@@ -919,7 +919,7 @@ func TestCommitmentE2E_TwoNodes_FollowerDownNoCommit(t *testing.T) {
 	h.ReconnectPeer(follower)
 	newLid, _ := h.WaitForSingleLeader(_leaderElectionBudget)
 	restored := 1013
-	if err := waitFuture(t, h.cluster[newLid].Apply(restored, 0), 3*time.Second); err != nil {
+	if err := waitFuture(t, h.cluster[newLid].Apply(intCommandBytes(restored), 0), 3*time.Second); err != nil {
 		t.Fatalf("Apply failed after reconnect: %v", err)
 	}
 	h.WaitForCommit(restored, 2)
@@ -1085,17 +1085,14 @@ func TestConfiguration_AddVoterFromSingleVoter(t *testing.T) {
 	// Клиентская запись на A применяется на ОБОИХ узлах (B получает
 	// записи после добавления).
 	cmd := 2001
-	future = cmA.Apply(cmd, 0)
+	future = cmA.Apply(intCommandBytes(cmd), 0)
 	if err := waitFuture(t, future, 5*time.Second); err != nil {
 		t.Fatalf("Apply after AddVoter failed: %v", err)
 	}
 	for _, ch := range []chan CommitEntry{commitChA, commitChB} {
 		select {
 		case entry := <-ch:
-			got, ok := entry.Data.(int)
-			if !ok {
-				t.Fatalf("committed %T, want int", entry.Data)
-			}
+			got := intCommandValue(t, entry.Data)
 			if got != cmd {
 				t.Fatalf("committed %v, want %d", entry.Data, cmd)
 			}

@@ -47,23 +47,21 @@ func (cm *ConsensusModule) AddVoter(id ServerID, addr ServerAddress) IndexFuture
 }
 
 // Apply отправляет команду в Raft и возвращает ApplyFuture.
-// Команда будет применена к FSM после фиксации.
-//
-// Обязательство отправителя: объект команды command сохраняется по ссылке
-// (LogEntry.Data = command, без копирования); вызывающий не должен изменять
-// переданную команду после вызова Apply — в противном случае изменение увидят
-// и журнал, и FSM, и любой потребитель, удержавший payload.
-func (cm *ConsensusModule) Apply(command any, timeout time.Duration) ApplyFuture {
+// Команда будет применена к FSM после фиксации. До публикации в журнал и
+// до возврата создаётся собственная копия байтов с сохранением различия
+// nil/пустой срез, поэтому вызывающий может менять буфер после возврата.
+func (cm *ConsensusModule) Apply(command []byte, timeout time.Duration) ApplyFuture {
 	select {
 	case <-cm.shutdownCh:
 		return errorFuture{contract.ErrRaftShutdown}
 	default:
 	}
 
+	data := cloneLogData(command)
 	future := &logFuture{
 		log: LogEntry{
 			Type: LogCommand,
-			Data: command,
+			Data: data,
 		},
 	}
 	future.init(cm.shutdownCh)
@@ -908,4 +906,16 @@ func (cm *ConsensusModule) startStopReplicationLocked(cfg Configuration) {
 		}
 	}
 	cm.ensureReplicationForLocked(cfg)
+}
+
+// cloneLogData возвращает собственную копию байтов команды с сохранением
+// различия nil и непустого среза: nil остаётся nil, пустой срез остаётся
+// непустым (не-nil) пустым срезом.
+func cloneLogData(data []byte) []byte {
+	if data == nil {
+		return nil
+	}
+	out := make([]byte, len(data))
+	copy(out, data)
+	return out
 }

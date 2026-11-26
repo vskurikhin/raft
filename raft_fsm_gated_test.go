@@ -78,8 +78,8 @@ func (f *gatedTestFSM) Apply(log *LogEntry) any {
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if cmd, ok := log.Data.(string); ok {
-		if parts := strings.SplitN(cmd, "=", 2); len(parts) == 2 {
+	if cmd := log.Data; cmd != nil {
+		if parts := strings.SplitN(string(cmd), "=", 2); len(parts) == 2 {
 			f.state[parts[0]] = parts[1]
 		}
 	}

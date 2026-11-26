@@ -23,6 +23,50 @@ func TestElectionBasic(t *testing.T) {
 	h.CheckSingleLeader()
 }
 
+// TestHarnessTestTimingProfile закрепляет, что узлы Harness создаются и
+// перезапускаются с тестовым профилем (база 430 мс) независимо от
+// продуктового умолчания DefaultReelectionTimeout. Проверяются поля
+// таймеров под cm.mu и выборка electionTimeout в [430; 860) мс до и
+// после RestartPeer.
+func TestHarnessTestTimingProfile(t *testing.T) {
+	defer leaktest.CheckTimeout(t, LeaktestBudget)()
+
+	h := NewHarness(t, 3)
+	defer h.Shutdown()
+
+	for i := 0; i < h.n; i++ {
+		re, hb, tk, ab := h.readTimerConfig(i)
+		if re != _testReelectionTimeout {
+			t.Fatalf("server %d: reelectionTimeout = %v, want %v", i, re, _testReelectionTimeout)
+		}
+		if hb != DefaultHeartbeatTimeout || tk != DefaultTickerTimeout || ab != DefaultApplyBatchInterval {
+			t.Fatalf("server %d: timing = %v/%v/%v, want 33/20/50 ms", i, hb, tk, ab)
+		}
+		// Выборка тайм-аута выборов лежит в [база; 2·база) = [430; 860) мс.
+		to := h.cluster[i].electionTimeout()
+		if to < _testReelectionTimeout || to >= 2*_testReelectionTimeout {
+			t.Fatalf("server %d: electionTimeout = %v, want in [%v; %v)", i, to, _testReelectionTimeout, 2*_testReelectionTimeout)
+		}
+	}
+
+	// Перезапуск не возвращает узел к продуктовому умолчанию.
+	lid, _ := h.CheckSingleLeader()
+	h.CrashPeer(lid)
+	h.RestartPeer(lid)
+
+	re, hb, tk, ab := h.readTimerConfig(lid)
+	if re != _testReelectionTimeout {
+		t.Fatalf("restarted server %d: reelectionTimeout = %v, want %v", lid, re, _testReelectionTimeout)
+	}
+	if hb != DefaultHeartbeatTimeout || tk != DefaultTickerTimeout || ab != DefaultApplyBatchInterval {
+		t.Fatalf("restarted server %d: timing = %v/%v/%v, want 33/20/50 ms", lid, hb, tk, ab)
+	}
+	to := h.cluster[lid].electionTimeout()
+	if to < _testReelectionTimeout || to >= 2*_testReelectionTimeout {
+		t.Fatalf("restarted server %d: electionTimeout = %v, want in [%v; %v)", lid, to, _testReelectionTimeout, 2*_testReelectionTimeout)
+	}
+}
+
 func TestElectionLeaderDisconnect(t *testing.T) {
 	h := NewHarness(t, 3)
 	defer h.Shutdown()
@@ -75,8 +119,8 @@ func TestDisconnectAllThenRestore(t *testing.T) {
 	defer h.Shutdown()
 
 	// remove: разрыв связи выполняется сразу; минимальный election timeout
-	// (DefaultReelectionTimeout) заведомо больше времени старта узлов, поэтому
-	// лидер не успевает быть избран до разрыва.
+	// тестового профиля (_testReelectionTimeout) заведомо больше времени
+	// старта узлов, поэтому лидер не успевает быть избран до разрыва.
 	// Отключаем все серверы с самого начала. Лидера не будет.
 	for i := 0; i < 3; i++ {
 		h.DisconnectPeer(i)
@@ -340,8 +384,9 @@ func TestNoCommitWithNoQuorum(t *testing.T) {
 	// Изолируем обоих follower'ов: у лидера остаётся 1/3 — кворума нет.
 	// Прежняя схема опиралась на инвариант «время изоляции < min election
 	// timeout» (комментарий «246ms < 254ms»); фактические константы
-	// (DefaultReelectionTimeout=430ms) его нарушали — изоляция 300+93ms
-	// превышала минимальный election timeout, и тест был flaky.
+	// тестового профиля (_testReelectionTimeout=430ms) его нарушали —
+	// изоляция 300+93ms превышала минимальный election timeout, и тест
+	// был flaky.
 	// Инвариант снят: тест больше не зависит от того, начнут ли изолированные
 	// follower'ы выборы.
 	dPeer1 := (origLeaderId + 1) % 3
@@ -419,8 +464,8 @@ func TestDisconnectLeaderBriefly(t *testing.T) {
 
 	// Отключаем лидера на короткое время (меньше тайм-аута выборов у соседей).
 	// keep: timing — предмет теста. Длительность разрыва (90 мс) заведомо
-	// меньше минимального election timeout (DefaultReelectionTimeout = 430 мс),
-	// поэтому соседи не начинают выборы.
+	// меньше минимального election timeout тестового профиля
+	// (_testReelectionTimeout = 430 мс), поэтому соседи не начинают выборы.
 	h.DisconnectPeer(origLeaderId)
 	sleepMs(90)
 	h.ReconnectPeer(origLeaderId)
@@ -1145,7 +1190,7 @@ func TestLeader_StepDown_AppendEntriesHigherTerm(t *testing.T) {
 	// База отсчёта inflight снимается ДО Apply: у только что избранного
 	// лидера в inflight может оставаться собственная noop-запись.
 	inflightBefore := h.applyInflightCount(lid)
-	future := h.cluster[lid].Apply(42, 0)
+	future := h.cluster[lid].Apply(intCommandBytes(42), 0)
 	// replace (не commit-ожидание): ждём попадания Apply в inflight.
 	h.waitForApplyInflight(lid, inflightBefore+1, _commitBudgetSteady)
 
@@ -1190,7 +1235,7 @@ func TestLeader_StepDown_RequestVoteHigherTerm(t *testing.T) {
 
 	// База отсчёта inflight снимается ДО Apply (см. выше).
 	inflightBefore := h.applyInflightCount(lid)
-	future := h.cluster[lid].Apply(42, 0)
+	future := h.cluster[lid].Apply(intCommandBytes(42), 0)
 	// replace (не commit-ожидание): ждём попадания Apply в inflight.
 	h.waitForApplyInflight(lid, inflightBefore+1, _commitBudgetSteady)
 
@@ -1728,7 +1773,7 @@ func TestLeader_Shutdown_DuringApply(t *testing.T) {
 
 	lid, _ := h.CheckSingleLeader()
 
-	future := h.cluster[lid].Apply(42, 0)
+	future := h.cluster[lid].Apply(intCommandBytes(42), 0)
 	h.Shutdown()
 
 	err := waitFuture(t, future, _commitBudgetSteady)
@@ -1755,9 +1800,9 @@ func TestLeader_DispatchLogs_IndexSequence(t *testing.T) {
 	lid, _ := h.CheckSingleLeader()
 	// remove: CheckSingleLeader уже дождался устойчивого лидера.
 
-	f1 := h.cluster[lid].Apply(1, 0)
-	f2 := h.cluster[lid].Apply(2, 0)
-	f3 := h.cluster[lid].Apply(3, 0)
+	f1 := h.cluster[lid].Apply(intCommandBytes(1), 0)
+	f2 := h.cluster[lid].Apply(intCommandBytes(2), 0)
+	f3 := h.cluster[lid].Apply(intCommandBytes(3), 0)
 
 	for _, f := range []ApplyFuture{f1, f2, f3} {
 		if err := f.Error(); err != nil {
@@ -1785,7 +1830,7 @@ func TestCommitmentInteg_CommitOnMajority(t *testing.T) {
 
 	lid, _ := h.CheckSingleLeader()
 
-	future := h.cluster[lid].Apply(42, 0)
+	future := h.cluster[lid].Apply(intCommandBytes(42), 0)
 	if err := future.Error(); err != nil {
 		t.Fatalf("Apply failed: %v", err)
 	}
@@ -1812,7 +1857,7 @@ func TestCommitmentInteg_NoCommitWithoutMajority(t *testing.T) {
 	h.waitForIsolated(lid, _commitBudgetSteady)
 
 	inflightBefore := h.applyInflightCount(lid)
-	future := h.cluster[lid].Apply(42, 0)
+	future := h.cluster[lid].Apply(intCommandBytes(42), 0)
 	// replace: ждём попадания Apply в inflight лидера.
 	h.waitForApplyInflight(lid, inflightBefore+1, _commitBudgetSteady)
 
@@ -1856,7 +1901,7 @@ func TestCommitmentInteg_CommitAfterReconnect(t *testing.T) {
 	h.waitForIsolated(lid, _commitBudgetSteady)
 
 	inflightBefore := h.applyInflightCount(lid)
-	future := h.cluster[lid].Apply(42, 0)
+	future := h.cluster[lid].Apply(intCommandBytes(42), 0)
 	// replace: ждём попадания Apply в inflight лидера.
 	h.waitForApplyInflight(lid, inflightBefore+1, _commitBudgetSteady)
 
@@ -1883,7 +1928,7 @@ func TestCommitmentInteg_SingleNode(t *testing.T) {
 
 	_, _ = h.CheckSingleLeader()
 
-	future := h.cluster[0].Apply(42, 0)
+	future := h.cluster[0].Apply(intCommandBytes(42), 0)
 	if err := future.Error(); err != nil {
 		t.Fatalf("Apply failed: %v", err)
 	}
@@ -1904,7 +1949,7 @@ func TestRaftSafety_NewLeaderCommitNoop(t *testing.T) {
 	// достаточно убедиться, что Apply работает на всех узлах
 	lid, _ := h.CheckSingleLeader()
 
-	future := h.cluster[lid].Apply(42, 0)
+	future := h.cluster[lid].Apply(intCommandBytes(42), 0)
 	if err := future.Error(); err != nil {
 		t.Fatalf("Apply failed: %v", err)
 	}
@@ -1926,7 +1971,7 @@ func TestRace_ApplyAndStepDown(t *testing.T) {
 	// Apply в одной горутине
 	done := make(chan struct{})
 	go func() {
-		future := h.cluster[lid].Apply(42, 0)
+		future := h.cluster[lid].Apply(intCommandBytes(42), 0)
 		_ = future.Error()
 		close(done)
 	}()
@@ -1968,7 +2013,7 @@ func TestCommitmentInteg_FiveNodes(t *testing.T) {
 
 	lid, _ := h.CheckSingleLeader()
 
-	future := h.cluster[lid].Apply(42, 0)
+	future := h.cluster[lid].Apply(intCommandBytes(42), 0)
 	if err := future.Error(); err != nil {
 		t.Fatalf("Apply failed: %v", err)
 	}
@@ -1998,7 +2043,7 @@ func TestCommitmentInteg_FiveNodesDisconnectTwo(t *testing.T) {
 		}
 	}
 
-	future := h.cluster[lid].Apply(42, 0)
+	future := h.cluster[lid].Apply(intCommandBytes(42), 0)
 	if err := future.Error(); err != nil {
 		t.Fatalf("Apply should succeed with 3/5 quorum: %v", err)
 	}
@@ -2029,7 +2074,7 @@ func TestCommitmentInteg_FiveNodesDisconnectThree(t *testing.T) {
 	}
 
 	inflightBefore := h.applyInflightCount(lid)
-	future := h.cluster[lid].Apply(42, 0)
+	future := h.cluster[lid].Apply(intCommandBytes(42), 0)
 	// replace: ждём попадания Apply в inflight лидера.
 	h.waitForApplyInflight(lid, inflightBefore+1, _commitBudgetSteady)
 
@@ -2060,7 +2105,7 @@ func TestStability_1kCommands(t *testing.T) {
 	lid, _ := h.CheckSingleLeader()
 
 	for i := 0; i < 100; i++ {
-		future := h.cluster[lid].Apply(i, 0)
+		future := h.cluster[lid].Apply(intCommandBytes(i), 0)
 		if err := future.Error(); err != nil {
 			t.Fatalf("Apply %d failed: %v", i, err)
 		}
@@ -2089,7 +2134,7 @@ func TestStability_ConcurrentClients(t *testing.T) {
 		wg.Add(1)
 		go func(cmd int) {
 			defer wg.Done()
-			future := h.cluster[lid].Apply(cmd, 0)
+			future := h.cluster[lid].Apply(intCommandBytes(cmd), 0)
 			if err := future.Error(); err != nil {
 				t.Errorf("Apply %d failed: %v", cmd, err)
 			}
@@ -2220,7 +2265,7 @@ func TestNonBatchingFSM_UnchangedBehavior(t *testing.T) {
 
 	var futures []ApplyFuture
 	for i := 0; i < 10; i++ {
-		f := h.cluster[lid].Apply(i, 5*time.Second)
+		f := h.cluster[lid].Apply(intCommandBytes(i), 5*time.Second)
 		futures = append(futures, f)
 	}
 	// remove: f.Error() блокируется до разрешения future (таймаут 5s
@@ -2245,7 +2290,7 @@ func TestBatchingFSM_Basic(t *testing.T) {
 	waitForLeader(t, cm, 2*time.Second)
 
 	for i := 0; i < 5; i++ {
-		future := cm.Apply(i, 0)
+		future := cm.Apply(intCommandBytes(i), 0)
 		if err := future.Error(); err != nil {
 			t.Fatalf("Apply %d failed: %v", i, err)
 		}
@@ -2273,7 +2318,7 @@ func TestBatchingFSM_BatchBoundary(t *testing.T) {
 
 	n := _maxApplyBatchSize * 3
 	for i := 0; i < n; i++ {
-		future := cm.Apply(i, 0)
+		future := cm.Apply(intCommandBytes(i), 0)
 		if err := future.Error(); err != nil {
 			t.Fatalf("Apply %d failed: %v", i, err)
 		}
@@ -2303,7 +2348,7 @@ func TestBatchingFSM_ApplyBatchResponseMatching(t *testing.T) {
 
 	futures := make([]ApplyFuture, 3)
 	for i := range futures {
-		futures[i] = cm.Apply(i*100, 0)
+		futures[i] = cm.Apply(intCommandBytes(i*100), 0)
 	}
 
 	for i, f := range futures {
@@ -2388,7 +2433,7 @@ func TestBatchingFSM_ApplyBatchResponseMismatch(t *testing.T) {
 	// хотя бы один батч, отправленный в ApplyBatch, вернёт неверное число ответов.
 	futures := make([]ApplyFuture, 3)
 	for i := range futures {
-		futures[i] = cm.Apply(i*100, 0)
+		futures[i] = cm.Apply(intCommandBytes(i*100), 0)
 	}
 
 	for i, f := range futures {
@@ -2403,7 +2448,7 @@ func TestBatchingFSM_ApplyBatchResponseMismatch(t *testing.T) {
 	// должен был стоять panic), future остался бы без ответа и select упал бы
 	// по таймауту. Допустимы оба исхода: успех либо ErrBatchFSMResponseMismatch
 	// (мок всегда возвращает неверное число ответов).
-	f := cm.Apply(1000, 0)
+	f := cm.Apply(intCommandBytes(1000), 0)
 	select {
 	case err := <-f.ErrorCh():
 		if errors.Is(err, contract.ErrRaftShutdown) {
@@ -2448,7 +2493,7 @@ func TestNonvoter_DoesNotStartElection(t *testing.T) {
 	// keep: negative window — за окно, превышающее минимальный election
 	// timeout, неголосующий не должен стать лидером. Опрос не доказывает
 	// отсутствия события; окно осознанно временное.
-	sleepMs(int(DefaultReelectionTimeout.Milliseconds()))
+	sleepMs(int(_testReelectionTimeout.Milliseconds()))
 
 	// Nonvoter не должен быть лидером.
 	_, _, isLeader := h.cluster[demoteID].Report()
@@ -2505,7 +2550,7 @@ func TestNonvoter_DoesNotAffectCommitIndex(t *testing.T) {
 	h.DisconnectPeer(demoteID)
 
 	// Отправляем команду — должна зафиксироваться (2 из 3 голосующих = кворум).
-	future := h.cluster[lid].Apply(42, 0)
+	future := h.cluster[lid].Apply(intCommandBytes(42), 0)
 	if err := future.Error(); err != nil {
 		t.Fatalf("Apply failed: %v", err)
 	}
@@ -2538,7 +2583,7 @@ func TestNonvoter_AppliesLogs(t *testing.T) {
 	h.waitForSuffrage(demoteID, ServerID(demoteID), Nonvoter, _commitBudgetAfterFailover)
 
 	for _, cmd := range []int{10, 20, 30} {
-		f := h.cluster[lid].Apply(cmd, 0)
+		f := h.cluster[lid].Apply(intCommandBytes(cmd), 0)
 		if err := f.Error(); err != nil {
 			t.Fatalf("Apply %d failed: %v", cmd, err)
 		}
@@ -2596,7 +2641,7 @@ func TestNonvoter_DemotedVoterDoesNotStartElection(t *testing.T) {
 	// keep: negative window — за окно, превышающее минимальный election
 	// timeout, неголосующий не должен стать лидером. Опрос не доказывает
 	// отсутствия события; окно осознанно временное.
-	sleepMs(int(DefaultReelectionTimeout.Milliseconds()))
+	sleepMs(int(_testReelectionTimeout.Milliseconds()))
 
 	// Nonvoter не должен стать лидером.
 	_, _, isLeader := h.cluster[demoteID].Report()
@@ -2710,7 +2755,7 @@ func TestNonvoter_NoGoroutineLeak(t *testing.T) {
 	h.waitForSuffrage(demoteID, ServerID(demoteID), Nonvoter, _commitBudgetAfterFailover)
 
 	// Отправить команду.
-	f = h.cluster[lid].Apply(42, 0)
+	f = h.cluster[lid].Apply(intCommandBytes(42), 0)
 	if err := f.Error(); err != nil {
 		t.Fatalf("Apply failed: %v", err)
 	}
@@ -2843,7 +2888,7 @@ func TestApply_Timeout(t *testing.T) {
 	h := NewHarness(t, 1)
 	defer h.Shutdown()
 
-	future := h.cluster[0].Apply(42, 10*time.Millisecond)
+	future := h.cluster[0].Apply(intCommandBytes(42), 10*time.Millisecond)
 	if err := future.Error(); err != ErrNotLeader && err != contract.ErrEnqueueTimeout {
 		t.Fatalf("expected ErrNotLeader or ErrEnqueueTimeout, got %v", err)
 	}
@@ -2855,7 +2900,7 @@ func TestApply_TimeoutDoesNotBlock(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 	h := NewHarness(t, 1)
 	h.Shutdown()
-	future := h.cluster[0].Apply(42, 0)
+	future := h.cluster[0].Apply(intCommandBytes(42), 0)
 	if err := future.Error(); err != contract.ErrRaftShutdown {
 		t.Fatalf("expected ErrRaftShutdown, got %v", err)
 	}
@@ -3152,7 +3197,7 @@ func TestRace_ReplicateLoopLeadershipChange(t *testing.T) {
 	inflightBefore := h.applyInflightCount(lid)
 	done := make(chan struct{})
 	go func() {
-		future := h.cluster[lid].Apply(43, 0)
+		future := h.cluster[lid].Apply(intCommandBytes(43), 0)
 		_ = future.Error()
 		close(done)
 	}()
@@ -3318,10 +3363,10 @@ func TestIntegration_TermIndexAfterLogTruncation(t *testing.T) {
 	// keep: окно без наблюдаемого состояния — victim уже отключён,
 	// поэтому после отключения лидера подключённым остаётся ровно
 	// один узел и кворума нет: ни лидер, ни фиксация не могут появиться.
-	// Бюджет — DefaultReelectionTimeout (минимальный election timeout):
-	// оставшийся узел успевает выйти из состояния «лидер известен».
+	// Бюджет — _testReelectionTimeout (минимальный election timeout тестового
+	// профиля): оставшийся узел успевает выйти из состояния «лидер известен».
 	h.DisconnectPeer(lid)
-	sleepMs(int(DefaultReelectionTimeout.Milliseconds()))
+	sleepMs(int(_testReelectionTimeout.Milliseconds()))
 	h.ReconnectPeer(lid)
 
 	for i := 0; i < 3; i++ {

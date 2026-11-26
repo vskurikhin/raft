@@ -314,7 +314,7 @@ func TestSingleNodeApply(t *testing.T) {
 
 	waitForLeader(t, cm, 2*time.Second)
 
-	future := cm.Apply("cmd1", 0)
+	future := cm.Apply([]byte("cmd1"), 0)
 	if err := future.Error(); err != nil {
 		t.Fatalf("Apply failed: %v", err)
 	}
@@ -331,9 +331,9 @@ func TestSingleNodeApplyOrder(t *testing.T) {
 
 	waitForLeader(t, cm, 2*time.Second)
 
-	f1 := cm.Apply("cmd1", 0)
-	f2 := cm.Apply("cmd2", 0)
-	f3 := cm.Apply("cmd3", 0)
+	f1 := cm.Apply([]byte("cmd1"), 0)
+	f2 := cm.Apply([]byte("cmd2"), 0)
+	f3 := cm.Apply([]byte("cmd3"), 0)
 
 	// Дожидаемся завершения всех Apply, чтобы индексы были назначены.
 	for _, f := range []ApplyFuture{f1, f2, f3} {
@@ -357,7 +357,7 @@ func TestSingleNodeApplyResponse(t *testing.T) {
 	defer h.Shutdown()
 	waitForLeader(t, h.cluster[0], 2*time.Second)
 
-	future := h.cluster[0].Apply("cmd1", 0)
+	future := h.cluster[0].Apply([]byte("cmd1"), 0)
 	if err := future.Error(); err != nil {
 		t.Fatalf("Apply failed: %v", err)
 	}
@@ -380,7 +380,7 @@ func TestApplyOnFollower(t *testing.T) {
 	leaderId, _ := h.CheckSingleLeader()
 	followerId := (leaderId + 1) % 3
 
-	future := h.cluster[followerId].Apply(42, 0)
+	future := h.cluster[followerId].Apply(intCommandBytes(42), 0)
 	if err := future.Error(); err != ErrNotLeader {
 		t.Fatalf("got %v, want ErrNotLeader", err)
 	}
@@ -399,7 +399,7 @@ func TestApplyAfterShutdown(t *testing.T) {
 	// наблюдаемого признака состояния здесь нет.
 	time.Sleep(10 * time.Millisecond)
 
-	future := cm.Apply("cmd", 0)
+	future := cm.Apply([]byte("cmd"), 0)
 	if err := future.Error(); err != contract.ErrRaftShutdown {
 		t.Fatalf("got %v, want ErrRaftShutdown", err)
 	}
@@ -441,14 +441,14 @@ func TestFSMApplyInOrder(t *testing.T) {
 	waitForLeader(t, cm, 2*time.Second)
 
 	for i := 0; i < 5; i++ {
-		future := cm.Apply(i, 0)
+		future := cm.Apply(intCommandBytes(i), 0)
 		if err := future.Error(); err != nil {
 			t.Fatalf("Apply %d failed: %v", i, err)
 		}
 	}
 
 	capture.mu.Lock()
-	raw := make([]any, len(capture.entries))
+	raw := make([][]byte, len(capture.entries))
 	for i, e := range capture.entries {
 		raw[i] = e.Data
 	}
@@ -456,11 +456,7 @@ func TestFSMApplyInOrder(t *testing.T) {
 
 	entries := make([]int, len(raw))
 	for i, d := range raw {
-		v, ok := d.(int)
-		if !ok {
-			t.Fatalf("entries[%d]: data %T is not int", i, d)
-		}
-		entries[i] = v
+		entries[i] = intCommandValue(t, d)
 	}
 
 	for i := 0; i < 5; i++ {
@@ -478,7 +474,7 @@ func TestFutureNoGoroutineLeak(t *testing.T) {
 	defer cm.Stop()
 
 	waitForLeader(t, cm, 2*time.Second)
-	future := cm.Apply("leaktest", 0)
+	future := cm.Apply([]byte("leaktest"), 0)
 	_ = future.Error()
 }
 
@@ -491,7 +487,7 @@ func TestFutureErrorNoLeak(t *testing.T) {
 	leaderId, _ := h.CheckSingleLeader()
 	followerId := (leaderId + 1) % 3
 
-	future := h.cluster[followerId].Apply("leaktest", 0)
+	future := h.cluster[followerId].Apply([]byte("leaktest"), 0)
 	_ = future.Error()
 }
 
@@ -504,7 +500,7 @@ func TestBatchApplyOrderAndIndices(t *testing.T) {
 	values := []int{42, 55, 81}
 	futures := make([]ApplyFuture, len(values))
 	for i, v := range values {
-		futures[i] = h.cluster[0].Apply(v, 0)
+		futures[i] = h.cluster[0].Apply(intCommandBytes(v), 0)
 	}
 
 	for i, f := range futures {
@@ -520,7 +516,7 @@ func TestBatchApplyOrderAndIndices(t *testing.T) {
 	}
 
 	capture.mu.Lock()
-	raw := make([]any, 0, len(capture.entries))
+	raw := make([][]byte, 0, len(capture.entries))
 	for _, e := range capture.entries {
 		if e.Type == LogCommand {
 			raw = append(raw, e.Data)
@@ -530,11 +526,7 @@ func TestBatchApplyOrderAndIndices(t *testing.T) {
 
 	entries := make([]int, len(raw))
 	for i, d := range raw {
-		v, ok := d.(int)
-		if !ok {
-			t.Fatalf("entries[%d]: data %T is not int", i, d)
-		}
-		entries[i] = v
+		entries[i] = intCommandValue(t, d)
 	}
 
 	for i, v := range values {
@@ -561,7 +553,7 @@ func TestApplyInflightOnLeaderCrash(t *testing.T) {
 	h.waitForIsolated(origLeaderId, _commitBudgetSteady)
 
 	inflightBefore := h.applyInflightCount(origLeaderId)
-	future := h.cluster[origLeaderId].Apply(42, 0)
+	future := h.cluster[origLeaderId].Apply(intCommandBytes(42), 0)
 	// Ждём, пока runLeaderLoop поместит future в inflight, — до CrashPeer.
 	h.waitForApplyInflight(origLeaderId, inflightBefore+1, _commitBudgetSteady)
 	h.CrashPeer(origLeaderId)
@@ -579,7 +571,7 @@ func TestApplyWithFollowerCrash(t *testing.T) {
 	lid, _ := h.CheckSingleLeader()
 	followerId := (lid + 1) % 3
 
-	future := h.cluster[lid].Apply(42, 0)
+	future := h.cluster[lid].Apply(intCommandBytes(42), 0)
 	h.CrashPeer(followerId)
 
 	if err := future.Error(); err != nil {
@@ -605,7 +597,7 @@ func TestApplyNoQuorumThenNewLeader(t *testing.T) {
 	h.waitForIsolated(lid, _commitBudgetSteady)
 
 	inflightBefore := h.applyInflightCount(lid)
-	future := h.cluster[lid].Apply(42, 0)
+	future := h.cluster[lid].Apply(intCommandBytes(42), 0)
 	// Ждём, пока Apply попадёт в inflight лидера.
 	h.waitForApplyInflight(lid, inflightBefore+1, _commitBudgetSteady)
 
@@ -639,14 +631,23 @@ func TestApplyNoQuorumThenNewLeader(t *testing.T) {
 
 // --- Benchmarks ---
 
+// leaderRoleB возвращает true, если узел уже избран лидером. Короткий
+// помощник чтения роли под cm.mu (Lock/defer Unlock в одной функции);
+// блокировка не удерживается при ожидании.
+func leaderRoleB(cm *ConsensusModule) bool {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	return cm.cmState.state == Leader
+}
+
 func waitForLeaderB(t testing.TB, cm *ConsensusModule) {
 	t.Helper()
-	deadline := time.After(800 * time.Millisecond)
+	// Окно покрывает верхнюю границу продуктового таймера выборов
+	// [DefaultReelectionTimeout; 2·DefaultReelectionTimeout) с запасом 500 мс
+	// (ADR-1010-09): 1360 мс на базисе, 2000 мс после смены умолчания на 750 мс.
+	deadline := time.After(2*DefaultReelectionTimeout + 500*time.Millisecond)
 	for {
-		cm.mu.Lock()
-		isLeader := cm.cmState.state == Leader
-		cm.mu.Unlock()
-		if isLeader {
+		if leaderRoleB(cm) {
 			return
 		}
 		select {
@@ -667,7 +668,7 @@ func BenchmarkApply(b *testing.B) {
 	waitForLeaderB(b, cm)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		future := cm.Apply(i, 0)
+		future := cm.Apply(intCommandBytes(i), 0)
 		_ = future.Error()
 	}
 }
@@ -682,7 +683,7 @@ func BenchmarkBatchApply(b *testing.B) {
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			future := cm.Apply("cmd", 0)
+			future := cm.Apply([]byte("cmd"), 0)
 			_ = future.Error()
 		}
 	})

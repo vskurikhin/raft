@@ -29,11 +29,10 @@ func newSnapshotTestFSM() *snapshotTestFSM {
 func (f *snapshotTestFSM) Apply(log *LogEntry) any {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	cmd, ok := log.Data.(string)
-	if !ok {
+	if log.Data == nil {
 		return nil
 	}
-	parts := strings.SplitN(cmd, "=", 2)
+	parts := strings.SplitN(string(log.Data), "=", 2)
 	if len(parts) == 2 {
 		f.state[parts[0]] = parts[1]
 	}
@@ -88,9 +87,9 @@ func TestSnapshotTestFSM_Basic(t *testing.T) {
 	defer leaktest.CheckTimeout(t, LeaktestBudget)()
 
 	fsm := newSnapshotTestFSM()
-	fsm.Apply(&LogEntry{Data: "a=1"})
-	fsm.Apply(&LogEntry{Data: "b=2"})
-	fsm.Apply(&LogEntry{Data: "c=3"})
+	fsm.Apply(&LogEntry{Data: []byte("a=1")})
+	fsm.Apply(&LogEntry{Data: []byte("b=2")})
+	fsm.Apply(&LogEntry{Data: []byte("c=3")})
 
 	// Snapshot + Persist.
 	snap, err := fsm.Snapshot()

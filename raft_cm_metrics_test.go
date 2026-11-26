@@ -133,9 +133,9 @@ func TestLatencyZeroValueCMMetricPaths(t *testing.T) {
 	cm.cmState.lastSnapshotTerm = -1
 	cm.cmState.termIndexMap = make(map[int]int)
 	cm.cmState.log = []LogEntry{
-		{Index: 0, Term: 1, Type: LogCommand, Data: "v0"},
-		{Index: 1, Term: 1, Type: LogCommand, Data: "v1"},
-		{Index: 2, Term: 1, Type: LogCommand, Data: "v2"},
+		{Index: 0, Term: 1, Type: LogCommand, Data: []byte("v0")},
+		{Index: 1, Term: 1, Type: LogCommand, Data: []byte("v1")},
+		{Index: 2, Term: 1, Type: LogCommand, Data: []byte("v2")},
 	}
 	cm.cmState.lastLogIndex = 2
 	cm.cmState.lastLogTerm = 1
@@ -458,7 +458,7 @@ func TestLatencyFsmApplyCountsBatches(t *testing.T) {
 	// Два батча (N >= 2) — по одному замеру на каждый.
 	for b := 0; b < 2; b++ {
 		cm.fsmMutateCh <- []*commitTuple{{
-			log:    &LogEntry{Index: b, Term: 1, Type: LogCommand, Data: b},
+			log:    &LogEntry{Index: b, Term: 1, Type: LogCommand, Data: intCommandBytes(b)},
 			future: nil,
 		}}
 	}

@@ -92,7 +92,7 @@ func TestCMStartFatalSubprocess(t *testing.T) {
 		fs := store.NewFileStorage(dir)
 		fs.Set("currentTerm", gobEncode(t, 1))
 		fs.Set("votedFor", gobEncode(t, -1))
-		fs.RewriteLog([]LogEntry{{Index: 0, Term: 1, Type: LogCommand, Data: "k0=v0"}})
+		fs.RewriteLog([]LogEntry{{Index: 0, Term: 1, Type: LogCommand, Data: []byte("k0=v0")}})
 	}
 
 	tests := []struct {
@@ -165,7 +165,7 @@ func TestCMStartFatalSubprocess(t *testing.T) {
 				// долговечных метаданных снимка. Порядок «скаляры снимка до
 				// журнала» исключает такое состояние при штатной работе; тест
 				// подтверждает отказ старта, а не молчаливое продолжение.
-				fs.RewriteLog([]LogEntry{{Index: 5, Term: 1, Type: LogCommand, Data: "k5=v5"}})
+				fs.RewriteLog([]LogEntry{{Index: 5, Term: 1, Type: LogCommand, Data: []byte("k5=v5")}})
 			},
 			wantMsg: "lastSnapshotIndex missing in storage",
 		},

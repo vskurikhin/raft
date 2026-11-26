@@ -71,7 +71,7 @@ func TestWaitFor_ConditionBecomesTrue(t *testing.T) {
 // (§21 architecture.md: ожидание, бюджет, достигнутое состояние).
 func TestWaitFor_TimeoutDiagnostics(t *testing.T) {
 	h := newSyntheticHarness(t, 3)
-	h.commits[0] = []CommitEntry{{Data: 41, Index: 1, Term: 1}}
+	h.commits[0] = []CommitEntry{{Data: intCommandBytes(41), Index: 1, Term: 1}}
 
 	budget := 60 * time.Millisecond
 	start := time.Now()
@@ -101,9 +101,9 @@ func TestCommittedOn_NotWeakerThanAssert(t *testing.T) {
 
 	// Узел 0 ушёл вперёд: команда 42 есть у всех, но длины не равны —
 	// предусловие CheckCommitted (равные длины) не выполнено.
-	h.commits[0] = []CommitEntry{{Data: 42, Index: 1, Term: 1}, {Data: 43, Index: 2, Term: 1}}
-	h.commits[1] = []CommitEntry{{Data: 42, Index: 1, Term: 1}}
-	h.commits[2] = []CommitEntry{{Data: 42, Index: 1, Term: 1}}
+	h.commits[0] = []CommitEntry{{Data: intCommandBytes(42), Index: 1, Term: 1}, {Data: intCommandBytes(43), Index: 2, Term: 1}}
+	h.commits[1] = []CommitEntry{{Data: intCommandBytes(42), Index: 1, Term: 1}}
+	h.commits[2] = []CommitEntry{{Data: intCommandBytes(42), Index: 1, Term: 1}}
 
 	h.mu.Lock()
 	nc, converged := h.committedOn(42)
@@ -132,8 +132,8 @@ func TestCommittedOn_NotWeakerThanAssert(t *testing.T) {
 
 	// После сходимости узлов предикат обязан стать истинным.
 	h.mu.Lock()
-	h.commits[1] = append(h.commits[1], CommitEntry{Data: 43, Index: 2, Term: 1})
-	h.commits[2] = append(h.commits[2], CommitEntry{Data: 43, Index: 2, Term: 1})
+	h.commits[1] = append(h.commits[1], CommitEntry{Data: intCommandBytes(43), Index: 2, Term: 1})
+	h.commits[2] = append(h.commits[2], CommitEntry{Data: intCommandBytes(43), Index: 2, Term: 1})
 	nc, converged = h.committedOn(42)
 	h.mu.Unlock()
 	if nc != 3 || !converged {
@@ -145,9 +145,9 @@ func TestCommittedOn_NotWeakerThanAssert(t *testing.T) {
 // предусловие CheckCommitted (равный Index) не выполнено.
 func TestCommittedOn_IndexMismatch(t *testing.T) {
 	h := newSyntheticHarness(t, 3)
-	h.commits[0] = []CommitEntry{{Data: 42, Index: 1, Term: 1}}
-	h.commits[1] = []CommitEntry{{Data: 42, Index: 2, Term: 1}}
-	h.commits[2] = []CommitEntry{{Data: 42, Index: 1, Term: 1}}
+	h.commits[0] = []CommitEntry{{Data: intCommandBytes(42), Index: 1, Term: 1}}
+	h.commits[1] = []CommitEntry{{Data: intCommandBytes(42), Index: 2, Term: 1}}
+	h.commits[2] = []CommitEntry{{Data: intCommandBytes(42), Index: 1, Term: 1}}
 
 	h.mu.Lock()
 	nc, converged := h.committedOn(42)
@@ -165,8 +165,8 @@ func TestCommittedOn_IndexMismatch(t *testing.T) {
 // ни в подсчёте nc, ни в проверке сходимости.
 func TestCommittedOn_IgnoresDisconnected(t *testing.T) {
 	h := newSyntheticHarness(t, 3)
-	h.commits[0] = []CommitEntry{{Data: 42, Index: 1, Term: 1}}
-	h.commits[1] = []CommitEntry{{Data: 42, Index: 1, Term: 1}}
+	h.commits[0] = []CommitEntry{{Data: intCommandBytes(42), Index: 1, Term: 1}}
+	h.commits[1] = []CommitEntry{{Data: intCommandBytes(42), Index: 1, Term: 1}}
 	// Узел 2 отстал и отключён — на сходимость влиять не должен.
 	h.commits[2] = nil
 	h.connected[2] = false
@@ -371,7 +371,7 @@ func TestWaitForApplyInflight(t *testing.T) {
 	h.DisconnectPeer((lid + 2) % 3)
 
 	inflightBefore := h.applyInflightCount(lid)
-	future := h.cluster[lid].Apply(42, 0)
+	future := h.cluster[lid].Apply(intCommandBytes(42), 0)
 	h.waitForApplyInflight(lid, inflightBefore+1, _commitBudgetSteady)
 
 	// Возвращаем связность, чтобы future разрешился и тест не оставил

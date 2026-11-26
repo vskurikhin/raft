@@ -718,6 +718,65 @@ func TestInmemCloseWithPendingRPC(t *testing.T) {
 	}
 }
 
+// TestInmemAppendEntriesDeepCopy проверяет, что AppendEntries копирует
+// записи и байты Data на границе отправки: изменение исходного среза
+// после возврата RPC не затрагивает полученные данные.
+func TestInmemAppendEntriesDeepCopy(t *testing.T) {
+	defer leaktest.CheckTimeout(t, raft.LeaktestBudget)()
+	t1, t2, cleanup := newInmemPair(t)
+	defer cleanup()
+
+	done := make(chan struct{})
+	var received []raft.LogEntry
+	go func() {
+		select {
+		case rpc := <-t2.Consumer():
+			cmd, ok := rpc.Command.(*contract.AppendEntriesArgs)
+			if !ok {
+				t.Errorf("Command = %T, want *contract.AppendEntriesArgs", rpc.Command)
+				return
+			}
+			received = make([]raft.LogEntry, len(cmd.Entries))
+			copy(received, cmd.Entries)
+			rpc.RespChan <- contract.RPCResponse{
+				Reply: &contract.AppendEntriesReply{Success: true, Term: cmd.Term},
+			}
+		case <-done:
+		}
+	}()
+	defer close(done)
+
+	originalData := []byte("original")
+	entries := []raft.LogEntry{{Index: 1, Term: 1, Data: originalData}}
+	args := contract.AppendEntriesArgs{
+		Term:         1,
+		LeaderID:     0,
+		PrevLogIndex: -1,
+		PrevLogTerm:  -1,
+		Entries:      entries,
+		LeaderCommit: -1,
+	}
+	_, err := t1.AppendEntries(1, args)
+	if err != nil {
+		t.Fatalf("AppendEntries failed: %v", err)
+	}
+
+	// Изменяем исходный срез и разделяемые байты после возврата RPC.
+	entries[0].Index = 99
+	entries[0].Term = 99
+	entries[0].Data[0] = 'X'
+
+	if len(received) != 1 {
+		t.Fatalf("received entries len = %d, want 1", len(received))
+	}
+	if received[0].Index != 1 || received[0].Term != 1 {
+		t.Fatalf("received metadata mutated: index=%d term=%d", received[0].Index, received[0].Term)
+	}
+	if string(received[0].Data) != "original" {
+		t.Fatalf("received data mutated: %q", received[0].Data)
+	}
+}
+
 // TestInmemAppendEntriesWithEntries проверяет, что AppendEntries
 // с записями журнала работает корректно.
 func TestInmemAppendEntriesWithEntries(t *testing.T) {
@@ -746,7 +805,7 @@ func TestInmemAppendEntriesWithEntries(t *testing.T) {
 	}()
 	defer close(done)
 
-	entries := []raft.LogEntry{{Index: 0, Term: 1, Data: "cmd1"}}
+	entries := []raft.LogEntry{{Index: 0, Term: 1, Data: []byte("cmd1")}}
 	args := contract.AppendEntriesArgs{
 		Term:         1,
 		LeaderID:     0,

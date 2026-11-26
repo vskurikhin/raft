@@ -43,9 +43,9 @@ func (pool *logBenchBatch) fill(first int, tag byte) []contract.LogEntry {
 		entry := &pool.entries[i]
 		entry.Index = first + i
 		entry.Term = 1
-		data, ok := entry.Data.([]byte)
-		if !ok {
-			panic("буфер Data потерял тип []byte")
+		data := entry.Data
+		if data == nil {
+			panic("буфер Data потерян")
 		}
 		for j := range data {
 			data[j] = byte((first+i+j)%251) ^ tag

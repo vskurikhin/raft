@@ -107,7 +107,7 @@ func decodeCachedEntries(entries []encodedLogEntry) ([]contract.LogEntry, error)
 	out := make([]contract.LogEntry, len(entries))
 	for i := range entries {
 		entry := &entries[i]
-		value, err := decodeLogData(entry.data)
+		value, err := decodeLogData(entry.typ, entry.data)
 		if err != nil {
 			return nil, fmt.Errorf("entry at index %d: %w", entry.index, err)
 		}

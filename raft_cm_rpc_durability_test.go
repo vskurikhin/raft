@@ -79,7 +79,7 @@ func TestAppendEntries_LogDurableBeforeSuccess(t *testing.T) {
 	dir := t.TempDir()
 	cm, _ := newAEDurabilityCM(dir)
 
-	entries := []LogEntry{{Index: 0, Term: 1, Type: LogCommand, Data: "k0=v0"}}
+	entries := []LogEntry{{Index: 0, Term: 1, Type: LogCommand, Data: []byte("k0=v0")}}
 	var reply AppendEntriesReply
 	if err := cm.AppendEntries(aeArgs(-1, -1, -1, entries), &reply); err != nil {
 		t.Fatalf("AppendEntries: %v", err)
@@ -112,7 +112,7 @@ func TestAppendEntries_LogDurableWithCommitAdvance(t *testing.T) {
 	fsm := startAEDurabilityFSM(t, cm)
 	defer close(cm.shutdownCh)
 
-	entries := []LogEntry{{Index: 0, Term: 1, Type: LogCommand, Data: "k0=v0"}}
+	entries := []LogEntry{{Index: 0, Term: 1, Type: LogCommand, Data: []byte("k0=v0")}}
 	var reply AppendEntriesReply
 	if err := cm.AppendEntries(aeArgs(-1, -1, 0, entries), &reply); err != nil {
 		t.Fatalf("AppendEntries: %v", err)
@@ -177,7 +177,7 @@ func TestAppendEntries_SingleWriteWithCommitAdvance(t *testing.T) {
 	startAEDurabilityFSM(t, cm)
 	defer close(cm.shutdownCh)
 
-	entries := []LogEntry{{Index: 0, Term: 1, Type: LogCommand, Data: "k0=v0"}}
+	entries := []LogEntry{{Index: 0, Term: 1, Type: LogCommand, Data: []byte("k0=v0")}}
 	beforeJournal := journalWritesOf(cm)
 	var reply AppendEntriesReply
 	if err := cm.AppendEntries(aeArgs(-1, -1, 0, entries), &reply); err != nil {

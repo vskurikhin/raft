@@ -217,11 +217,7 @@ func (cm *ConsensusModule) dispatchLogsLocked(applyLogs []*logFuture) {
 // processConfigurationLogEntry обрабатывает LogConfiguration запись
 // на follower при репликации.
 func (cm *ConsensusModule) processConfigurationLogEntry(entry *LogEntry) {
-	entryData, ok := entry.Data.([]byte)
-	if !ok {
-		return
-	}
-	cfg, err := DecodeConfiguration(entryData)
+	cfg, err := DecodeConfiguration(entry.Data)
 	if err != nil {
 		return
 	}
@@ -249,11 +245,7 @@ func (cm *ConsensusModule) rebuildConfigurations() {
 		if entry.Type != LogConfiguration {
 			continue
 		}
-		entryData, ok := entry.Data.([]byte)
-		if !ok {
-			continue
-		}
-		cfg, err := DecodeConfiguration(entryData)
+		cfg, err := DecodeConfiguration(entry.Data)
 		if err != nil {
 			continue
 		}

@@ -153,6 +153,7 @@ auth/coverage.*
 
 # production
 /build
+.kimi-code/
 
 # misc
 .env.local
@@ -227,3 +228,4 @@ docs/TASK/
 docs/TODO*.md
 docs/TODO/
 exportToHTML/*
+.codex/

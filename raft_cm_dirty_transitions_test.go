@@ -226,7 +226,7 @@ func TestDirtyTransitions_AppendEntriesCommitAdvanceSinglePeriod(t *testing.T) {
 	persistBefore := persistenceSnapshotOf(cm)
 	scalarsBefore := storage.WriteCount()
 
-	entries := []LogEntry{{Index: 0, Term: 1, Type: LogCommand, Data: "k0=v0"}}
+	entries := []LogEntry{{Index: 0, Term: 1, Type: LogCommand, Data: []byte("k0=v0")}}
 	var reply AppendEntriesReply
 	if err := cm.AppendEntries(aeArgs(-1, -1, 0, entries), &reply); err != nil {
 		t.Fatalf("AppendEntries: %v", err)

@@ -30,6 +30,12 @@ Log entry types — values of `LogType`: `LogCommand` (client command),
 `LogNoop` (leader's no-op entry), `LogConfiguration` (cluster membership
 change).
 
+The `ProtocolVersion` number did not change with the move to byte `Data`,
+but the AppendEntries network representation and the log format did:
+nodes of the previous and the new build are incompatible, a cluster runs a
+single build ([API-Data-v3-en.md](API-Data-v3-en.md),
+[Data-v3-migration-en.md](Data-v3-migration-en.md)).
+
 Suffrage — values of `ServerSuffrage`: `Voter` (voting server), `Nonvoter`
 (non-voting; cannot be elected leader).
 
@@ -170,8 +176,8 @@ Elections are implemented in `raft_cm_election.go`:
 ## 7. Client path
 
 ```go
-func (cm *ConsensusModule) Apply(command any, timeout time.Duration) ApplyFuture
-func (s *Server) Apply(cmd any, timeout time.Duration) ApplyFuture
+func (cm *ConsensusModule) Apply(command []byte, timeout time.Duration) ApplyFuture
+func (s *Server) Apply(cmd []byte, timeout time.Duration) ApplyFuture
 ```
 
 `Apply` submits a command to Raft and returns an `ApplyFuture`; the command
@@ -180,8 +186,28 @@ bounds only the enqueueing into the `applyCh` channel: on expiry a future
 with the `contract.ErrEnqueueTimeout` error is returned. On a non-leader —
 `ErrNotLeader`; during a leadership transfer —
 `ErrLeadershipTransferInProgress`; after the node is stopped —
-`contract.ErrRaftShutdown`. The command is stored by reference: the caller
-must not mutate it after the call.
+`contract.ErrRaftShutdown`.
+
+The command is the ready-made bytes of the application representation:
+Raft neither parses nor re-encodes them. Before publishing the entry to
+the log, `Apply` makes its own copy of the bytes (`cloneLogData`,
+`raft_cm_leader.go`), preserving the distinction between `nil` and a
+non-nil empty slice. Until `Apply` returns, the caller does not modify the
+buffer; after it returns, the buffer may be modified and reused even if
+the future has not completed yet. An empty slice and `nil` are valid and
+distinct `LogCommand` data; their meaning is defined by the state machine.
+For example, the KV service encodes a command once and passes the bytes:
+
+```go
+data, err := kvservice.EncodeCommand(cmd) // KVC1 format, pkg/raft/codec
+if err != nil {
+	return err
+}
+future := server.Apply(data, timeout)
+```
+
+The byte format of KV service commands and the representation of `Data`
+in the log and on the network — [API-Data-v3-en.md](API-Data-v3-en.md).
 
 ```go
 func (cm *ConsensusModule) VerifyLeader() Future
@@ -305,7 +331,7 @@ precondition — `cfg.Transport != nil` (panic on violation, same as in
 
 ```go
 func (s *Server) Serve()
-func (s *Server) Apply(cmd any, timeout time.Duration) ApplyFuture
+func (s *Server) Apply(cmd []byte, timeout time.Duration) ApplyFuture
 func (s *Server) ConnectToPeer(peerID int, addr net.Addr) error
 func (s *Server) ConnectToPeerWithTimeout(peerID int, addr net.Addr, _ time.Duration) error
 func (s *Server) DisconnectPeer(peerID int) error
@@ -390,14 +416,15 @@ window.
 
 ```go
 type CommitEntry struct {
-	Data any
+	Data  []byte
 	Index int
-	Term int
+	Term  int
 }
 ```
 
-The data Raft sends to the commit channel: the command, the log index, and
-the term of the commitment.
+The data Raft sends to the commit channel: the command bytes, the log
+index, and the term of the commitment. `Data` is read-only: the consumer
+may retain the slice but must make its own copy to modify it.
 
 ### CMState
 
@@ -415,8 +442,10 @@ func (f *CommitChannelFSM) Snapshot() (FSMSnapshot, error)
 ```
 
 A wrapper turning a commit channel into an `FSM` for backward compatibility
-with the test infrastructure: it forwards `log.Data` to the channel.
-Test-only: while the node is alive the channel must have a reader (`Apply`
+with the test infrastructure: it forwards `log.Data` to the channel
+without copying. By then the caller's original buffer has already been
+detached by the copy in `Apply`, and the published bytes are immutable
+(`raft_fsm.go`). Test-only: while the node is alive the channel must have a reader (`Apply`
 must not block forever, otherwise `Stop` hangs).
 
 ## 13. Interfaces
@@ -432,8 +461,12 @@ type FSM interface {
 The client's state machine: `Apply` applies a committed entry, `Snapshot`
 returns a state snapshot (fast capture; serialization happens in
 `FSMSnapshot.Persist`), `Restore` restores the state from a snapshot,
-resetting the previous one. Entries are passed as owned copies; the payload
-must not be mutated after the call.
+resetting the previous one. The FSM receives a copy of the `LogEntry`
+struct (`raft_cm_apply.go`), but the `Data` bytes are shared with the log
+and the transport and are read-only: the FSM, including in `ApplyBatch`,
+does not modify `Data`. The `FSM`, `BatchingFSM`, and `ApplyFuture`
+signatures did not change with the move to `[]byte`: the result of `Apply`
+is still `any`.
 
 ```go
 type BatchingFSM interface {
@@ -558,7 +591,7 @@ All types listed below are transparent aliases of declarations from
 | `TimeoutNowRequest` / `TimeoutNowResponse`           | contract | Immediate-election request and reply (leadership transfer).                                |
 | `RPC`                                                | contract | Incoming RPC request from `Consumer()`: command, data stream, reply channel.               |
 | `RPCResponse`                                        | contract | RPC response: `Reply` or `Error`.                                                          |
-| `LogEntry`                                           | contract | Log entry: index, term, type, data.                                                        |
+| `LogEntry`                                           | contract | Log entry: index, term, type, data `Data []byte`.                                          |
 | `LogType`                                            | contract | Log entry type (see section 1).                                                            |
 | `Configuration`                                      | contract | Cluster composition.                                                                       |
 | `ConfigServer`                                       | contract | One server of the configuration: identifier, address, suffrage.                            |
